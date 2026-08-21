@@ -1,0 +1,8 @@
+node_modules/
+.wrangler/
+.DS_Store
+# secrets — never commit
+.dev.vars
+.env
+*.local
+*-secrets.sh

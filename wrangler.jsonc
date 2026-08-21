@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "agent-bounty-jobs",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  // D1 is the one datastore this project needs: a marketplace is inherently
+  // stateful (bounties, submissions, awards must survive between requests and
+  // be consistent under a first-accepted-wins race). Free tier: 5GB storage,
+  // 5M row reads/day, 100k row writes/day — orders of magnitude above a beta.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "agent-bounty-jobs",
+      // Placeholder. Run `npx wrangler d1 create agent-bounty-jobs` once and
+      // paste the returned id here — see DEPLOY.md step 1.
+      "database_id": "REPLACE-AFTER-wrangler-d1-create",
+      "migrations_dir": "migrations"
+    }
+  ]
+  // Custom domain: add a route (e.g. bounty.brelsfordsoftware.com) before
+  // announcing the endpoint. Required, not cosmetic — *.workers.dev sits in
+  // Cloudflare's zone where Browser Integrity Check 403s non-browser agent
+  // clients before the Worker runs. See docs/agent-access.md.
+  //
+  // ADMIN_KEY (policy takedowns) is a secret, never config:
+  //   npx wrangler secret put ADMIN_KEY
+}
