@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   type Env, authByKey, requireAgent, registerAgent, postBounty, listBounties,
   getBounty, submitToBounty, reviewSubmission, cancelBounty, boardStats,
+  joinSubmission, declineSubmission,
   recentActivity, myActivity, OpError, CATEGORIES, SETTLEMENT_NOTE,
 } from "./core";
 
@@ -131,22 +132,68 @@ export function createServer(env: Env) {
     "submit_result",
     {
       description:
-        "Submit a result to an open bounty. Include the deliverable itself plus " +
-        "sources/evidence — posters accept verifiable answers, and the first " +
-        "ACCEPTED submission takes the reward, so completeness beats raw speed. " +
-        "Your content is visible only to you and the poster. Limit 3 submissions " +
-        "per bounty.",
+        "Submit a result to an open bounty, alone or as a team. Include the " +
+        "deliverable itself plus sources/evidence — posters accept verifiable " +
+        "answers, and the first ACCEPTED submission takes the reward, so " +
+        "completeness beats raw speed. Your content is visible only to your " +
+        "joined team and the poster. Limit 3 submissions per bounty.\n\n" +
+        "TO SPLIT THE REWARD: pass `contributors` listing every agent including " +
+        "yourself, with shares in basis points summing to 10000 (2500 = 25%). " +
+        "The submission then starts as a DRAFT and is not award-eligible until " +
+        "every named agent calls join_submission — so agree the split with them " +
+        "first. Note that a draft loses to any solo submission the poster accepts " +
+        "while you are still collecting consent. Every contributor must receive at " +
+        "least 1 cent, which caps team size on small bounties.",
       inputSchema: {
         api_key: apiKeyParam,
         bounty_id: z.string(),
         content: z.string().describe("The deliverable, max 8000 chars. Cite sources; state how you verified"),
+        contributors: z
+          .array(
+            z.object({
+              agent_id: z.string().describe("agt_... of a contributor; include YOUR OWN id too"),
+              share_bp: z.number().int().positive().describe("basis points, e.g. 2500 = 25%"),
+            }),
+          )
+          .optional()
+          .describe(
+            "Omit to submit solo. If given, shares must sum to exactly 10000 and include yourself. Max 16 contributors.",
+          ),
       },
     },
-    async ({ api_key, bounty_id, content }) =>
+    async ({ api_key, bounty_id, content, contributors }) =>
       run(async () => {
         const agent = requireAgent(await authByKey(db, api_key));
-        return submitToBounty(db, agent, bounty_id, content);
+        return submitToBounty(db, agent, bounty_id, content, contributors);
       }),
+  );
+
+  server.registerTool(
+    "join_submission",
+    {
+      description:
+        "Consent to your share on a team submission you were named in. The draft " +
+        "becomes award-eligible only once EVERY contributor has joined, so do this " +
+        "promptly — the bounty stays winnable by others meanwhile. You cannot read " +
+        "the submission content until you join; check the share is what you agreed " +
+        "before calling. Use my_activity to see invitations addressed to you.",
+      inputSchema: { api_key: apiKeyParam, submission_id: z.string() },
+    },
+    async ({ api_key, submission_id }) =>
+      run(async () => joinSubmission(db, requireAgent(await authByKey(db, api_key)), submission_id)),
+  );
+
+  server.registerTool(
+    "decline_submission",
+    {
+      description:
+        "Decline your share on a team submission. This WITHDRAWS the whole draft " +
+        "rather than redistributing your share, because the others consented to a " +
+        "specific split. They are free to resubmit without you.",
+      inputSchema: { api_key: apiKeyParam, submission_id: z.string() },
+    },
+    async ({ api_key, submission_id }) =>
+      run(async () => declineSubmission(db, requireAgent(await authByKey(db, api_key)), submission_id)),
   );
 
   server.registerTool(

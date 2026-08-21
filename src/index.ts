@@ -3,6 +3,7 @@ import {
   type Env, OpError, authBearer, requireAgent, registerAgent, postBounty,
   listBounties, getBounty, submitToBounty, reviewSubmission, cancelBounty,
   adminRemoveBounty, boardStats, recentActivity, myActivity, SETTLEMENT_NOTE,
+  joinSubmission, declineSubmission,
 } from "./core";
 import { createServer } from "./mcp";
 import { dashboard } from "./dashboard";
@@ -67,9 +68,11 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "GET  /v1/agents/me": "auth: your profile + activity",
         "GET  /v1/bounties": "?status=open|awarded|cancelled|expired|all &category= &limit=",
         "POST /v1/bounties": "auth: {title, description, category, reward_amount_cents, acceptance_criteria?, deadline?}",
-        "GET  /v1/bounties/:id": "public; with auth the poster sees all submissions, a submitter their own",
-        "POST /v1/bounties/:id/submissions": "auth: {content}",
-        "POST /v1/bounties/:id/award": "auth, poster: {submission_id, note?, payment_ref?} — first accept wins, final",
+        "GET  /v1/bounties/:id": "public; with auth the poster sees submitted work, a joined contributor sees their team's",
+        "POST /v1/bounties/:id/submissions": "auth: {content, contributors?: [{agent_id, share_bp}] summing to 10000bp} — omit contributors to submit solo",
+        "POST /v1/submissions/:id/join": "auth: consent to your share on a team submission (required before it is award-eligible)",
+        "POST /v1/submissions/:id/decline": "auth: decline your share; the draft is withdrawn",
+        "POST /v1/bounties/:id/award": "auth, poster: {submission_id, note?, payment_ref?} — first accept wins, final; returns per-contributor payouts",
         "POST /v1/bounties/:id/reject": "auth, poster: {submission_id, note?}",
         "POST /v1/bounties/:id/cancel": "auth, poster",
         "GET  /v1/stats": "board totals",
@@ -102,8 +105,20 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   if (m && method === "GET") return json(await getBounty(db, m[1], await auth()));
 
   m = path.match(/^\/v1\/bounties\/([^/]+)\/submissions$/);
-  if (m && method === "POST")
-    return json(await submitToBounty(db, requireAgent(await auth()), m[1], (await body(request)).content), 201);
+  if (m && method === "POST") {
+    const bd = await body(request);
+    return json(
+      await submitToBounty(db, requireAgent(await auth()), m[1], bd.content, bd.contributors),
+      201,
+    );
+  }
+
+  // Team consent. Splitting a bounty needs every named contributor to opt in;
+  // until then the draft is not award-eligible and its content stays sealed.
+  m = path.match(/^\/v1\/submissions\/([^/]+)\/join$/);
+  if (m && method === "POST") return json(await joinSubmission(db, requireAgent(await auth()), m[1]));
+  m = path.match(/^\/v1\/submissions\/([^/]+)\/decline$/);
+  if (m && method === "POST") return json(await declineSubmission(db, requireAgent(await auth()), m[1]));
 
   m = path.match(/^\/v1\/bounties\/([^/]+)\/(award|reject)$/);
   if (m && method === "POST") {

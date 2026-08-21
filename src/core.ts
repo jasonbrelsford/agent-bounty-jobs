@@ -34,6 +34,11 @@ export type Submission = {
   created_at: string; reviewed_at: string | null;
 };
 
+export type Contributor = {
+  submission_id: string; agent_id: string; share_bp: number;
+  accepted_at: string | null; payout_cents: number | null;
+};
+
 export type EventRow = {
   seq: number; at: string; kind: string;
   bounty_id: string | null; agent_id: string | null; detail: string | null;
@@ -56,6 +61,7 @@ export const LIMITS = {
   pending_submissions_per_agent: 25,
   registrations_per_day: 200,                      // global, all callers
   list_limit_max: 100,
+  contributors_per_submission: 16,               // incl. the lead; see splitPayout
 } as const;
 
 /**
@@ -150,6 +156,79 @@ const eventStmt = (
 // No cron. Overdue bounties are expired on the read/write paths that care.
 // The SELECT-first shape means the common case (nothing overdue) costs one
 // row-read and zero writes, which is what keeps this inside D1's free tier.
+
+/** Basis points per whole share. Shares are integers; money never touches a float. */
+const BP_TOTAL = 10_000;
+
+/**
+ * Split `cents` by basis-point shares using the largest-remainder method, so
+ * the payouts sum to EXACTLY `cents` — no rounding dust appears or vanishes.
+ * Ties break toward the earlier contributor, which makes the result a pure
+ * function of the input order and therefore reproducible from the audit log.
+ */
+export function splitPayout(cents: number, shares: number[]): number[] {
+  const exact = shares.map((bp) => (cents * bp) / BP_TOTAL);
+  const base = exact.map(Math.floor);
+  let left = cents - base.reduce((a, b) => a + b, 0);
+  const order = exact
+    .map((v, i) => ({ i, frac: v - Math.floor(v) }))
+    .sort((a, b) => b.frac - a.frac || a.i - b.i);
+  for (let k = 0; k < order.length && left > 0; k++, left--) base[order[k].i]++;
+  return base;
+}
+
+/**
+ * Validate a team roster against a reward. Returns rows ready to insert.
+ *
+ * The floor rule is arithmetic, not policy: a contributor whose share rounds to
+ * zero cents is owed nothing, which is a silent bug rather than a small payment.
+ * Rejecting it at submission time is why `reward_cents` caps the real team size
+ * far below `contributors_per_submission` for small bounties.
+ */
+export function validateShares(
+  raw: unknown,
+  leadId: string,
+  posterId: string,
+  rewardCents: number,
+): { agent_id: string; share_bp: number }[] {
+  if (!Array.isArray(raw)) throw new OpError(400, "contributors must be an array");
+  const rows: { agent_id: string; share_bp: number }[] = [];
+  const seen = new Set<string>();
+  for (const c of raw) {
+    if (typeof c !== "object" || c === null) throw new OpError(400, "each contributor must be an object");
+    const id = String((c as Record<string, unknown>).agent_id ?? "");
+    const bp = Number((c as Record<string, unknown>).share_bp);
+    if (!/^agt_[0-9a-f]{16}$/.test(id)) throw new OpError(400, `invalid contributor agent_id "${id}"`);
+    if (!Number.isInteger(bp) || bp <= 0) throw new OpError(400, "share_bp must be a positive integer");
+    if (id === posterId) throw new OpError(403, "the bounty poster cannot be a contributor on their own bounty");
+    if (seen.has(id)) throw new OpError(400, `duplicate contributor ${id}`);
+    seen.add(id);
+    rows.push({ agent_id: id, share_bp: bp });
+  }
+  if (!seen.has(leadId)) throw new OpError(400, "the submitting agent must be listed among the contributors");
+  if (rows.length > LIMITS.contributors_per_submission)
+    throw new OpError(400, `at most ${LIMITS.contributors_per_submission} contributors per submission`);
+  const total = rows.reduce((a, r) => a + r.share_bp, 0);
+  if (total !== BP_TOTAL)
+    throw new OpError(400, `contributor shares must sum to ${BP_TOTAL} basis points (got ${total})`);
+  for (const r of rows)
+    if (Math.floor((rewardCents * r.share_bp) / BP_TOTAL) < 1)
+      throw new OpError(
+        400,
+        `share ${r.share_bp}bp of ${fmtMoney(rewardCents, "USD")} rounds to $0.00 — ` +
+          "every contributor must receive at least 1 cent",
+      );
+  return rows;
+}
+
+/** Accepted contributors on a submission, in insert order. */
+async function contributorsOf(db: D1Database, submissionId: string): Promise<Contributor[]> {
+  const { results } = await db
+    .prepare("SELECT * FROM submission_contributors WHERE submission_id = ? ORDER BY rowid")
+    .bind(submissionId)
+    .all<Contributor>();
+  return results ?? [];
+}
 
 export async function expireOverdue(db: D1Database): Promise<void> {
   const now = nowIso();
@@ -299,6 +378,13 @@ export async function listBounties(
   return results;
 }
 
+/** Attach the contributor roster to each submission, so a reviewer can see who is owed what. */
+async function withTeams(db: D1Database, subs: Submission[]) {
+  return Promise.all(
+    subs.map(async (sub) => ({ ...sub, contributors: await contributorsOf(db, sub.id) })),
+  );
+}
+
 export async function getBounty(
   db: D1Database,
   id: string,
@@ -314,24 +400,56 @@ export async function getBounty(
   // Submission CONTENT is visible only to the poster and to its own author.
   // This is load-bearing for the race: a public answer is a free answer, and
   // the whole first-to-fill mechanism collapses if competitors can copy it.
+  // Drafts are invisible to the poster: a team that is still forming has not
+  // offered anything yet, and showing it would leak a half-built answer.
   if (viewer?.id === bounty.poster_id) {
     const { results } = await db
-      .prepare("SELECT * FROM submissions WHERE bounty_id = ? ORDER BY created_at")
+      .prepare("SELECT * FROM submissions WHERE bounty_id = ? AND status NOT IN ('draft','withdrawn') ORDER BY created_at")
       .bind(id)
       .all<Submission>();
-    return { bounty, submissions: results, your_role: "poster" };
+    return {
+      bounty,
+      submissions: await withTeams(db, results ?? []),
+      your_role: "poster",
+    };
   }
+  // A contributor sees their own team's submission only once they have JOINED.
+  // Invited-but-not-joined deliberately returns nothing: that gap is what stops
+  // an invite from being used to read a rival team's answer.
   if (viewer) {
     const { results } = await db
-      .prepare("SELECT * FROM submissions WHERE bounty_id = ? AND agent_id = ? ORDER BY created_at")
+      .prepare(
+        "SELECT s.* FROM submissions s JOIN submission_contributors c ON c.submission_id = s.id " +
+          "WHERE s.bounty_id = ? AND c.agent_id = ? AND c.accepted_at IS NOT NULL ORDER BY s.created_at",
+      )
       .bind(id, viewer.id)
       .all<Submission>();
-    if (results.length) return { bounty, submissions: results, your_role: "submitter" };
+    if (results.length)
+      return { bounty, submissions: await withTeams(db, results), your_role: "contributor" };
+    const invited = await db
+      .prepare(
+        "SELECT s.id FROM submissions s JOIN submission_contributors c ON c.submission_id = s.id " +
+          "WHERE s.bounty_id = ? AND c.agent_id = ? AND c.accepted_at IS NULL AND s.status = 'draft'",
+      )
+      .bind(id, viewer.id)
+      .all<{ id: string }>();
+    if ((invited.results ?? []).length)
+      return {
+        bounty,
+        your_role: "invited",
+        invitations: (invited.results ?? []).map((r) => r.id),
+      } as never;
   }
   return { bounty };
 }
 
-export async function submitToBounty(db: D1Database, agent: Agent, bountyId: string, contentRaw: unknown) {
+export async function submitToBounty(
+  db: D1Database,
+  agent: Agent,
+  bountyId: string,
+  contentRaw: unknown,
+  contributorsRaw?: unknown,
+) {
   await expireOverdue(db);
   const content = reqString(contentRaw, "content", 1, LIMITS.submission_content.max);
   const b = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(bountyId).first<Bounty>();
@@ -339,33 +457,162 @@ export async function submitToBounty(db: D1Database, agent: Agent, bountyId: str
   if (b.status !== "open") throw new OpError(409, `bounty is ${b.status}, not accepting submissions`);
   if (b.poster_id === agent.id) throw new OpError(403, "you cannot submit to your own bounty");
 
+  // Solo is the degenerate team: one contributor at 100%. Keeping a single
+  // shape here is what gives award one payout path instead of two.
+  const roster =
+    contributorsRaw == null
+      ? [{ agent_id: agent.id, share_bp: 10_000 }]
+      : validateShares(contributorsRaw, agent.id, b.poster_id, b.reward_amount_cents);
+
+  const ids = roster.map((r) => r.agent_id);
+  const found = await db
+    .prepare(`SELECT id FROM agents WHERE id IN (${ids.map(() => "?").join(",")})`)
+    .bind(...ids)
+    .all<{ id: string }>();
+  const known = new Set((found.results ?? []).map((r) => r.id));
+  const missing = ids.filter((i) => !known.has(i));
+  if (missing.length) throw new OpError(404, `unknown contributor agent(s): ${missing.join(", ")}`);
+
+  // Per-bounty and pending caps count every submission the agent is ON, not
+  // just ones they authored — otherwise joining teams is an unmetered way
+  // around both limits.
   const mine = await db
-    .prepare("SELECT COUNT(*) AS n FROM submissions WHERE bounty_id = ? AND agent_id = ?")
+    .prepare(
+      "SELECT COUNT(*) AS n FROM submissions s JOIN submission_contributors c ON c.submission_id = s.id " +
+        "WHERE s.bounty_id = ? AND c.agent_id = ?",
+    )
     .bind(bountyId, agent.id)
     .first<{ n: number }>();
   if ((mine?.n ?? 0) >= LIMITS.submissions_per_agent_per_bounty)
     throw new OpError(429, `limit of ${LIMITS.submissions_per_agent_per_bounty} submissions per bounty reached`);
   const pending = await db
-    .prepare("SELECT COUNT(*) AS n FROM submissions WHERE agent_id = ? AND status = 'pending'")
+    .prepare(
+      "SELECT COUNT(*) AS n FROM submissions s JOIN submission_contributors c ON c.submission_id = s.id " +
+        "WHERE c.agent_id = ? AND s.status IN ('pending','draft')",
+    )
     .bind(agent.id)
     .first<{ n: number }>();
   if ((pending?.n ?? 0) >= LIMITS.pending_submissions_per_agent)
     throw new OpError(429, "too many pending submissions — wait for reviews before submitting more");
 
+  // A team submission is NOT award-eligible until everyone has consented, so it
+  // starts as 'draft'. Solo submissions skip straight to 'pending' — the lead
+  // consents by the act of submitting.
+  const solo = roster.length === 1;
   const id = newId("sub");
   const at = nowIso();
-  await db.batch([
+  const stmts = [
     db.prepare(
-      "INSERT INTO submissions (id, bounty_id, agent_id, content, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)",
-    ).bind(id, bountyId, agent.id, content, at),
-    eventStmt(db, at, "submission_received", bountyId, agent.id, `submission for "${b.title}"`),
-  ]);
+      "INSERT INTO submissions (id, bounty_id, agent_id, content, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    ).bind(id, bountyId, agent.id, content, solo ? "pending" : "draft", at),
+    ...roster.map((r) =>
+      db.prepare(
+        "INSERT INTO submission_contributors (submission_id, agent_id, share_bp, accepted_at) VALUES (?, ?, ?, ?)",
+      ).bind(id, r.agent_id, r.share_bp, r.agent_id === agent.id ? at : null),
+    ),
+    eventStmt(
+      db, at, solo ? "submission_received" : "team_forming", bountyId, agent.id,
+      solo
+        ? `submission for "${b.title}"`
+        : `${roster.length}-agent team forming on "${b.title}"`,
+    ),
+  ];
+  await db.batch(stmts);
+
+  const pendingJoins = roster.filter((r) => r.agent_id !== agent.id).map((r) => r.agent_id);
   return {
     submission_id: id,
     bounty_id: bountyId,
-    status: "pending",
-    note: "The poster reviews submissions; the FIRST ACCEPTED submission takes the bounty and all other pending submissions are closed.",
+    status: solo ? "pending" : "draft",
+    contributors: roster.map((r) => ({
+      agent_id: r.agent_id,
+      share_bp: r.share_bp,
+      share: `${(r.share_bp / 100).toFixed(2)}%`,
+      payout_if_awarded: fmtMoney(
+        splitPayout(b.reward_amount_cents, roster.map((x) => x.share_bp))[roster.indexOf(r)],
+        b.reward_currency,
+      ),
+      accepted: r.agent_id === agent.id,
+    })),
+    awaiting_consent: pendingJoins,
+    note: solo
+      ? "The poster reviews submissions; the FIRST ACCEPTED submission takes the bounty and all other pending submissions are closed."
+      : `Draft: not visible to the poster and not award-eligible until all ${pendingJoins.length} invited contributor(s) call join_submission. They cannot read the content until they join.`,
   };
+}
+
+/**
+ * Consent to a share on a team submission. This is the gate that makes naming a
+ * contributor safe: until it is called the invitee cannot read the content, so
+ * an invite cannot be used to leak a rival's answer.
+ */
+export async function joinSubmission(db: D1Database, agent: Agent, submissionId: string) {
+  const s = await db.prepare("SELECT * FROM submissions WHERE id = ?").bind(submissionId).first<Submission>();
+  if (!s) throw new OpError(404, `no submission ${submissionId}`);
+  const me = await db
+    .prepare("SELECT * FROM submission_contributors WHERE submission_id = ? AND agent_id = ?")
+    .bind(submissionId, agent.id)
+    .first<Contributor>();
+  if (!me) throw new OpError(403, "you are not an invited contributor on that submission");
+  if (s.status !== "draft") throw new OpError(409, `submission is ${s.status}, no longer forming`);
+  if (me.accepted_at) throw new OpError(409, "you have already joined this submission");
+
+  const b = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(s.bounty_id).first<Bounty>();
+  if (!b || b.status !== "open") throw new OpError(409, `bounty is ${b?.status ?? "gone"}, not accepting submissions`);
+
+  const at = nowIso();
+  await db
+    .prepare("UPDATE submission_contributors SET accepted_at = ? WHERE submission_id = ? AND agent_id = ? AND accepted_at IS NULL")
+    .bind(at, submissionId, agent.id)
+    .run();
+
+  // Last consent flips the draft to pending. The compare-and-swap on
+  // status='draft' means concurrent final joins cannot double-promote it.
+  const left = await db
+    .prepare("SELECT COUNT(*) AS n FROM submission_contributors WHERE submission_id = ? AND accepted_at IS NULL")
+    .bind(submissionId)
+    .first<{ n: number }>();
+  const complete = (left?.n ?? 0) === 0;
+  if (complete) {
+    const res = await db
+      .prepare("UPDATE submissions SET status = 'pending' WHERE id = ? AND status = 'draft'")
+      .bind(submissionId)
+      .run();
+    if (res.meta.changes)
+      await db.batch([
+        eventStmt(db, at, "submission_received", s.bounty_id, s.agent_id, `team submission for "${b.title}"`),
+      ]);
+  }
+  return {
+    submission_id: submissionId,
+    joined: true,
+    your_share_bp: me.share_bp,
+    status: complete ? "pending" : "draft",
+    still_awaiting: left?.n ?? 0,
+  };
+}
+
+/**
+ * Decline an invited share. This voids the whole draft rather than reallocating
+ * the share: silently redistributing would change what the other contributors
+ * already consented to.
+ */
+export async function declineSubmission(db: D1Database, agent: Agent, submissionId: string) {
+  const s = await db.prepare("SELECT * FROM submissions WHERE id = ?").bind(submissionId).first<Submission>();
+  if (!s) throw new OpError(404, `no submission ${submissionId}`);
+  const me = await db
+    .prepare("SELECT * FROM submission_contributors WHERE submission_id = ? AND agent_id = ?")
+    .bind(submissionId, agent.id)
+    .first<Contributor>();
+  if (!me) throw new OpError(403, "you are not a contributor on that submission");
+  if (s.status !== "draft") throw new OpError(409, `submission is ${s.status}, no longer forming`);
+  const at = nowIso();
+  await db.batch([
+    db.prepare("UPDATE submissions SET status = 'withdrawn', review_note = ?, reviewed_at = ? WHERE id = ? AND status = 'draft'")
+      .bind(`contributor ${agent.id} declined their share`, at, submissionId),
+    eventStmt(db, at, "team_dissolved", s.bounty_id, agent.id, "a contributor declined; team submission withdrawn"),
+  ]);
+  return { submission_id: submissionId, status: "withdrawn", reason: "a contributor declined their share" };
 }
 
 export async function reviewSubmission(
@@ -414,11 +661,21 @@ export async function reviewSubmission(
 
   // Winner is marked accepted BEFORE the pending-sweep, so the sweep's
   // status='pending' filter can no longer touch it.
+  // Freeze the split into the ledger at award time. Storing payout_cents rather
+  // than recomputing it later means a share can never be reinterpreted after the
+  // fact, and the row is the receipt the off-platform settlement is made against.
+  const team = await contributorsOf(db, submissionId);
+  const payouts = splitPayout(b.reward_amount_cents, team.map((t) => t.share_bp));
+
   await db.batch([
     db.prepare("UPDATE submissions SET status = 'accepted', review_note = ?, reviewed_at = ? WHERE id = ?")
       .bind(reviewNote, at, submissionId),
+    ...team.map((t, i) =>
+      db.prepare("UPDATE submission_contributors SET payout_cents = ? WHERE submission_id = ? AND agent_id = ?")
+        .bind(payouts[i], submissionId, t.agent_id),
+    ),
     db.prepare(
-      "UPDATE submissions SET status = 'closed', review_note = 'another submission was accepted first', reviewed_at = ? WHERE bounty_id = ? AND status = 'pending'",
+      "UPDATE submissions SET status = 'closed', review_note = 'another submission was accepted first', reviewed_at = ? WHERE bounty_id = ? AND status IN ('pending','draft')",
     ).bind(at, bountyId),
     eventStmt(
       db, at, "bounty_awarded", bountyId, s.agent_id,
@@ -430,8 +687,17 @@ export async function reviewSubmission(
     winning_submission_id: submissionId,
     winner_agent_id: s.agent_id,
     reward: fmtMoney(b.reward_amount_cents, b.reward_currency),
+    payouts: team.map((t, i) => ({
+      agent_id: t.agent_id,
+      share_bp: t.share_bp,
+      amount: fmtMoney(payouts[i], b.reward_currency),
+      amount_cents: payouts[i],
+    })),
     payment_ref: ref,
-    settlement: SETTLEMENT_NOTE,
+    settlement:
+      team.length > 1
+        ? `${SETTLEMENT_NOTE} This bounty was filled by a team of ${team.length}: settle with EACH contributor for the amount listed in payouts.`
+        : SETTLEMENT_NOTE,
   };
 }
 
@@ -512,17 +778,28 @@ export async function recentActivity(db: D1Database, limit = 50): Promise<EventR
 }
 
 export async function myActivity(db: D1Database, agent: Agent) {
-  const [posted, submitted] = await db.batch([
+  const [posted, submitted, invites] = await db.batch([
     db.prepare(
       "SELECT id, title, status, reward_amount_cents, reward_currency, deadline, created_at, awarded_submission_id FROM bounties WHERE poster_id = ? ORDER BY created_at DESC LIMIT 50",
     ).bind(agent.id),
     db.prepare(
-      "SELECT id, bounty_id, status, review_note, created_at, reviewed_at FROM submissions WHERE agent_id = ? ORDER BY created_at DESC LIMIT 50",
+      "SELECT s.id, s.bounty_id, s.status, s.review_note, s.created_at, s.reviewed_at, c.share_bp, c.payout_cents " +
+        "FROM submissions s JOIN submission_contributors c ON c.submission_id = s.id " +
+        "WHERE c.agent_id = ? AND c.accepted_at IS NOT NULL ORDER BY s.created_at DESC LIMIT 50",
+    ).bind(agent.id),
+    db.prepare(
+      "SELECT s.id AS submission_id, s.bounty_id, b.title, c.share_bp, s.created_at " +
+        "FROM submissions s JOIN submission_contributors c ON c.submission_id = s.id " +
+        "JOIN bounties b ON b.id = s.bounty_id " +
+        "WHERE c.agent_id = ? AND c.accepted_at IS NULL AND s.status = 'draft' ORDER BY s.created_at DESC LIMIT 50",
     ).bind(agent.id),
   ]);
   return {
     agent: { id: agent.id, name: agent.name, registered: agent.created_at },
     bounties_posted: posted.results ?? [],
     submissions_made: submitted.results ?? [],
+    // Shares you have been offered but not yet consented to. Until you join,
+    // the submission is not award-eligible and you cannot read its content.
+    invitations_awaiting_you: invites.results ?? [],
   };
 }
