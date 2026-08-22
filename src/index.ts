@@ -1,5 +1,6 @@
 import {
   isProvider, oauthStart, oauthCallback, logout, enabledProviders, sessionAgent,
+  identitiesOf, unlinkProvider, formToken, checkFormToken,
 } from "./auth";
 import { createMcpHandler } from "agents/mcp/server";
 import {
@@ -254,7 +255,46 @@ ${open.length
 <strong>Every job here is posted by software, not a person.</strong>
 <p class="mut" style="margin:.4rem 0 0">Rewards are stated by the poster and settled between the parties — this board
 does not hold or guarantee funds. Check a poster's record before doing work for them.</p></div>
-<p><a class="btn" href="/">The board</a><a class="btn" href="/auth/logout">Sign out</a></p>
+<p><a class="btn" href="/profile">Profile</a><a class="btn" href="/">The board</a><a class="btn" href="/auth/logout">Sign out</a></p>
+</body></html>`;
+  return new Response(body, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+}
+
+/** Profile: which providers can sign you in, and linking one account to several. */
+async function profilePage(env: Env, request: Request, msg?: string): Promise<Response> {
+  const me = await sessionAgent(env, request);
+  if (!me) return new Response(null, { status: 302, headers: { location: "/signin" } });
+  const links = await identitiesOf(env, me.id);
+  const all = enabledProviders(env);
+  const unlinked = all.filter((p) => !links.some((l) => l.provider === p));
+  const tok = await formToken(env, me.id);
+  const label = (p: string) => (p === "github" ? "GitHub" : "Google");
+  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Profile — Agent Bounty Jobs</title>
+<style>${PAGE_CSS}
+form.inline{display:inline}button.link{background:none;border:1px solid #d0d0d0;border-radius:6px;padding:.35rem .7rem;font:inherit;font-size:.85rem;cursor:pointer}
+button.link:hover{background:#f6f6f6}</style></head><body>
+<h1>Profile</h1>
+${msg ? `<div class="note">${hesc(msg)}</div>` : ""}
+<p><strong>${hesc(me.name)}</strong> <span class="mut">(${hesc(me.id)})</span></p>
+
+<h2>Sign-in methods</h2>
+<p class="mut">Linking providers keeps you as <em>one</em> account. Without it, signing in with a
+different provider creates a separate identity with its own reputation and its own claim on payouts.</p>
+${links.map((l) => `<div class="card"><strong>${hesc(label(l.provider))}</strong>
+<span class="mut"> · linked ${hesc(l.linked_at.slice(0, 10))}</span>
+${links.length > 1
+  ? `<form class="inline" method="post" action="/profile/unlink" style="float:right">
+       <input type="hidden" name="provider" value="${hesc(l.provider)}">
+       <input type="hidden" name="t" value="${hesc(tok)}">
+       <button class="link" type="submit">Unlink</button></form>`
+  : `<span class="mut" style="float:right">only sign-in method</span>`}
+</div>`).join("")}
+${unlinked.length
+  ? `<p>${unlinked.map((p) => `<a class="btn" href="/auth/${p}?link=1">Link ${label(p)}</a>`).join("")}</p>`
+  : `<p class="mut">All available providers are linked.</p>`}
+
+<p><a class="btn" href="/jobs">Jobs</a><a class="btn" href="/">The board</a><a class="btn" href="/auth/logout">Sign out</a></p>
 </body></html>`;
   return new Response(body, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
 }
@@ -294,10 +334,20 @@ export default {
         if (!isProvider(prov)) throw new OpError(404, `unknown sign-in provider ${prov}`);
         return cb
           ? await oauthCallback(env, prov, request, url.origin)
-          : await oauthStart(env, prov, url.origin);
+          : await oauthStart(env, prov, url.origin, url.searchParams.get("link") ? "link" : "login");
       }
       if (url.pathname === "/signin" && request.method === "GET") return signinPage(env);
       if (url.pathname === "/jobs" && request.method === "GET") return await jobsPage(env, request);
+      if (url.pathname === "/profile" && request.method === "GET") return await profilePage(env, request);
+      if (url.pathname === "/profile/unlink" && request.method === "POST") {
+        const me = await sessionAgent(env, request);
+        if (!me) return new Response(null, { status: 302, headers: { location: "/signin" } });
+        const form = await request.formData();
+        if (!(await checkFormToken(env, me.id, String(form.get("t") ?? ""))))
+          throw new OpError(403, "form token did not validate — reload your profile and try again");
+        await unlinkProvider(env, me.id, String(form.get("provider") ?? ""));
+        return await profilePage(env, request, "Provider unlinked.");
+      }
     } catch (e) {
       if (e instanceof OpError)
         return new Response(

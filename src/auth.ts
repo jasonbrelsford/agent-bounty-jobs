@@ -116,12 +116,16 @@ export async function sessionAgent(env: Env, request: Request): Promise<Agent | 
 
 // ── flow ────────────────────────────────────────────────────────────────────
 
-export async function oauthStart(env: Env, p: Provider, origin: string): Promise<Response> {
+export async function oauthStart(
+  env: Env, p: Provider, origin: string, intent: "login" | "link" = "login",
+): Promise<Response> {
   const c = creds(env, p);
   if (!c || !env.SESSION_SECRET) throw new OpError(503, `${p} sign-in is not configured on this board`);
   // `state` is signed and cookie-bound: an attacker cannot mint one, and a
   // callback that did not originate here has no matching cookie to compare to.
-  const nonce = crypto.randomUUID();
+  // Intent rides INSIDE the signature, so it cannot be flipped from login to
+  // link (or back) by editing the query string.
+  const nonce = `${crypto.randomUUID()}~${intent}`;
   const state = await seal(env.SESSION_SECRET, nonce, STATE_TTL_S);
   const u = new URL(PROVIDERS[p].authorize);
   u.searchParams.set("client_id", c.id);
@@ -166,12 +170,41 @@ export async function oauthCallback(env: Env, p: Provider, request: Request, ori
   const rawName = String(prof.name ?? prof.login ?? "").trim() || `${p} user`;
   const name = rawName.slice(0, LIMITS.name.max).padEnd(LIMITS.name.min, ".");
 
-  const agentId = await upsertHuman(env, subject, name);
+  const intent = (await unseal(env.SESSION_SECRET, state))?.split("~")[1] === "link" ? "link" : "login";
+  const existing = await env.DB.prepare("SELECT agent_id FROM agent_identities WHERE subject = ?")
+    .bind(subject)
+    .first<{ agent_id: string }>();
+
+  if (intent === "link") {
+    // Linking requires BOTH proofs: a live session (control of this account) and
+    // a completed OAuth round trip (control of that provider identity).
+    const me = await sessionAgent(env, request);
+    if (!me) throw new OpError(403, "sign in first, then link a second provider from your profile");
+    if (existing && existing.agent_id !== me.id)
+      // Never silently move an identity between accounts — that would be a
+      // one-click way to strip someone else's provider off their account.
+      throw new OpError(
+        409,
+        "that account is already linked to a different profile here. Sign in with it directly, or unlink it there first.",
+      );
+    if (!existing)
+      await env.DB.prepare(
+        "INSERT INTO agent_identities (subject, agent_id, provider, linked_at) VALUES (?, ?, ?, ?)",
+      ).bind(subject, me.id, p, new Date().toISOString()).run();
+    return redirectWithSession(env, me.id, "/profile");
+  }
+
+  const agentId = existing ? existing.agent_id : await createHuman(env, subject, name, p);
+  return redirectWithSession(env, agentId, "/jobs");
+}
+
+async function redirectWithSession(env: Env, agentId: string, to: string): Promise<Response> {
+  const sid = await seal(env.SESSION_SECRET!, agentId, SESSION_TTL_S);
   return new Response(null, {
     status: 302,
     headers: [
-      ["location", "/jobs"],
-      ["set-cookie", await seal(env.SESSION_SECRET, agentId, SESSION_TTL_S).then((t) => cookie("sid", t, SESSION_TTL_S))],
+      ["location", to],
+      ["set-cookie", cookie("sid", sid, SESSION_TTL_S)],
       // The one-shot state cookie has done its job; leaving it set would let a
       // stale value be replayed against a later callback.
       ["set-cookie", cookie("ostate", "", 0)],
@@ -180,31 +213,61 @@ export async function oauthCallback(env: Env, p: Provider, request: Request, ori
 }
 
 /**
- * Find-or-create the human behind an OAuth subject.
+ * Create the human behind a brand-new OAuth subject, with their first identity.
  *
  * Humans get a real API key like agents do, so the same person can use the web
  * UI and the JSON API. It is generated here and never shown by this function —
  * the profile page is responsible for revealing or rotating it.
  */
-async function upsertHuman(env: Env, subject: string, name: string): Promise<string> {
-  const found = await env.DB.prepare("SELECT id FROM agents WHERE oauth_subject = ?")
-    .bind(subject)
-    .first<{ id: string }>();
-  if (found) return found.id;
-
+async function createHuman(env: Env, subject: string, name: string, provider: Provider): Promise<string> {
   const id = `agt_${[...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
   const rawKey = `bk_${[...crypto.getRandomValues(new Uint8Array(24))].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(rawKey));
   const keyHash = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
   const at = new Date().toISOString();
   await env.DB.batch([
+    env.DB.prepare("INSERT INTO agents (id, name, key_hash, kind, created_at) VALUES (?, ?, ?, 'human', ?)")
+      .bind(id, name, keyHash, at),
     env.DB.prepare(
-      "INSERT INTO agents (id, name, key_hash, kind, oauth_subject, created_at) VALUES (?, ?, ?, 'human', ?, ?)",
-    ).bind(id, name, keyHash, subject, at),
+      "INSERT INTO agent_identities (subject, agent_id, provider, linked_at) VALUES (?, ?, ?, ?)",
+    ).bind(subject, id, provider, at),
     env.DB.prepare("INSERT INTO events (at, kind, bounty_id, agent_id, detail) VALUES (?, 'agent_registered', NULL, ?, ?)")
-      .bind(at, id, `${name} joined as a human via ${subject.split(":")[0]}`),
+      .bind(at, id, `${name} joined as a human via ${provider}`),
   ]);
   return id;
+}
+
+export type Identity = { subject: string; provider: string; linked_at: string };
+
+export async function identitiesOf(env: Env, agentId: string): Promise<Identity[]> {
+  const { results } = await env.DB
+    .prepare("SELECT subject, provider, linked_at FROM agent_identities WHERE agent_id = ? ORDER BY linked_at")
+    .bind(agentId)
+    .all<Identity>();
+  return results ?? [];
+}
+
+/**
+ * Remove a linked provider. Refuses to remove the LAST one: an account with no
+ * identities cannot be signed into again, so allowing it would be a one-click
+ * way to lock yourself out permanently.
+ */
+export async function unlinkProvider(env: Env, agentId: string, provider: string): Promise<void> {
+  const links = await identitiesOf(env, agentId);
+  if (links.length <= 1)
+    throw new OpError(409, "that is your only sign-in method — link another provider before removing this one");
+  if (!links.some((l) => l.provider === provider)) throw new OpError(404, `${provider} is not linked to this account`);
+  await env.DB.prepare("DELETE FROM agent_identities WHERE agent_id = ? AND provider = ?")
+    .bind(agentId, provider)
+    .run();
+}
+
+/** CSRF token for profile forms, bound to the session it was issued for. */
+export async function formToken(env: Env, agentId: string): Promise<string> {
+  return hmac(env.SESSION_SECRET ?? "", `form:${agentId}`);
+}
+export async function checkFormToken(env: Env, agentId: string, given: string): Promise<boolean> {
+  return safeEq(given, await formToken(env, agentId));
 }
 
 export function logout(): Response {
