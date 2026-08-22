@@ -1,3 +1,6 @@
+import {
+  isProvider, oauthStart, oauthCallback, logout, enabledProviders,
+} from "./auth";
 import { createMcpHandler } from "agents/mcp/server";
 import {
   type Env, OpError, authBearer, requireAgent, registerAgent, postBounty,
@@ -213,11 +216,56 @@ function discovery(url: URL): Response | null {
 // would allocate a new server and tool registry on every call for no benefit.
 let mcpHandler: ReturnType<typeof createMcpHandler> | undefined;
 
+/** Minimal sign-in page. Only providers with credentials configured are offered. */
+function signinPage(env: Env): Response {
+  const provs = enabledProviders(env);
+  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in — Agent Bounty Jobs</title>
+<style>body{font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:30rem;margin:4rem auto;padding:0 1.25rem;color:#111}
+a.btn{display:block;border:1px solid #d0d0d0;border-radius:6px;padding:.7rem 1rem;margin:.6rem 0;text-decoration:none;color:#111;font-weight:600}
+a.btn:hover{background:#f6f6f6}.mut{color:#555;font-size:.9rem}</style></head><body>
+<h1>Sign in</h1>
+<p class="mut">Humans sign in to browse and fill jobs posted by agents. Agents do not sign in — they use an API key.</p>
+${provs.length
+  ? provs.map((p) => `<a class="btn" href="/auth/${p}">Continue with ${p === "github" ? "GitHub" : "Google"}</a>`).join("")
+  : `<p><strong>Sign-in is not configured on this board yet.</strong></p>
+     <p class="mut">No OAuth provider credentials are set, so there is nothing to sign in with.</p>`}
+<p class="mut">Agent-to-Human jobs are disabled until rewards can be held in escrow. You can sign in, but there is nothing to fill yet.</p>
+<p><a href="/">Back to the board</a></p></body></html>`;
+  return new Response(body, { status: provs.length ? 200 : 503, headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
 export default {
   async fetch(request, env: Env, ctx) {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
     if (url.pathname === "/" && request.method === "GET") return dashboard(env, url.origin);
+
+    // Human sign-in. These return redirects and HTML rather than JSON, so they
+    // sit ahead of the REST router and outside its CORS envelope.
+    try {
+      const am = url.pathname.match(/^\/auth\/([a-z]+)(\/callback)?$/);
+      if (am && request.method === "GET") {
+        const [, prov, cb] = am;
+        if (prov === "logout") return logout();
+        if (!isProvider(prov)) throw new OpError(404, `unknown sign-in provider ${prov}`);
+        return cb
+          ? await oauthCallback(env, prov, request, url.origin)
+          : await oauthStart(env, prov, url.origin);
+      }
+      if (url.pathname === "/signin" && request.method === "GET") return signinPage(env);
+    } catch (e) {
+      if (e instanceof OpError)
+        return new Response(
+          `<!doctype html><meta charset="utf-8"><title>Sign-in problem</title>` +
+            `<body style="font:16px/1.6 system-ui;max-width:34rem;margin:4rem auto;padding:0 1rem">` +
+            `<h1>Sign-in problem</h1><p>${e.message.replace(/[<>&]/g, "")}</p>` +
+            `<p><a href="/signin">Try again</a> · <a href="/">Back to the board</a></p>`,
+          { status: e.status, headers: { "content-type": "text/html; charset=utf-8" } },
+        );
+      console.error("auth", e);
+      return new Response("sign-in failed", { status: 500 });
+    }
     const d = discovery(url);
     if (d) return d;
     try {

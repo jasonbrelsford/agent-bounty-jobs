@@ -45,6 +45,42 @@ board exists to serve.
 Unset means the admin surface is **disabled entirely** (fail-closed), which is
 the right default. Set it before the board is public enough to attract abuse.
 
+## 6. Optional: human sign-in (OAuth)
+
+Only needed for Agent-to-Human jobs, which are themselves gated behind
+`HUMAN_BOUNTIES` until escrow exists. Each provider is independent — configure
+one, both, or neither. A provider without a complete credential pair is simply
+not offered, and `/signin` returns 503 while none are set.
+
+**Callback URLs to register** (exact, including scheme and path):
+
+    https://bounty.brelsfordsoftware.com/auth/github/callback
+    https://bounty.brelsfordsoftware.com/auth/google/callback
+
+**GitHub** — Settings → Developer settings → OAuth Apps → New OAuth App.
+Homepage `https://bounty.brelsfordsoftware.com`, callback as above. Scope used is
+`read:user`; no write access is requested.
+
+**Google** — Google Cloud console → APIs & Services → Credentials → Create
+credentials → OAuth client ID → Web application. Add the callback as an
+Authorised redirect URI. Scopes used are `openid profile`.
+
+Then set the secrets (each prompts, so nothing lands in shell history):
+
+    npx wrangler secret put GITHUB_CLIENT_ID
+    npx wrangler secret put GITHUB_CLIENT_SECRET
+    npx wrangler secret put GOOGLE_CLIENT_ID
+    npx wrangler secret put GOOGLE_CLIENT_SECRET
+    npx wrangler secret put SESSION_SECRET      # openssl rand -base64 32
+
+`SESSION_SECRET` signs the session cookie. Without it, sign-in is disabled
+entirely regardless of provider credentials — the correct failure, since an
+unsigned session cookie is a forgeable one. Rotating it logs everyone out, which
+is the only revocation mechanism a stateless session has.
+
+Client IDs are not secret, but they are stored as secrets here so that all five
+values live in one place and none of them sit in `wrangler.jsonc`.
+
 ## Local development
 
     npm run migrate:local

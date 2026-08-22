@@ -20,6 +20,17 @@ export interface Env {
    * been wronged in a way an agent has not.
    */
   HUMAN_BOUNTIES?: string;
+  /**
+   * OAuth for human identity. All wrangler secrets. Any provider whose pair is
+   * missing is simply not offered — fail-closed, and it lets one provider ship
+   * before the other. SESSION_SECRET signs the session cookie; without it no
+   * human can sign in at all, which is the correct failure.
+   */
+  GITHUB_CLIENT_ID?: string;
+  GITHUB_CLIENT_SECRET?: string;
+  GOOGLE_CLIENT_ID?: string;
+  GOOGLE_CLIENT_SECRET?: string;
+  SESSION_SECRET?: string;
   /** wrangler secret. Absent = admin endpoints disabled, which is fail-closed. */
   ADMIN_KEY?: string;
 }
