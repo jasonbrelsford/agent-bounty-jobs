@@ -75,3 +75,67 @@ test("splitPayout conserves cents across randomized splits", () => {
     assert.equal(splitPayout(cents, sh).reduce((a, b) => a + b, 0), cents);
   }
 });
+
+import { validateEvidenceSpec, validateEvidence, metresBetween, evidenceManifest } from "../.test-build/core.js";
+
+const SPEC = validateEvidenceSpec([
+  { kind: "photo", label: "Storefront", min: 2, require_geo: true,
+    near: { lat: 38.7223, lon: -9.1393, radius_m: 150 } },
+  { kind: "receipt", label: "Purchase receipt", fields: ["vendor", "reference"] },
+  { kind: "url", label: "Published review", starts_with: "https://example.com/" },
+]);
+const photo = (lat, lon) => ({ kind: "photo", label: "Storefront", value: { url: "https://i/x.jpg", geo: { lat, lon } } });
+const receipt = { kind: "receipt", label: "Purchase receipt", value: { vendor: "Acme", reference: "R-1" } };
+const review = { kind: "url", label: "Published review", value: { url: "https://example.com/r/1" } };
+const full = () => [photo(38.7223, -9.1393), photo(38.7224, -9.1394), receipt, review];
+
+test("evidence spec rejects malformed requirements", () => {
+  assert.throws(() => validateEvidenceSpec([{ kind: "nope", label: "x" }]), /evidence kind/);
+  assert.throws(() => validateEvidenceSpec([{ kind: "photo", label: "ab" }]), /label/);
+  assert.throws(() => validateEvidenceSpec([{ kind: "photo", label: "Shop", min: 0 }]), /min/);
+  assert.throws(() => validateEvidenceSpec([{ kind: "photo", label: "Shop", near: { lat: 999, lon: 0, radius_m: 5 } }]), /lat/);
+});
+
+test("proximity requirement implies a geo requirement", () => {
+  assert.equal(validateEvidenceSpec([{ kind: "photo", label: "Shop", near: { lat: 1, lon: 1, radius_m: 10 } }])[0].require_geo, true);
+});
+
+test("evidence must satisfy counts, fields, matchers and geo", () => {
+  assert.equal(validateEvidence(SPEC, full()).length, 4);
+  assert.throws(() => validateEvidence(SPEC, [photo(38.7223, -9.1393), receipt, review]), /requires 2/);
+  assert.throws(() => validateEvidence(SPEC, [...full().slice(0, 2), { kind: "receipt", label: "Purchase receipt", value: { vendor: "Acme" } }, review]), /reference/);
+  assert.throws(() => validateEvidence(SPEC, [...full().slice(0, 3), { kind: "url", label: "Published review", value: { url: "https://elsewhere.com/x" } }]), /must start with/);
+  assert.throws(() => validateEvidence(SPEC, [...full().slice(0, 3), { kind: "url", label: "Published review", value: { url: "http://example.com/r/1" } }]), /https/);
+  assert.throws(() => validateEvidence(SPEC, [{ kind: "photo", label: "Nope", value: { url: "https://i/x.jpg" } }]), /does not match any requirement/);
+  assert.throws(() => validateEvidence(SPEC, [{ kind: "photo", label: "Storefront", value: { url: "https://i/x.jpg" } }, ...full().slice(1)]), /geo/);
+});
+
+test("a far coordinate is recorded non-compliant, not rejected", () => {
+  // The coordinate is a CLAIM. Wrong claim with right work is the poster's call.
+  const out = validateEvidence(SPEC, [photo(38.7223, -9.1393), photo(0, 0), receipt, review]);
+  assert.equal(out.filter((e) => e.compliant === false).length, 1);
+  assert.equal(out.filter((e) => e.compliant === true).length, 3);
+});
+
+test("a bounty asking for nothing accepts nothing", () => {
+  assert.deepEqual(validateEvidence([], []), []);
+  assert.throws(() => validateEvidence([], [review]), /does not ask for evidence/);
+});
+
+test("manifest exposes shape and compliance but never values", () => {
+  const rows = [
+    { kind: "photo", label: "Storefront", value: JSON.stringify({ url: "https://secret/x.jpg" }), provenance: "self_reported", compliant: 1 },
+    { kind: "photo", label: "Storefront", value: JSON.stringify({ url: "https://secret/y.jpg" }), provenance: "self_reported", compliant: 0 },
+  ];
+  const m = evidenceManifest(rows);
+  assert.equal(m.length, 1);
+  assert.equal(m[0].count, 2);
+  assert.equal(m[0].all_compliant, false);
+  assert.ok(!JSON.stringify(m).includes("secret"), "manifest must not leak values");
+});
+
+test("metresBetween is sane", () => {
+  assert.ok(metresBetween(38.7223, -9.1393, 38.7223, -9.1393) < 1);
+  const d = metresBetween(38.7223, -9.1393, 38.7323, -9.1393);
+  assert.ok(d > 1000 && d < 1200, `~1.11km, got ${d}`);
+});

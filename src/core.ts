@@ -44,7 +44,7 @@ export type Bounty = {
   status: string; deadline: string | null;
   awarded_submission_id: string | null; awarded_at: string | null;
   payment_ref: string | null; fee_bp: number; fee_cents: number | null;
-  audience: string; created_at: string;
+  audience: string; evidence_required: string | null; created_at: string;
 };
 
 export type Submission = {
@@ -59,8 +59,25 @@ export type Contributor = {
   accepted_at: string | null; payout_cents: number | null;
 };
 
+export const EVIDENCE_KINDS =
+  ["photo", "url", "receipt", "code", "location", "file", "attestation"] as const;
+
+export type EvidenceReq = {
+  kind: string; label: string; min: number;
+  fields?: string[];
+  starts_with?: string; contains?: string;
+  min_length?: number; max_length?: number;
+  require_geo?: boolean;
+  near?: { lat: number; lon: number; radius_m: number };
+};
+
+export type EvidenceRow = {
+  id: string; submission_id: string; kind: string; label: string | null;
+  value: string; provenance: string; compliant: number; created_at: string;
+};
+
 export type Milestone = {
-  id: string; bounty_id: string; idx: number; title: string;
+  id: string; bounty_id: string; idx: number; title: string; evidence_required?: string | null;
   reward_amount_cents: number; status: string;
   awarded_submission_id: string | null; awarded_at: string | null;
   fee_cents: number | null; created_at: string;
@@ -93,6 +110,9 @@ export const LIMITS = {
   list_limit_max: 100,
   contributors_per_submission: 16,               // incl. the lead; see splitPayout
   milestones_per_bounty: 10,
+  evidence_requirements: 8,                      // distinct requirements per bounty
+  evidence_items: 24,                            // evidence rows per submission
+  evidence_value_chars: 600,                     // per field, bounds any matcher's work
   milestone_title: { min: 4, max: 100 },
 } as const;
 
@@ -320,6 +340,167 @@ async function contributorsOf(db: D1Database, submissionId: string): Promise<Con
   return results ?? [];
 }
 
+/**
+ * Validate a poster's evidence requirements at post time.
+ *
+ * NOTE ON MATCHERS: the design sketch had a poster-supplied regex. That is a
+ * denial-of-service vector — a pattern with nested quantifiers backtracks
+ * catastrophically, and the board would be running an ATTACKER'S regex against a
+ * SUBMITTER'S string on every submission. Workers cannot time a regex out, so
+ * the safe move is not to run one. These declarative matchers cover the real
+ * cases (an https URL, a prefixed reference, a length bound) and cannot blow up.
+ */
+export function validateEvidenceSpec(raw: unknown): EvidenceReq[] {
+  if (raw == null) return [];
+  if (!Array.isArray(raw)) throw new OpError(400, "evidence_required must be an array");
+  if (raw.length > LIMITS.evidence_requirements)
+    throw new OpError(400, `at most ${LIMITS.evidence_requirements} evidence requirements per bounty`);
+  return raw.map((r) => {
+    const o = (r ?? {}) as Record<string, unknown>;
+    const kind = String(o.kind ?? "");
+    if (!(EVIDENCE_KINDS as readonly string[]).includes(kind))
+      throw new OpError(400, `evidence kind must be one of: ${EVIDENCE_KINDS.join(", ")}`);
+    const label = reqString(o.label, "evidence label", 3, 120);
+    const min = o.min == null ? 1 : Number(o.min);
+    if (!Number.isInteger(min) || min < 1 || min > LIMITS.evidence_items)
+      throw new OpError(400, `evidence "min" must be an integer between 1 and ${LIMITS.evidence_items}`);
+    const req: EvidenceReq = { kind, label, min };
+    if (o.fields != null) {
+      if (!Array.isArray(o.fields) || o.fields.some((f) => typeof f !== "string"))
+        throw new OpError(400, "evidence fields must be an array of strings");
+      if (o.fields.length > 12) throw new OpError(400, "at most 12 fields per evidence requirement");
+      req.fields = o.fields as string[];
+    }
+    for (const k of ["starts_with", "contains"] as const)
+      if (o[k] != null) req[k] = reqString(o[k], `evidence ${k}`, 1, 200);
+    for (const k of ["min_length", "max_length"] as const)
+      if (o[k] != null) {
+        const v = Number(o[k]);
+        if (!Number.isInteger(v) || v < 0 || v > LIMITS.evidence_value_chars)
+          throw new OpError(400, `evidence ${k} must be an integer between 0 and ${LIMITS.evidence_value_chars}`);
+        req[k] = v;
+      }
+    if (o.require_geo != null) req.require_geo = Boolean(o.require_geo);
+    if (o.near != null) {
+      const n = o.near as Record<string, unknown>;
+      const lat = Number(n.lat), lon = Number(n.lon), radius = Number(n.radius_m);
+      if (!Number.isFinite(lat) || lat < -90 || lat > 90) throw new OpError(400, "near.lat must be -90..90");
+      if (!Number.isFinite(lon) || lon < -180 || lon > 180) throw new OpError(400, "near.lon must be -180..180");
+      if (!Number.isFinite(radius) || radius <= 0 || radius > 100_000)
+        throw new OpError(400, "near.radius_m must be 1..100000");
+      req.near = { lat, lon, radius_m: radius };
+      req.require_geo = true;   // asking for proximity without a coordinate is incoherent
+    }
+    return req;
+  });
+}
+
+/** Great-circle distance in metres. Used only to check a CLAIMED coordinate. */
+export function metresBetween(aLat: number, aLon: number, bLat: number, bLon: number): number {
+  const R = 6_371_000, rad = Math.PI / 180;
+  const dLat = (bLat - aLat) * rad, dLon = (bLon - aLon) * rad;
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(aLat * rad) * Math.cos(bLat * rad) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+/**
+ * Check submitted evidence against the poster's requirements.
+ *
+ * Everything arriving through the API is `self_reported`, and that is not a
+ * placeholder for something better: a submitter-declared provenance is itself
+ * self-reported, so accepting the claim would launder it. `platform_captured`
+ * becomes reachable only when a capture client stamps server-side.
+ */
+export function validateEvidence(
+  spec: EvidenceReq[],
+  raw: unknown,
+): { kind: string; label: string; value: Record<string, unknown>; compliant: boolean }[] {
+  if (!spec.length) {
+    if (raw != null && (!Array.isArray(raw) || raw.length))
+      throw new OpError(400, "this bounty does not ask for evidence");
+    return [];
+  }
+  if (!Array.isArray(raw)) throw new OpError(400, "evidence must be an array");
+  if (raw.length > LIMITS.evidence_items)
+    throw new OpError(400, `at most ${LIMITS.evidence_items} evidence items per submission`);
+
+  const out: { kind: string; label: string; value: Record<string, unknown>; compliant: boolean }[] = [];
+  for (const item of raw) {
+    const o = (item ?? {}) as Record<string, unknown>;
+    const kind = String(o.kind ?? "");
+    const label = String(o.label ?? "");
+    const req = spec.find((r) => r.kind === kind && r.label === label);
+    if (!req)
+      throw new OpError(400, `evidence item "${label}" (${kind}) does not match any requirement on this bounty`);
+    const v = (o.value ?? {}) as Record<string, unknown>;
+
+    // photo/url/file carry a link; the rest carry text or structured fields.
+    let primary = "";
+    if (kind === "photo" || kind === "url" || kind === "file") {
+      primary = reqString(v.url, `${label} url`, 1, LIMITS.evidence_value_chars);
+      if (!/^https:\/\//i.test(primary)) throw new OpError(400, `${label}: url must be https`);
+    } else if (kind !== "receipt" && kind !== "location") {
+      primary = reqString(v.text, `${label} text`, 1, LIMITS.evidence_value_chars);
+    }
+
+    if (req.fields)
+      for (const f of req.fields)
+        if (v[f] == null || String(v[f]).trim() === "")
+          throw new OpError(400, `${label}: field "${f}" is required`);
+
+    const probe = primary || String(v.reference ?? v.text ?? "");
+    if (req.starts_with && !probe.startsWith(req.starts_with))
+      throw new OpError(400, `${label}: must start with "${req.starts_with}"`);
+    if (req.contains && !probe.includes(req.contains))
+      throw new OpError(400, `${label}: must contain "${req.contains}"`);
+    if (req.min_length != null && probe.length < req.min_length)
+      throw new OpError(400, `${label}: must be at least ${req.min_length} characters`);
+    if (req.max_length != null && probe.length > req.max_length)
+      throw new OpError(400, `${label}: must be at most ${req.max_length} characters`);
+
+    let compliant = true;
+    if (req.require_geo) {
+      const g = (v.geo ?? {}) as Record<string, unknown>;
+      const lat = Number(g.lat), lon = Number(g.lon);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon))
+        throw new OpError(400, `${label}: a geo {lat, lon} is required`);
+      if (req.near) {
+        const d = metresBetween(req.near.lat, req.near.lon, lat, lon);
+        // Recorded, not enforced: the coordinate is a claim, and a wrong claim
+        // with right work is the poster's call to make, not the board's.
+        compliant = d <= req.near.radius_m;
+      }
+    }
+    out.push({ kind, label, value: v, compliant });
+  }
+
+  for (const r of spec) {
+    const n = out.filter((o) => o.kind === r.kind && o.label === r.label).length;
+    if (n < r.min)
+      throw new OpError(400, `evidence "${r.label}" requires ${r.min} item(s); ${n} supplied`);
+  }
+  return out;
+}
+
+/**
+ * What the poster sees BEFORE awarding: shape and compliance, never values.
+ * Without this, requiring evidence would reopen the harvest hole — ask for the
+ * photo URL, read it, cancel, keep it.
+ */
+export function evidenceManifest(rows: EvidenceRow[]) {
+  const byKey = new Map<string, { kind: string; label: string | null; count: number; provenance: string; all_compliant: boolean }>();
+  for (const r of rows) {
+    const k = `${r.kind}|${r.label}`;
+    const e = byKey.get(k) ?? { kind: r.kind, label: r.label, count: 0, provenance: r.provenance, all_compliant: true };
+    e.count++;
+    if (!r.compliant) e.all_compliant = false;
+    byKey.set(k, e);
+  }
+  return [...byKey.values()];
+}
+
 export async function expireOverdue(db: D1Database): Promise<void> {
   const now = nowIso();
   const { results } = await db
@@ -375,7 +556,7 @@ export async function postBounty(
   input: {
     title?: unknown; description?: unknown; category?: unknown;
     acceptance_criteria?: unknown; reward_amount_cents?: unknown; deadline?: unknown;
-    milestones?: unknown; audience?: unknown;
+    milestones?: unknown; audience?: unknown; evidence_required?: unknown;
   },
 ) {
   const title = reqString(input.title, "title", LIMITS.title.min, LIMITS.title.max);
@@ -427,6 +608,7 @@ export async function postBounty(
     deadline = new Date(t).toISOString();
   }
 
+  const evidence = validateEvidenceSpec(input.evidence_required);
   const audience = String(input.audience ?? "agents");
   if (!(AUDIENCES as readonly string[]).includes(audience))
     throw new OpError(400, `audience must be one of: ${AUDIENCES.join(", ")}`);
@@ -464,9 +646,10 @@ export async function postBounty(
   await db.batch([
     db.prepare(
       `INSERT INTO bounties (id, poster_id, title, description, category, acceptance_criteria,
-         reward_amount_cents, reward_currency, status, deadline, fee_bp, audience, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'USD', 'open', ?, ?, ?, ?)`,
-    ).bind(id, agent.id, title, description, category, criteria, cents, deadline, PLATFORM_FEE_BP, audience, at),
+         reward_amount_cents, reward_currency, status, deadline, fee_bp, audience, evidence_required, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'USD', 'open', ?, ?, ?, ?, ?)`,
+    ).bind(id, agent.id, title, description, category, criteria, cents, deadline, PLATFORM_FEE_BP, audience,
+           evidence.length ? JSON.stringify(evidence) : null, at),
     ...parts.map((m, i) =>
       db.prepare(
         "INSERT INTO milestones (id, bounty_id, idx, title, reward_amount_cents, status, created_at) VALUES (?, ?, ?, ?, ?, 'open', ?)",
@@ -489,6 +672,7 @@ export async function postBounty(
     platform_fee_bp: PLATFORM_FEE_BP,
     net_to_filler: fmtMoney(fs.net, "USD"),
     audience,
+    evidence_required: evidence.length ? evidence : undefined,
     // Disclosure is not decoration: a person is entitled to know they are being
     // directed by software before they agree to the work.
     human_disclosure: humanFillable
@@ -509,7 +693,7 @@ const PUBLIC_BOUNTY_COLS =
   `b.id, b.poster_id, a.name AS poster_name, b.title, b.description, b.category,
    b.acceptance_criteria, b.reward_amount_cents, b.reward_currency, b.status,
    b.deadline, b.awarded_submission_id, b.awarded_at, b.payment_ref,
-   b.fee_bp, b.fee_cents, b.audience, b.created_at,
+   b.fee_bp, b.fee_cents, b.audience, b.evidence_required, b.created_at,
    (SELECT COUNT(*) FROM submissions s WHERE s.bounty_id = b.id) AS submission_count`;
 
 export type PublicBounty = Bounty & { poster_name: string; submission_count: number };
@@ -592,10 +776,36 @@ export async function posterReputation(db: D1Database, posterId: string) {
   };
 }
 
-/** Attach the contributor roster to each submission, so a reviewer can see who is owed what. */
-async function withTeams(db: D1Database, subs: Submission[]) {
+async function evidenceOf(db: D1Database, submissionId: string): Promise<EvidenceRow[]> {
+  const { results } = await db
+    .prepare("SELECT * FROM submission_evidence WHERE submission_id = ? ORDER BY rowid")
+    .bind(submissionId)
+    .all<EvidenceRow>();
+  return results ?? [];
+}
+
+/**
+ * Attach the contributor roster, and evidence at the right fidelity.
+ *
+ * `reveal` is true only for a submission that has been AWARDED. Before that the
+ * poster gets the manifest: enough to answer "did they do what I asked?" without
+ * answering "what is the answer?". Anything looser and requiring evidence would
+ * be a way to collect it for free.
+ */
+async function withTeams(db: D1Database, subs: Submission[], reveal = false) {
   return Promise.all(
-    subs.map(async (sub) => ({ ...sub, contributors: await contributorsOf(db, sub.id) })),
+    subs.map(async (sub) => {
+      const rows = await evidenceOf(db, sub.id);
+      const revealThis = reveal || sub.status === "accepted";
+      return {
+        ...sub,
+        contributors: await contributorsOf(db, sub.id),
+        evidence: revealThis
+          ? rows.map((r) => ({ ...r, value: JSON.parse(r.value), compliant: !!r.compliant }))
+          : undefined,
+        evidence_manifest: revealThis ? undefined : evidenceManifest(rows),
+      };
+    }),
   );
 }
 
@@ -618,6 +828,9 @@ export async function getBounty(
   if (!bounty || bounty.status === "removed") throw new OpError(404, `no bounty ${id}`);
   (bounty as PublicBounty & { poster_reputation?: unknown; milestones?: unknown }).poster_reputation =
     await posterReputation(db, bounty.poster_id);
+  if (bounty.evidence_required)
+    (bounty as PublicBounty & { evidence_required_parsed?: unknown }).evidence_required_parsed =
+      JSON.parse(bounty.evidence_required);
   const parts = await milestonesOf(db, id);
   if (parts.length)
     (bounty as PublicBounty & { milestones?: unknown }).milestones = parts.map((m) => ({
@@ -662,7 +875,7 @@ export async function getBounty(
       .bind(id, viewer.id)
       .all<Submission>();
     if (results.length)
-      return { bounty, submissions: await withTeams(db, results), your_role: "contributor" };
+      return { bounty, submissions: await withTeams(db, results, true), your_role: "contributor" };
     const invited = await db
       .prepare(
         "SELECT s.id FROM submissions s JOIN submission_contributors c ON c.submission_id = s.id " +
@@ -688,6 +901,7 @@ export async function submitToBounty(
   contributorsRaw?: unknown,
   previewRaw?: unknown,
   milestoneIdRaw?: unknown,
+  evidenceRaw?: unknown,
 ) {
   await expireOverdue(db);
   const content = reqString(contentRaw, "content", 1, LIMITS.submission_content.max);
@@ -721,6 +935,12 @@ export async function submitToBounty(
     throw new OpError(400, "this bounty has no milestones — omit milestone_id");
   }
   const targetCents = milestone ? milestone.reward_amount_cents : b.reward_amount_cents;
+  // A milestone may override the bounty-level requirement: parts of a job often
+  // need different proof.
+  const spec = validateEvidenceSpec(
+    JSON.parse((milestone?.evidence_required ?? b.evidence_required) ?? "null"),
+  );
+  const evidence = validateEvidence(spec, evidenceRaw);
 
   // Solo is the degenerate team: one contributor at 100%. Keeping a single
   // shape here is what gives award one payout path instead of two.
@@ -770,6 +990,11 @@ export async function submitToBounty(
     db.prepare(
       "INSERT INTO submissions (id, bounty_id, agent_id, milestone_id, content, preview, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     ).bind(id, bountyId, agent.id, milestone?.id ?? null, content, preview, solo ? "pending" : "draft", at),
+    ...evidence.map((e) =>
+      db.prepare(
+        "INSERT INTO submission_evidence (id, submission_id, kind, label, value, provenance, compliant, created_at) VALUES (?, ?, ?, ?, ?, 'self_reported', ?, ?)",
+      ).bind(newId("evd"), id, e.kind, e.label, JSON.stringify(e.value), e.compliant ? 1 : 0, at),
+    ),
     ...roster.map((r) =>
       db.prepare(
         "INSERT INTO submission_contributors (submission_id, agent_id, share_bp, accepted_at) VALUES (?, ?, ?, ?)",
@@ -790,6 +1015,10 @@ export async function submitToBounty(
     bounty_id: bountyId,
     milestone_id: milestone?.id ?? null,
     filling: milestone ? milestone.title : "the whole bounty",
+    evidence_accepted: evidence.length,
+    evidence_note: evidence.length
+      ? "Your evidence is sealed like your content: the poster sees only its shape and whether it complied until they award you."
+      : undefined,
     status: solo ? "pending" : "draft",
     contributors: roster.map((r) => ({
       agent_id: r.agent_id,

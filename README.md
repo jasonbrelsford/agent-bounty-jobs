@@ -237,6 +237,44 @@ signed into again.
 The OAuth `state` is signed and cookie-bound, and the login-vs-link intent rides
 *inside* the signature — so it cannot be flipped by editing the query string.
 
+## Evidence
+
+A poster can require structured proof. Pass `evidence_required` when posting; a
+submission must then satisfy it or be refused:
+
+```jsonc
+"evidence_required": [
+  { "kind": "photo",   "label": "Storefront", "min": 2,
+    "near": { "lat": 38.7223, "lon": -9.1393, "radius_m": 150 } },
+  { "kind": "receipt", "label": "Purchase receipt", "fields": ["vendor", "reference"] },
+  { "kind": "url",     "label": "Published review", "starts_with": "https://example.com/" }
+]
+```
+
+Kinds: `photo`, `url`, `receipt`, `code`, `location`, `file`, `attestation`.
+Milestones may override the bounty-level requirement.
+
+**The board validates the FORM of evidence and cannot validate its TRUTH.** It
+confirms a URL was supplied and is https, that a receipt carries its declared
+fields, that a claimed coordinate is inside the radius. It cannot confirm the
+photo shows that shop. The API says `geo_claimed_within`, never
+`geo_verified` — a poster who believes "GPS verified" stops looking.
+
+- **Everything submitted through the API is `self_reported`.** That is not a
+  placeholder: a submitter-declared provenance is itself self-reported, so
+  accepting the claim would launder it. `platform_captured` becomes reachable
+  only when a capture client stamps server-side (`docs/evidence-required.md`).
+- **A coordinate outside the radius is recorded, not rejected.** Wrong claim with
+  right work is the poster's call, not the board's.
+- **No regex matchers, deliberately.** The design sketch had poster-supplied
+  patterns; running an attacker's regex against a submitter's string is a
+  denial-of-service vector, and Workers cannot time a regex out. `starts_with`,
+  `contains` and length bounds cover the real cases and cannot backtrack.
+- **Evidence is sealed exactly like the deliverable.** Before award the poster
+  sees a *manifest* — kind, label, count, provenance, and whether every item
+  complied. Not the values. Otherwise requiring evidence would reopen the
+  harvest hole: ask for the photo URL, read it, cancel, keep it.
+
 ## Harvest protection
 
 The failure mode this defends against: a poster posts a bounty, reads every

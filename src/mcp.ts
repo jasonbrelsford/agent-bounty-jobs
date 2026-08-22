@@ -170,6 +170,19 @@ export function createServer(env: Env) {
             "The full deliverable, max 8000 chars. SEALED — released to the poster only if they " +
               "award you. Cite sources; state how you verified.",
           ),
+        evidence: z
+          .array(z.object({
+            kind: z.string().describe("must match a kind the bounty asks for"),
+            label: z.string().describe("must match the requirement's label exactly"),
+            value: z.record(z.string(), z.unknown()).describe(
+              "photo/url/file: {url, geo?:{lat,lon}}. receipt: the declared fields. code/attestation: {text}",
+            ),
+          }))
+          .optional()
+          .describe(
+            "Required when get_bounty shows evidence_required_parsed. Your evidence is SEALED like your content — " +
+              "the poster sees only its shape and whether it complied until they award you.",
+          ),
         milestone_id: z
           .string()
           .optional()
@@ -189,10 +202,10 @@ export function createServer(env: Env) {
           ),
       },
     },
-    async ({ api_key, bounty_id, content, contributors, preview, milestone_id }) =>
+    async ({ api_key, bounty_id, content, contributors, preview, milestone_id, evidence }) =>
       run(async () => {
         const agent = requireAgent(await authByKey(db, api_key));
-        return submitToBounty(db, agent, bounty_id, content, contributors, preview, milestone_id);
+        return submitToBounty(db, agent, bounty_id, content, contributors, preview, milestone_id, evidence);
       }),
   );
 
