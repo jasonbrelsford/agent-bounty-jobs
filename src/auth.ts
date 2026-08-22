@@ -180,13 +180,47 @@ export async function oauthCallback(env: Env, p: Provider, request: Request, ori
     // a completed OAuth round trip (control of that provider identity).
     const me = await sessionAgent(env, request);
     if (!me) throw new OpError(403, "sign in first, then link a second provider from your profile");
-    if (existing && existing.agent_id !== me.id)
-      // Never silently move an identity between accounts — that would be a
-      // one-click way to strip someone else's provider off their account.
-      throw new OpError(
-        409,
-        "that account is already linked to a different profile here. Sign in with it directly, or unlink it there first.",
-      );
+    if (existing && existing.agent_id !== me.id) {
+      // Completing this OAuth round trip PROVES control of the identity, and
+      // that identity is a way into the other account — so the person doing
+      // this already controls both. What must not happen is stranding history:
+      // moving an account's last identity when it has work behind it would
+      // leave that record unreachable forever.
+      const other = existing.agent_id;
+      const [act, links] = await Promise.all([
+        env.DB.prepare(
+          `SELECT (SELECT COUNT(*) FROM bounties WHERE poster_id = ?1)
+                + (SELECT COUNT(*) FROM submissions WHERE agent_id = ?1)
+                + (SELECT COUNT(*) FROM submission_contributors WHERE agent_id = ?1) AS n`,
+        ).bind(other).first<{ n: number }>(),
+        env.DB.prepare("SELECT COUNT(*) AS n FROM agent_identities WHERE agent_id = ?")
+          .bind(other).first<{ n: number }>(),
+      ]);
+      const activity = act?.n ?? 0;
+      const otherLinks = links?.n ?? 0;
+      const staysReachable = otherLinks > 1;
+
+      if (activity > 0 && !staysReachable)
+        throw new OpError(
+          409,
+          "that sign-in belongs to another profile here which has activity on it, and it is that profile's only way in. " +
+            "Moving it would strand that history. Sign in with it directly instead.",
+        );
+
+      const at = new Date().toISOString();
+      const stmts = [
+        env.DB.prepare("UPDATE agent_identities SET agent_id = ?, linked_at = ? WHERE subject = ?")
+          .bind(me.id, at, subject),
+        env.DB.prepare("INSERT INTO events (at, kind, bounty_id, agent_id, detail) VALUES (?, 'identity_linked', NULL, ?, ?)")
+          .bind(at, me.id, `${p} sign-in moved onto this account from an empty duplicate`),
+      ];
+      // An account with no activity and no remaining way in is a husk. Leaving
+      // it would accumulate unreachable rows that look like real people.
+      if (!staysReachable && activity === 0)
+        stmts.push(env.DB.prepare("DELETE FROM agents WHERE id = ?").bind(other));
+      await env.DB.batch(stmts);
+      return redirectWithSession(env, me.id, "/profile");
+    }
     if (!existing) {
       const at = new Date().toISOString();
       await env.DB.batch([
