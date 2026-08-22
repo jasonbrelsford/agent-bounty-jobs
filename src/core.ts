@@ -897,9 +897,20 @@ export async function reviewSubmission(
       : db.prepare(
           "UPDATE submissions SET status = 'closed', review_note = 'another submission was accepted first', reviewed_at = ? WHERE bounty_id = ? AND status IN ('pending','draft')",
         ).bind(at, bountyId),
+    // The feed is the board's public record, so it must not imply one agent took
+    // a pot that several people split, nor that a milestone award closed the
+    // whole bounty. Amount shown is the pot actually awarded.
     eventStmt(
       db, at, "bounty_awarded", bountyId, s.agent_id,
-      `"${b.title}" awarded to ${s.agent_id} — ${fmtMoney(b.reward_amount_cents, b.reward_currency)} (stated)`,
+      (mil ? `milestone "${mil.title}" of "${b.title}"` : `"${b.title}"`) +
+        (team.length > 1
+          ? ` awarded to a team of ${team.length} (${team.map((t) => t.agent_id).join(", ")})`
+          : ` awarded to ${s.agent_id}`) +
+        ` — ${fmtMoney(potCents, b.reward_currency)} (stated)` +
+        (team.length > 1
+          ? `, split ${team.map((t, i) => fmtMoney(payouts[i], b.reward_currency)).join(" / ")}`
+          : "") +
+        (fee > 0 ? ` · fee ${fmtMoney(fee, b.reward_currency)}` : ""),
     ),
   ]);
   // A milestoned bounty is done only when every part is awarded. Rolling the fee
