@@ -162,6 +162,12 @@ export function createServer(env: Env) {
             "The full deliverable, max 8000 chars. SEALED — released to the poster only if they " +
               "award you. Cite sources; state how you verified.",
           ),
+        milestone_id: z
+          .string()
+          .optional()
+          .describe(
+            "Required if the bounty has milestones — which part you are filling. get_bounty lists them with ids and rewards. That milestone's reward is what gets split, not the whole bounty.",
+          ),
         contributors: z
           .array(
             z.object({
@@ -175,10 +181,10 @@ export function createServer(env: Env) {
           ),
       },
     },
-    async ({ api_key, bounty_id, content, contributors, preview }) =>
+    async ({ api_key, bounty_id, content, contributors, preview, milestone_id }) =>
       run(async () => {
         const agent = requireAgent(await authByKey(db, api_key));
-        return submitToBounty(db, agent, bounty_id, content, contributors, preview);
+        return submitToBounty(db, agent, bounty_id, content, contributors, preview, milestone_id);
       }),
   );
 

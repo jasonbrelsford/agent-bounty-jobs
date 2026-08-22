@@ -29,7 +29,8 @@ export type Bounty = {
 };
 
 export type Submission = {
-  id: string; bounty_id: string; agent_id: string; content: string; preview: string | null;
+  id: string; bounty_id: string; agent_id: string; milestone_id: string | null;
+  content: string; preview: string | null;
   status: string; review_note: string | null;
   created_at: string; reviewed_at: string | null;
 };
@@ -37,6 +38,13 @@ export type Submission = {
 export type Contributor = {
   submission_id: string; agent_id: string; share_bp: number;
   accepted_at: string | null; payout_cents: number | null;
+};
+
+export type Milestone = {
+  id: string; bounty_id: string; idx: number; title: string;
+  reward_amount_cents: number; status: string;
+  awarded_submission_id: string | null; awarded_at: string | null;
+  fee_cents: number | null; created_at: string;
 };
 
 export type EventRow = {
@@ -64,6 +72,8 @@ export const LIMITS = {
   registrations_per_day: 200,                      // global, all callers
   list_limit_max: 100,
   contributors_per_submission: 16,               // incl. the lead; see splitPayout
+  milestones_per_bounty: 10,
+  milestone_title: { min: 4, max: 100 },
 } as const;
 
 /**
@@ -248,6 +258,15 @@ export function feeSplit(rewardCents: number, feeBp: number): { fee: number; net
   return { fee, net: rewardCents - fee };
 }
 
+/** Milestones of a bounty in display order; empty when the bounty is whole. */
+export async function milestonesOf(db: D1Database, bountyId: string): Promise<Milestone[]> {
+  const { results } = await db
+    .prepare("SELECT * FROM milestones WHERE bounty_id = ? ORDER BY idx")
+    .bind(bountyId)
+    .all<Milestone>();
+  return results ?? [];
+}
+
 /** Accepted contributors on a submission, in insert order. */
 async function contributorsOf(db: D1Database, submissionId: string): Promise<Contributor[]> {
   const { results } = await db
@@ -311,6 +330,7 @@ export async function postBounty(
   input: {
     title?: unknown; description?: unknown; category?: unknown;
     acceptance_criteria?: unknown; reward_amount_cents?: unknown; deadline?: unknown;
+    milestones?: unknown;
   },
 ) {
   const title = reqString(input.title, "title", LIMITS.title.min, LIMITS.title.max);
@@ -323,7 +343,29 @@ export async function postBounty(
       ? null
       : reqString(input.acceptance_criteria, "acceptance_criteria", 1, LIMITS.acceptance_criteria.max);
 
-  const cents = Number(input.reward_amount_cents);
+  // Milestones, if any. The bounty reward is DERIVED from their sum rather than
+  // stated alongside: two numbers that must agree are two numbers that will
+  // eventually disagree.
+  let parts: { title: string; cents: number }[] = [];
+  if (input.milestones != null) {
+    if (!Array.isArray(input.milestones)) throw new OpError(400, "milestones must be an array");
+    if (input.milestones.length < 2)
+      throw new OpError(400, "a milestoned bounty needs at least 2 milestones — otherwise just post it whole");
+    if (input.milestones.length > LIMITS.milestones_per_bounty)
+      throw new OpError(400, `at most ${LIMITS.milestones_per_bounty} milestones per bounty`);
+    parts = input.milestones.map((m: unknown) => {
+      const o = (m ?? {}) as Record<string, unknown>;
+      const c = Number(o.reward_amount_cents);
+      if (!Number.isInteger(c) || c < LIMITS.reward_cents.min)
+        throw new OpError(400, "each milestone needs an integer reward_amount_cents of at least 1");
+      return {
+        title: reqString(o.title, "milestone title", LIMITS.milestone_title.min, LIMITS.milestone_title.max),
+        cents: c,
+      };
+    });
+  }
+
+  const cents = parts.length ? parts.reduce((a, m) => a + m.cents, 0) : Number(input.reward_amount_cents);
   if (!Number.isInteger(cents) || cents < LIMITS.reward_cents.min || cents > LIMITS.reward_cents.max)
     throw new OpError(
       400,
@@ -361,7 +403,16 @@ export async function postBounty(
          reward_amount_cents, reward_currency, status, deadline, fee_bp, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, 'USD', 'open', ?, ?, ?)`,
     ).bind(id, agent.id, title, description, category, criteria, cents, deadline, PLATFORM_FEE_BP, at),
-    eventStmt(db, at, "bounty_posted", id, agent.id, `"${title}" posted — ${fmtMoney(cents, "USD")} (stated)`),
+    ...parts.map((m, i) =>
+      db.prepare(
+        "INSERT INTO milestones (id, bounty_id, idx, title, reward_amount_cents, status, created_at) VALUES (?, ?, ?, ?, ?, 'open', ?)",
+      ).bind(newId("mil"), id, i, m.title, m.cents, at),
+    ),
+    eventStmt(
+      db, at, "bounty_posted", id, agent.id,
+      `"${title}" posted — ${fmtMoney(cents, "USD")} (stated)` +
+        (parts.length ? ` across ${parts.length} milestones` : ""),
+    ),
   ]);
   const fs = feeSplit(cents, PLATFORM_FEE_BP);
   return {
@@ -373,6 +424,9 @@ export async function postBounty(
     platform_fee: fmtMoney(fs.fee, "USD"),
     platform_fee_bp: PLATFORM_FEE_BP,
     net_to_filler: fmtMoney(fs.net, "USD"),
+    milestones: parts.length
+      ? parts.map((m, i) => ({ idx: i, title: m.title, reward: fmtMoney(m.cents, "USD") }))
+      : undefined,
     deadline,
     settlement: SETTLEMENT_NOTE,
   };
@@ -484,8 +538,16 @@ export async function getBounty(
     .bind(id)
     .first<PublicBounty>();
   if (!bounty || bounty.status === "removed") throw new OpError(404, `no bounty ${id}`);
-  (bounty as PublicBounty & { poster_reputation?: unknown }).poster_reputation =
+  (bounty as PublicBounty & { poster_reputation?: unknown; milestones?: unknown }).poster_reputation =
     await posterReputation(db, bounty.poster_id);
+  const parts = await milestonesOf(db, id);
+  if (parts.length)
+    (bounty as PublicBounty & { milestones?: unknown }).milestones = parts.map((m) => ({
+      id: m.id, idx: m.idx, title: m.title,
+      reward: fmtMoney(m.reward_amount_cents, bounty.reward_currency),
+      reward_amount_cents: m.reward_amount_cents,
+      status: m.status, awarded_at: m.awarded_at,
+    }));
 
   // Submission CONTENT is visible only to the poster and to its own author.
   // This is load-bearing for the race: a public answer is a free answer, and
@@ -547,6 +609,7 @@ export async function submitToBounty(
   contentRaw: unknown,
   contributorsRaw?: unknown,
   previewRaw?: unknown,
+  milestoneIdRaw?: unknown,
 ) {
   await expireOverdue(db);
   const content = reqString(contentRaw, "content", 1, LIMITS.submission_content.max);
@@ -560,12 +623,33 @@ export async function submitToBounty(
   if (b.status !== "open") throw new OpError(409, `bounty is ${b.status}, not accepting submissions`);
   if (b.poster_id === agent.id) throw new OpError(403, "you cannot submit to your own bounty");
 
+  // On a milestoned bounty you fill ONE part, and that part's reward is what
+  // gets split. Requiring the target explicitly beats inferring it: a wrong
+  // guess would silently compete for the wrong money.
+  const parts = await milestonesOf(db, bountyId);
+  let milestone: Milestone | null = null;
+  if (parts.length) {
+    const mid = String(milestoneIdRaw ?? "");
+    if (!mid)
+      throw new OpError(
+        400,
+        `this bounty has ${parts.length} milestones — pass milestone_id to say which one you are filling: ` +
+          parts.map((m) => `${m.id} (${m.title}, ${fmtMoney(m.reward_amount_cents, b.reward_currency)}, ${m.status})`).join("; "),
+      );
+    milestone = parts.find((m) => m.id === mid) ?? null;
+    if (!milestone) throw new OpError(404, `no milestone ${mid} on bounty ${bountyId}`);
+    if (milestone.status !== "open") throw new OpError(409, `milestone is ${milestone.status}, not accepting submissions`);
+  } else if (milestoneIdRaw != null) {
+    throw new OpError(400, "this bounty has no milestones — omit milestone_id");
+  }
+  const targetCents = milestone ? milestone.reward_amount_cents : b.reward_amount_cents;
+
   // Solo is the degenerate team: one contributor at 100%. Keeping a single
   // shape here is what gives award one payout path instead of two.
   const roster =
     contributorsRaw == null
       ? [{ agent_id: agent.id, share_bp: 10_000 }]
-      : validateShares(contributorsRaw, agent.id, b.poster_id, feeSplit(b.reward_amount_cents, b.fee_bp).net);
+      : validateShares(contributorsRaw, agent.id, b.poster_id, feeSplit(targetCents, b.fee_bp).net);
 
   const ids = roster.map((r) => r.agent_id);
   const found = await db
@@ -582,9 +666,9 @@ export async function submitToBounty(
   const mine = await db
     .prepare(
       "SELECT COUNT(*) AS n FROM submissions s JOIN submission_contributors c ON c.submission_id = s.id " +
-        "WHERE s.bounty_id = ? AND c.agent_id = ?",
+        "WHERE s.bounty_id = ? AND c.agent_id = ? AND (? IS NULL OR s.milestone_id = ?)",
     )
-    .bind(bountyId, agent.id)
+    .bind(bountyId, agent.id, milestone?.id ?? null, milestone?.id ?? null)
     .first<{ n: number }>();
   if ((mine?.n ?? 0) >= LIMITS.submissions_per_agent_per_bounty)
     throw new OpError(429, `limit of ${LIMITS.submissions_per_agent_per_bounty} submissions per bounty reached`);
@@ -606,8 +690,8 @@ export async function submitToBounty(
   const at = nowIso();
   const stmts = [
     db.prepare(
-      "INSERT INTO submissions (id, bounty_id, agent_id, content, preview, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    ).bind(id, bountyId, agent.id, content, preview, solo ? "pending" : "draft", at),
+      "INSERT INTO submissions (id, bounty_id, agent_id, milestone_id, content, preview, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    ).bind(id, bountyId, agent.id, milestone?.id ?? null, content, preview, solo ? "pending" : "draft", at),
     ...roster.map((r) =>
       db.prepare(
         "INSERT INTO submission_contributors (submission_id, agent_id, share_bp, accepted_at) VALUES (?, ?, ?, ?)",
@@ -626,13 +710,15 @@ export async function submitToBounty(
   return {
     submission_id: id,
     bounty_id: bountyId,
+    milestone_id: milestone?.id ?? null,
+    filling: milestone ? milestone.title : "the whole bounty",
     status: solo ? "pending" : "draft",
     contributors: roster.map((r) => ({
       agent_id: r.agent_id,
       share_bp: r.share_bp,
       share: `${(r.share_bp / 100).toFixed(2)}%`,
       payout_if_awarded: fmtMoney(
-        splitPayout(feeSplit(b.reward_amount_cents, b.fee_bp).net, roster.map((x) => x.share_bp))[
+        splitPayout(feeSplit(targetCents, b.fee_bp).net, roster.map((x) => x.share_bp))[
           roster.indexOf(r)
         ],
         b.reward_currency,
@@ -757,23 +843,44 @@ export async function reviewSubmission(
 
   // First accepted wins, atomically: the compare-and-swap on status='open' is
   // the whole race arbiter. Two concurrent accepts cannot both pass it.
-  const res = await db
-    .prepare(
-      "UPDATE bounties SET status = 'awarded', awarded_submission_id = ?, awarded_at = ?, payment_ref = ?, fee_cents = ? WHERE id = ? AND status = 'open'",
-    )
-    .bind(submissionId, at, ref, Math.floor((b.reward_amount_cents * b.fee_bp) / 10_000), bountyId)
-    .run();
-  if (!res.meta.changes) throw new OpError(409, "bounty is no longer open — it was awarded, cancelled or expired first");
-
-  // Winner is marked accepted BEFORE the pending-sweep, so the sweep's
-  // status='pending' filter can no longer touch it.
   // Freeze the split into the ledger at award time. Storing payout_cents rather
   // than recomputing it later means a share can never be reinterpreted after the
   // fact, and the row is the receipt the off-platform settlement is made against.
   const team = await contributorsOf(db, submissionId);
-  const { fee, net } = feeSplit(b.reward_amount_cents, b.fee_bp);
+  const mil = s.milestone_id
+    ? await db.prepare("SELECT * FROM milestones WHERE id = ?").bind(s.milestone_id).first<Milestone>()
+    : null;
+  const potCents = mil ? mil.reward_amount_cents : b.reward_amount_cents;
+  const { fee, net } = feeSplit(potCents, b.fee_bp);
   const payouts = splitPayout(net, team.map((t) => t.share_bp));
 
+  // The arbiter is the SAME compare-and-swap, one level down when the bounty is
+  // milestoned: awarding a part swaps that milestone from 'open', awarding a
+  // whole bounty swaps the bounty. Either way two concurrent accepts cannot both
+  // pass, and the loser gets a clean 409.
+  const res = mil
+    ? await db
+        .prepare(
+          "UPDATE milestones SET status = 'awarded', awarded_submission_id = ?, awarded_at = ?, fee_cents = ? WHERE id = ? AND status = 'open'",
+        )
+        .bind(submissionId, at, fee, mil.id)
+        .run()
+    : await db
+        .prepare(
+          "UPDATE bounties SET status = 'awarded', awarded_submission_id = ?, awarded_at = ?, payment_ref = ?, fee_cents = ? WHERE id = ? AND status = 'open'",
+        )
+        .bind(submissionId, at, ref, fee, bountyId)
+        .run();
+  if (!res.meta.changes)
+    throw new OpError(
+      409,
+      mil
+        ? "that milestone is no longer open — it was awarded or cancelled first"
+        : "bounty is no longer open — it was awarded, cancelled or expired first",
+    );
+
+  // Winner is marked accepted BEFORE the pending-sweep, so the sweep's
+  // status='pending' filter can no longer touch it.
   await db.batch([
     db.prepare("UPDATE submissions SET status = 'accepted', review_note = ?, reviewed_at = ? WHERE id = ?")
       .bind(reviewNote, at, submissionId),
@@ -781,19 +888,51 @@ export async function reviewSubmission(
       db.prepare("UPDATE submission_contributors SET payout_cents = ? WHERE submission_id = ? AND agent_id = ?")
         .bind(payouts[i], submissionId, t.agent_id),
     ),
-    db.prepare(
-      "UPDATE submissions SET status = 'closed', review_note = 'another submission was accepted first', reviewed_at = ? WHERE bounty_id = ? AND status IN ('pending','draft')",
-    ).bind(at, bountyId),
+    // Sweep only the submissions that were competing for the SAME pot. On a
+    // milestoned bounty the other parts are still live and must not be closed.
+    mil
+      ? db.prepare(
+          "UPDATE submissions SET status = 'closed', review_note = 'another submission was accepted first', reviewed_at = ? WHERE milestone_id = ? AND status IN ('pending','draft')",
+        ).bind(at, mil.id)
+      : db.prepare(
+          "UPDATE submissions SET status = 'closed', review_note = 'another submission was accepted first', reviewed_at = ? WHERE bounty_id = ? AND status IN ('pending','draft')",
+        ).bind(at, bountyId),
     eventStmt(
       db, at, "bounty_awarded", bountyId, s.agent_id,
       `"${b.title}" awarded to ${s.agent_id} — ${fmtMoney(b.reward_amount_cents, b.reward_currency)} (stated)`,
     ),
   ]);
+  // A milestoned bounty is done only when every part is awarded. Rolling the fee
+  // up as we go keeps bounties.fee_cents meaningful at any point, not just at the end.
+  let bountyComplete = !mil;
+  if (mil) {
+    const left = await db
+      .prepare("SELECT COUNT(*) AS n FROM milestones WHERE bounty_id = ? AND status = 'open'")
+      .bind(bountyId)
+      .first<{ n: number }>();
+    bountyComplete = (left?.n ?? 0) === 0;
+    const rolled = await db
+      .prepare("SELECT COALESCE(SUM(fee_cents),0) AS f FROM milestones WHERE bounty_id = ?")
+      .bind(bountyId)
+      .first<{ f: number }>();
+    await db
+      .prepare(
+        bountyComplete
+          ? "UPDATE bounties SET status = 'awarded', awarded_at = ?, payment_ref = COALESCE(?, payment_ref), fee_cents = ? WHERE id = ? AND status = 'open'"
+          : "UPDATE bounties SET fee_cents = ? WHERE id = ?",
+      )
+      .bind(...(bountyComplete ? [at, ref, rolled?.f ?? 0, bountyId] : [rolled?.f ?? 0, bountyId]))
+      .run();
+  }
+
   return {
     bounty_id: bountyId,
+    milestone_id: mil?.id ?? null,
+    milestone_title: mil?.title ?? null,
+    bounty_complete: bountyComplete,
     winning_submission_id: submissionId,
     winner_agent_id: s.agent_id,
-    reward: fmtMoney(b.reward_amount_cents, b.reward_currency),
+    reward: fmtMoney(potCents, b.reward_currency),
     platform_fee: fmtMoney(fee, b.reward_currency),
     platform_fee_bp: b.fee_bp,
     net_to_contributors: fmtMoney(net, b.reward_currency),
@@ -825,6 +964,7 @@ export async function cancelBounty(db: D1Database, agent: Agent, bountyId: strin
     db.prepare(
       "UPDATE submissions SET status = 'closed', review_note = 'bounty cancelled by poster', reviewed_at = ? WHERE bounty_id = ? AND status = 'pending'",
     ).bind(at, bountyId),
+    db.prepare("UPDATE milestones SET status = 'cancelled' WHERE bounty_id = ? AND status = 'open'").bind(bountyId),
     eventStmt(db, at, "bounty_cancelled", bountyId, agent.id, `"${b.title}" cancelled by poster`),
   ]);
   return { bounty_id: bountyId, status: "cancelled" };
