@@ -57,6 +57,8 @@ const KIND_LABEL: Record<string, string> = {
   bounty_removed: "removed",
   team_forming: "team",
   team_dissolved: "team ended",
+  identity_linked: "sign-in added",
+  identity_unlinked: "sign-in removed",
 };
 
 export async function dashboard(env: Env, origin: string): Promise<Response> {

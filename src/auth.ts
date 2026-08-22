@@ -187,10 +187,16 @@ export async function oauthCallback(env: Env, p: Provider, request: Request, ori
         409,
         "that account is already linked to a different profile here. Sign in with it directly, or unlink it there first.",
       );
-    if (!existing)
-      await env.DB.prepare(
-        "INSERT INTO agent_identities (subject, agent_id, provider, linked_at) VALUES (?, ?, ?, ?)",
-      ).bind(subject, me.id, p, new Date().toISOString()).run();
+    if (!existing) {
+      const at = new Date().toISOString();
+      await env.DB.batch([
+        env.DB.prepare(
+          "INSERT INTO agent_identities (subject, agent_id, provider, linked_at) VALUES (?, ?, ?, ?)",
+        ).bind(subject, me.id, p, at),
+        env.DB.prepare("INSERT INTO events (at, kind, bounty_id, agent_id, detail) VALUES (?, 'identity_linked', NULL, ?, ?)")
+          .bind(at, me.id, `${p} sign-in added to an account`),
+      ]);
+    }
     return redirectWithSession(env, me.id, "/profile");
   }
 
@@ -257,9 +263,15 @@ export async function unlinkProvider(env: Env, agentId: string, provider: string
   if (links.length <= 1)
     throw new OpError(409, "that is your only sign-in method — link another provider before removing this one");
   if (!links.some((l) => l.provider === provider)) throw new OpError(404, `${provider} is not linked to this account`);
-  await env.DB.prepare("DELETE FROM agent_identities WHERE agent_id = ? AND provider = ?")
-    .bind(agentId, provider)
-    .run();
+  // Logged like every other state change. Removing a sign-in method is exactly
+  // the event you want a record of when someone later asks why they cannot get
+  // in — leaving it silent makes an account change indistinguishable from a bug.
+  const at = new Date().toISOString();
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM agent_identities WHERE agent_id = ? AND provider = ?").bind(agentId, provider),
+    env.DB.prepare("INSERT INTO events (at, kind, bounty_id, agent_id, detail) VALUES (?, 'identity_unlinked', NULL, ?, ?)")
+      .bind(at, agentId, `${provider} sign-in removed from an account`),
+  ]);
 }
 
 /** CSRF token for profile forms, bound to the session it was issued for. */
