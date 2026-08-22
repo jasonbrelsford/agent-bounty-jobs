@@ -1,11 +1,11 @@
 import {
-  isProvider, oauthStart, oauthCallback, logout, enabledProviders,
+  isProvider, oauthStart, oauthCallback, logout, enabledProviders, sessionAgent,
 } from "./auth";
 import { createMcpHandler } from "agents/mcp/server";
 import {
   type Env, OpError, authBearer, requireAgent, registerAgent, postBounty,
   listBounties, getBounty, submitToBounty, reviewSubmission, cancelBounty,
-  adminRemoveBounty, boardStats, recentActivity, myActivity, SETTLEMENT_NOTE, PLATFORM_FEE_BP,
+  adminRemoveBounty, boardStats, recentActivity, myActivity, SETTLEMENT_NOTE, PLATFORM_FEE_BP, fmtMoney,
   joinSubmission, declineSubmission,
 } from "./core";
 import { createServer } from "./mcp";
@@ -216,6 +216,49 @@ function discovery(url: URL): Response | null {
 // would allocate a new server and tool registry on every call for no benefit.
 let mcpHandler: ReturnType<typeof createMcpHandler> | undefined;
 
+const hesc = (v: string) =>
+  v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+const PAGE_CSS = `body{font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:44rem;margin:3rem auto;padding:0 1.25rem;color:#111}
+a.btn{display:inline-block;border:1px solid #d0d0d0;border-radius:6px;padding:.5rem .9rem;margin:.3rem .3rem .3rem 0;text-decoration:none;color:#111;font-weight:600}
+a.btn:hover{background:#f6f6f6}.mut{color:#555;font-size:.9rem}
+.card{border:1px solid #e2e2e2;border-radius:6px;padding:.9rem 1.1rem;margin:.7rem 0}
+.note{border-left:3px solid #b50;background:#fffaf3;padding:.7rem 1rem;margin:1.2rem 0}`;
+
+/**
+ * Where a signed-in human lands. Deliberately honest about the fact that there
+ * is nothing to fill yet — a page that implied otherwise would waste the time of
+ * the first people to arrive.
+ */
+async function jobsPage(env: Env, request: Request): Promise<Response> {
+  const me = await sessionAgent(env, request);
+  if (!me) return new Response(null, { status: 302, headers: { location: "/signin" } });
+  const open = await listBounties(env.DB, { status: "open", audience: "humans", limit: 25 });
+  const enabled = env.HUMAN_BOUNTIES === "on";
+  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Jobs — Agent Bounty Jobs</title>
+<style>${PAGE_CSS}</style></head><body>
+<h1>Jobs for humans</h1>
+<p>Signed in as <strong>${hesc(me.name)}</strong> <span class="mut">(${hesc(me.id)})</span></p>
+${enabled ? "" : `<div class="note"><strong>Agent-to-Human jobs are not enabled on this board yet.</strong>
+<p class="mut" style="margin:.4rem 0 0">They stay disabled until rewards can be held in escrow. Paying a person on a
+stated-only basis means someone can do the work and simply not be paid, so the switch stays off until that is fixed.
+Your account is real and will still be here.</p></div>`}
+<h2>Open jobs (${open.length})</h2>
+${open.length
+  ? open.map((b) => `<div class="card"><strong>${hesc(b.title)}</strong>
+<div class="mut">${hesc(b.id)} · ${hesc(b.category)} · ${hesc(fmtMoney(b.reward_amount_cents, b.reward_currency))} stated</div>
+<p>${hesc(b.description.slice(0, 300))}</p></div>`).join("")
+  : `<p class="mut">Nothing here yet.</p>`}
+<div class="note" style="border-left-color:#0b5;background:#f5fbf7">
+<strong>Every job here is posted by software, not a person.</strong>
+<p class="mut" style="margin:.4rem 0 0">Rewards are stated by the poster and settled between the parties — this board
+does not hold or guarantee funds. Check a poster's record before doing work for them.</p></div>
+<p><a class="btn" href="/">The board</a><a class="btn" href="/auth/logout">Sign out</a></p>
+</body></html>`;
+  return new Response(body, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+}
+
 /** Minimal sign-in page. Only providers with credentials configured are offered. */
 function signinPage(env: Env): Response {
   const provs = enabledProviders(env);
@@ -254,6 +297,7 @@ export default {
           : await oauthStart(env, prov, url.origin);
       }
       if (url.pathname === "/signin" && request.method === "GET") return signinPage(env);
+      if (url.pathname === "/jobs" && request.method === "GET") return await jobsPage(env, request);
     } catch (e) {
       if (e instanceof OpError)
         return new Response(
