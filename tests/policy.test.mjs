@@ -139,3 +139,46 @@ test("metresBetween is sane", () => {
   const d = metresBetween(38.7223, -9.1393, 38.7323, -9.1393);
   assert.ok(d > 1000 && d < 1200, `~1.11km, got ${d}`);
 });
+
+import { allocate, feeSplit } from "../.test-build/core.js";
+
+test("allocate conserves the total across arbitrary weights", () => {
+  const cases = [[5,[300,500,200]],[1,[1,1,1]],[7,[1,1,1,1,1]],[0,[5,5]],[100,[1,99]],[3,[1,1,1,1,1,1,1,1,1,1]]];
+  for (const [total, w] of cases)
+    assert.equal(allocate(total, w).reduce((a, b) => a + b, 0), total, `${total} over ${w}`);
+});
+
+test("milestoning a bounty no longer shrinks the rake", () => {
+  // The regression: floor() applied per part discarded a cent per part, so a
+  // poster could cut the fee simply by splitting the same bounty into pieces.
+  const bp = 50;
+  const shapes = [
+    [[300, 500, 200]], [[100, 100, 100, 100, 100, 100, 100, 100, 100, 100]],
+    [[1, 1, 1, 1, 1, 1, 1, 1, 1, 991]], [[3333, 3333, 3334]], [[7, 11, 13, 17, 19]],
+  ];
+  for (const [parts] of shapes) {
+    const total = parts.reduce((a, b) => a + b, 0);
+    const whole = feeSplit(total, bp).fee;
+    const perPart = allocate(whole, parts);
+    assert.equal(perPart.reduce((a, b) => a + b, 0), whole,
+      `parts ${parts} must sum to the whole-bounty fee ${whole}`);
+    // and the old broken behaviour would have been strictly less
+    const legacy = parts.reduce((a, p) => a + feeSplit(p, bp).fee, 0);
+    assert.ok(legacy <= whole, "sanity: per-part flooring never exceeded the whole");
+  }
+});
+
+test("fee plus payouts always equals the pot, per milestone", () => {
+  const bp = 50, parts = [300, 500, 200];
+  const total = parts.reduce((a, b) => a + b, 0);
+  const fees = allocate(feeSplit(total, bp).fee, parts);
+  let paid = 0, feed = 0;
+  parts.forEach((pot, i) => {
+    const net = pot - fees[i];
+    const outs = splitPayout(net, [6000, 4000]);
+    assert.equal(outs.reduce((a, b) => a + b, 0) + fees[i], pot, "each part conserves");
+    paid += outs.reduce((a, b) => a + b, 0); feed += fees[i];
+  });
+  assert.equal(paid + feed, total, "and the whole bounty conserves");
+  assert.equal(feed, feeSplit(total, bp).fee, "total fee equals the whole-bounty fee");
+});

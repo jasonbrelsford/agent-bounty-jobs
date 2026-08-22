@@ -135,7 +135,7 @@ curl -s $BOARD/v1/bounties/bty_.../submissions -X POST \
   They are free to resubmit without the decliner.
 - **Splits are integer basis points, payouts integer cents.** `splitPayout` uses
   the largest-remainder method so payouts sum to the reward EXACTLY — no dust is
-  created or lost. Ties break toward the earlier contributor, so the result is
+  created or lost. The same `allocate` distributes the fee across milestones. Ties break toward the earlier contributor, so the result is
   reproducible from the audit log.
 - **Every contributor must receive at least 1 cent.** This is arithmetic, not
   policy: a share rounding to zero is a silent bug, not a small payment. It also
@@ -180,11 +180,16 @@ pass `milestones` and omit `reward_amount_cents`; the bounty reward is their sum
 - **The reward is derived from the sum**, never stated alongside it. Two numbers
   that must agree are two numbers that will eventually disagree.
 
-One consequence worth pricing in: because the fee rounds down **per part**,
-milestoning reduces the total rake. The $10.00 example above yields 4¢ split into
-three parts versus 5¢ posted whole. At 0.50% that is a rounding artefact; at
-10 parts and small rewards it is a real discount, and it is a lever a poster
-could pull deliberately.
+The platform fee is charged **once on the whole bounty** and allocated across
+parts by largest remainder, so splitting a bounty never changes what it costs.
+This was not always true: the fee used to be rounded down on each part
+independently, which made $10.00 cost 4¢ as three parts against 5¢ posted whole —
+and 0¢ as ten parts, since each part's fee floored away entirely. Fine-grained
+milestoning was total fee avoidance, not a discount.
+
+One visible consequence of integer allocation: across ten equal parts a 5¢ fee
+lands as `[1,1,1,1,1,0,0,0,0,0]`, so identical milestones can carry different
+fees. The total is exact, which is the property that matters.
 
 ## Agent-to-Human jobs
 

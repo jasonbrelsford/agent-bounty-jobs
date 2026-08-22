@@ -257,9 +257,23 @@ const BP_TOTAL = 10_000;
  * function of the input order and therefore reproducible from the audit log.
  */
 export function splitPayout(cents: number, shares: number[]): number[] {
-  const exact = shares.map((bp) => (cents * bp) / BP_TOTAL);
+  return allocate(cents, shares);
+}
+
+/**
+ * Distribute `total` across `weights` by largest remainder, so the parts sum to
+ * EXACTLY `total`. Ties break toward the earlier index, making the result a pure
+ * function of input order and so reproducible from the audit log.
+ *
+ * Used for two things that must both conserve: splitting a reward across
+ * contributors, and splitting a fee across milestones.
+ */
+export function allocate(total: number, weights: number[]): number[] {
+  const sum = weights.reduce((a, b) => a + b, 0);
+  if (sum <= 0) return weights.map(() => 0);
+  const exact = weights.map((w) => (total * w) / sum);
   const base = exact.map(Math.floor);
-  let left = cents - base.reduce((a, b) => a + b, 0);
+  let left = total - base.reduce((a, b) => a + b, 0);
   const order = exact
     .map((v, i) => ({ i, frac: v - Math.floor(v) }))
     .sort((a, b) => b.frac - a.frac || a.i - b.i);
@@ -937,6 +951,13 @@ export async function submitToBounty(
   const targetCents = milestone ? milestone.reward_amount_cents : b.reward_amount_cents;
   // A milestone may override the bounty-level requirement: parts of a job often
   // need different proof.
+  const previewFee = milestone
+    ? (allocate(
+        feeSplit(b.reward_amount_cents, b.fee_bp).fee,
+        parts.map((m) => m.reward_amount_cents),
+      )[parts.findIndex((m) => m.id === milestone.id)] ?? 0)
+    : feeSplit(b.reward_amount_cents, b.fee_bp).fee;
+  const netPool = targetCents - previewFee;
   const spec = validateEvidenceSpec(
     JSON.parse((milestone?.evidence_required ?? b.evidence_required) ?? "null"),
   );
@@ -947,7 +968,7 @@ export async function submitToBounty(
   const roster =
     contributorsRaw == null
       ? [{ agent_id: agent.id, share_bp: 10_000 }]
-      : validateShares(contributorsRaw, agent.id, b.poster_id, feeSplit(targetCents, b.fee_bp).net);
+      : validateShares(contributorsRaw, agent.id, b.poster_id, netPool);
 
   const ids = roster.map((r) => r.agent_id);
   const found = await db
@@ -1025,9 +1046,7 @@ export async function submitToBounty(
       share_bp: r.share_bp,
       share: `${(r.share_bp / 100).toFixed(2)}%`,
       payout_if_awarded: fmtMoney(
-        splitPayout(feeSplit(targetCents, b.fee_bp).net, roster.map((x) => x.share_bp))[
-          roster.indexOf(r)
-        ],
+        splitPayout(netPool, roster.map((x) => x.share_bp))[roster.indexOf(r)],
         b.reward_currency,
       ),
       accepted: r.agent_id === agent.id,
@@ -1158,7 +1177,22 @@ export async function reviewSubmission(
     ? await db.prepare("SELECT * FROM milestones WHERE id = ?").bind(s.milestone_id).first<Milestone>()
     : null;
   const potCents = mil ? mil.reward_amount_cents : b.reward_amount_cents;
-  const { fee, net } = feeSplit(potCents, b.fee_bp);
+  // The fee is charged ONCE on the whole bounty and allocated across milestones,
+  // rather than rounded down on each part independently. Per-part rounding made
+  // splitting a bounty a way to shrink the rake — $10.00 as three parts yielded
+  // 4c against 5c posted whole — which is a lever a poster could pull on purpose.
+  let fee: number;
+  if (mil) {
+    const parts = await milestonesOf(db, bountyId);
+    const shares = allocate(
+      feeSplit(b.reward_amount_cents, b.fee_bp).fee,
+      parts.map((m) => m.reward_amount_cents),
+    );
+    fee = shares[parts.findIndex((m) => m.id === mil.id)] ?? 0;
+  } else {
+    fee = feeSplit(potCents, b.fee_bp).fee;
+  }
+  const net = potCents - fee;
   const payouts = splitPayout(net, team.map((t) => t.share_bp));
 
   // The arbiter is the SAME compare-and-swap, one level down when the bounty is
