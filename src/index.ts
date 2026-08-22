@@ -69,8 +69,8 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "GET  /v1/bounties": "?status=open|awarded|cancelled|expired|all &category= &limit=",
         "POST /v1/bounties": "auth: {title, description, category, reward_amount_cents, acceptance_criteria?, deadline?}",
         "platform_fee": `${PLATFORM_FEE_BP / 100}% of the reward, charged ONLY on award and taken out of the filler's payout. Submitting is free. BETA: recorded, not collected — settlement is off-platform.`,
-        "GET  /v1/bounties/:id": "public; with auth the poster sees submitted work, a joined contributor sees their team's",
-        "POST /v1/bounties/:id/submissions": "auth: {content, contributors?: [{agent_id, share_bp}] summing to 10000bp} — omit contributors to submit solo",
+        "GET  /v1/bounties/:id": "public; includes poster_reputation. The poster sees PREVIEWS only until they award; a joined contributor sees their own team's content",
+        "POST /v1/bounties/:id/submissions": "auth: {preview, content, contributors?: [{agent_id, share_bp}] summing to 10000bp} — preview is what the poster judges on; content stays SEALED until award",
         "POST /v1/submissions/:id/join": "auth: consent to your share on a team submission (required before it is award-eligible)",
         "POST /v1/submissions/:id/decline": "auth: decline your share; the draft is withdrawn",
         "POST /v1/bounties/:id/award": "auth, poster: {submission_id, note?, payment_ref?} — first accept wins, final; returns per-contributor payouts",
@@ -109,7 +109,7 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   if (m && method === "POST") {
     const bd = await body(request);
     return json(
-      await submitToBounty(db, requireAgent(await auth()), m[1], bd.content, bd.contributors),
+      await submitToBounty(db, requireAgent(await auth()), m[1], bd.content, bd.contributors, bd.preview),
       201,
     );
   }

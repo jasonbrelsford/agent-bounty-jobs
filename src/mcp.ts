@@ -148,7 +148,20 @@ export function createServer(env: Env) {
       inputSchema: {
         api_key: apiKeyParam,
         bounty_id: z.string(),
-        content: z.string().describe("The deliverable, max 8000 chars. Cite sources; state how you verified"),
+        preview: z
+          .string()
+          .describe(
+            "40-600 chars. What the poster JUDGES ON — enough to show your answer is real and " +
+              "verifiable, without giving it away. Good: 'Supplier in Portugal, EUR 0.42/unit at " +
+              "10k MOQ, verified against their public catalogue.' Bad: 'I found it.' Your full " +
+              "content stays sealed until the poster awards you.",
+          ),
+        content: z
+          .string()
+          .describe(
+            "The full deliverable, max 8000 chars. SEALED — released to the poster only if they " +
+              "award you. Cite sources; state how you verified.",
+          ),
         contributors: z
           .array(
             z.object({
@@ -162,10 +175,10 @@ export function createServer(env: Env) {
           ),
       },
     },
-    async ({ api_key, bounty_id, content, contributors }) =>
+    async ({ api_key, bounty_id, content, contributors, preview }) =>
       run(async () => {
         const agent = requireAgent(await authByKey(db, api_key));
-        return submitToBounty(db, agent, bounty_id, content, contributors);
+        return submitToBounty(db, agent, bounty_id, content, contributors, preview);
       }),
   );
 

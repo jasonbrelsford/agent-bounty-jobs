@@ -29,7 +29,7 @@ export type Bounty = {
 };
 
 export type Submission = {
-  id: string; bounty_id: string; agent_id: string; content: string;
+  id: string; bounty_id: string; agent_id: string; content: string; preview: string | null;
   status: string; review_note: string | null;
   created_at: string; reviewed_at: string | null;
 };
@@ -54,6 +54,8 @@ export const LIMITS = {
   description: { min: 20, max: 4000 },
   acceptance_criteria: { max: 2000 },
   submission_content: { max: 8000 },
+  submission_preview: { min: 40, max: 600 },      // what the poster judges on
+
   reward_cents: { min: 1, max: 1_000_000 },       // $0.01 – $10,000 stated
   deadline_days_max: 90,
   open_bounties_per_agent: 10,
@@ -416,6 +418,48 @@ export async function listBounties(
   return results;
 }
 
+/**
+ * A poster's public track record. Computed live from the bounty table rather
+ * than denormalised, so it cannot drift from what actually happened.
+ *
+ * This is the residual defence against harvesting: sealing the deliverable stops
+ * the free copy, and this stops a poster who repeatedly collects previews and
+ * walks from doing it unnoticed. Fillers should read it before spending work.
+ */
+export async function posterReputation(db: D1Database, posterId: string) {
+  const r = await db
+    .prepare(
+      `SELECT COUNT(*) AS posted,
+              SUM(CASE WHEN status = 'awarded'   THEN 1 ELSE 0 END) AS awarded,
+              SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
+              SUM(CASE WHEN status = 'expired'   THEN 1 ELSE 0 END) AS expired
+         FROM bounties WHERE poster_id = ? AND status != 'removed'`,
+    )
+    .bind(posterId)
+    .first<{ posted: number; awarded: number; cancelled: number; expired: number }>();
+  const posted = r?.posted ?? 0;
+  const awarded = r?.awarded ?? 0;
+  const cancelled = r?.cancelled ?? 0;
+  const expired = r?.expired ?? 0;
+  // Only count bounties that actually drew work: cancelling an ignored bounty
+  // costs nobody anything and should not stain the record.
+  const withWork = await db
+    .prepare(
+      `SELECT COUNT(DISTINCT b.id) AS n FROM bounties b JOIN submissions s ON s.bounty_id = b.id
+        WHERE b.poster_id = ? AND b.status IN ('cancelled','expired') AND s.status != 'draft'`,
+    )
+    .bind(posterId)
+    .first<{ n: number }>();
+  return {
+    bounties_posted: posted,
+    awarded,
+    cancelled,
+    expired,
+    abandoned_after_submissions: withWork?.n ?? 0,
+    award_rate: posted ? Math.round((awarded / posted) * 100) / 100 : null,
+  };
+}
+
 /** Attach the contributor roster to each submission, so a reviewer can see who is owed what. */
 async function withTeams(db: D1Database, subs: Submission[]) {
   return Promise.all(
@@ -427,13 +471,21 @@ export async function getBounty(
   db: D1Database,
   id: string,
   viewer: Agent | null,
-): Promise<{ bounty: PublicBounty; submissions?: Omit<Submission, "content">[] | Submission[]; your_role?: string }> {
+): Promise<{
+  bounty: PublicBounty;
+  submissions?: Omit<Submission, "content">[] | Submission[];
+  your_role?: string;
+  note?: string;
+  invitations?: string[];
+}> {
   await expireOverdue(db);
   const bounty = await db
     .prepare(`SELECT ${PUBLIC_BOUNTY_COLS} FROM bounties b JOIN agents a ON a.id = b.poster_id WHERE b.id = ?`)
     .bind(id)
     .first<PublicBounty>();
   if (!bounty || bounty.status === "removed") throw new OpError(404, `no bounty ${id}`);
+  (bounty as PublicBounty & { poster_reputation?: unknown }).poster_reputation =
+    await posterReputation(db, bounty.poster_id);
 
   // Submission CONTENT is visible only to the poster and to its own author.
   // This is load-bearing for the race: a public answer is a free answer, and
@@ -445,10 +497,17 @@ export async function getBounty(
       .prepare("SELECT * FROM submissions WHERE bounty_id = ? AND status NOT IN ('draft','withdrawn') ORDER BY created_at")
       .bind(id)
       .all<Submission>();
+    // Content is released ONLY for the submission you awarded. Everything else
+    // shows its preview. This is what makes "read everything then cancel"
+    // stop being a way to get work for free.
+    const shown = (results ?? []).map((r) =>
+      r.status === "accepted" ? r : { ...r, content: null, sealed: true },
+    );
     return {
       bounty,
-      submissions: await withTeams(db, results ?? []),
+      submissions: await withTeams(db, shown as Submission[]),
       your_role: "poster",
+      note: "You review on previews. Awarding releases the winning submission's full content; it is final and cannot be undone.",
     };
   }
   // A contributor sees their own team's submission only once they have JOINED.
@@ -476,7 +535,7 @@ export async function getBounty(
         bounty,
         your_role: "invited",
         invitations: (invited.results ?? []).map((r) => r.id),
-      } as never;
+      };
   }
   return { bounty };
 }
@@ -487,9 +546,15 @@ export async function submitToBounty(
   bountyId: string,
   contentRaw: unknown,
   contributorsRaw?: unknown,
+  previewRaw?: unknown,
 ) {
   await expireOverdue(db);
   const content = reqString(contentRaw, "content", 1, LIMITS.submission_content.max);
+  // The preview is what the poster judges on. It is mandatory: without it the
+  // poster has nothing to evaluate and would need the sealed content back.
+  const preview = reqString(
+    previewRaw, "preview", LIMITS.submission_preview.min, LIMITS.submission_preview.max,
+  );
   const b = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(bountyId).first<Bounty>();
   if (!b || b.status === "removed") throw new OpError(404, `no bounty ${bountyId}`);
   if (b.status !== "open") throw new OpError(409, `bounty is ${b.status}, not accepting submissions`);
@@ -541,8 +606,8 @@ export async function submitToBounty(
   const at = nowIso();
   const stmts = [
     db.prepare(
-      "INSERT INTO submissions (id, bounty_id, agent_id, content, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-    ).bind(id, bountyId, agent.id, content, solo ? "pending" : "draft", at),
+      "INSERT INTO submissions (id, bounty_id, agent_id, content, preview, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    ).bind(id, bountyId, agent.id, content, preview, solo ? "pending" : "draft", at),
     ...roster.map((r) =>
       db.prepare(
         "INSERT INTO submission_contributors (submission_id, agent_id, share_bp, accepted_at) VALUES (?, ?, ?, ?)",
@@ -575,8 +640,9 @@ export async function submitToBounty(
       accepted: r.agent_id === agent.id,
     })),
     awaiting_consent: pendingJoins,
+    sealed: "Your content is sealed. The poster sees only your preview until they award the bounty.",
     note: solo
-      ? "The poster reviews submissions; the FIRST ACCEPTED submission takes the bounty and all other pending submissions are closed."
+      ? "The poster reviews on your PREVIEW; the FIRST ACCEPTED submission takes the bounty and all other pending submissions are closed."
       : `Draft: not visible to the poster and not award-eligible until all ${pendingJoins.length} invited contributor(s) call join_submission. They cannot read the content until they join.`,
   };
 }
