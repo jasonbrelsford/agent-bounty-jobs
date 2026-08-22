@@ -25,7 +25,7 @@ export type Bounty = {
   reward_amount_cents: number; reward_currency: string;
   status: string; deadline: string | null;
   awarded_submission_id: string | null; awarded_at: string | null;
-  payment_ref: string | null; created_at: string;
+  payment_ref: string | null; fee_bp: number; fee_cents: number | null; created_at: string;
 };
 
 export type Submission = {
@@ -63,6 +63,20 @@ export const LIMITS = {
   list_limit_max: 100,
   contributors_per_submission: 16,               // incl. the lead; see splitPayout
 } as const;
+
+/**
+ * Platform rake, in basis points of the stated reward, charged ONLY when a
+ * bounty is awarded. Submitting is free by design: on a board where most
+ * submissions lose a race, a per-submission fee would bill agents mainly for
+ * losing and choke the supply side while liquidity is still thin.
+ *
+ * The fee comes OUT of the reward, so "stated reward" keeps meaning what the
+ * poster owes in total; contributors split the remainder.
+ *
+ * Change this freely — it is snapshot onto each bounty at post time, so edits
+ * never alter a deal already struck.
+ */
+export const PLATFORM_FEE_BP = 50; // 0.50%
 
 /**
  * Acceptable-use tripwire, NOT a filter. Policy is the real instrument (see
@@ -189,7 +203,7 @@ export function validateShares(
   raw: unknown,
   leadId: string,
   posterId: string,
-  rewardCents: number,
+  netCents: number,
 ): { agent_id: string; share_bp: number }[] {
   if (!Array.isArray(raw)) throw new OpError(400, "contributors must be an array");
   const rows: { agent_id: string; share_bp: number }[] = [];
@@ -211,14 +225,25 @@ export function validateShares(
   const total = rows.reduce((a, r) => a + r.share_bp, 0);
   if (total !== BP_TOTAL)
     throw new OpError(400, `contributor shares must sum to ${BP_TOTAL} basis points (got ${total})`);
+  // Tested against the post-fee pool, because that is what actually gets paid.
   for (const r of rows)
-    if (Math.floor((rewardCents * r.share_bp) / BP_TOTAL) < 1)
+    if (Math.floor((netCents * r.share_bp) / BP_TOTAL) < 1)
       throw new OpError(
         400,
-        `share ${r.share_bp}bp of ${fmtMoney(rewardCents, "USD")} rounds to $0.00 — ` +
-          "every contributor must receive at least 1 cent",
+        `share ${r.share_bp}bp of ${fmtMoney(netCents, "USD")} (reward after platform fee) ` +
+          "rounds to $0.00 — every contributor must receive at least 1 cent",
       );
   return rows;
+}
+
+/**
+ * The rake, and what is actually left to split. Both integer cents.
+ * The fee rounds DOWN, so rounding error always favours the contributors
+ * rather than the house — the one direction that needs no explaining.
+ */
+export function feeSplit(rewardCents: number, feeBp: number): { fee: number; net: number } {
+  const fee = Math.floor((rewardCents * feeBp) / BP_TOTAL);
+  return { fee, net: rewardCents - fee };
 }
 
 /** Accepted contributors on a submission, in insert order. */
@@ -331,12 +356,24 @@ export async function postBounty(
   await db.batch([
     db.prepare(
       `INSERT INTO bounties (id, poster_id, title, description, category, acceptance_criteria,
-         reward_amount_cents, reward_currency, status, deadline, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'USD', 'open', ?, ?)`,
-    ).bind(id, agent.id, title, description, category, criteria, cents, deadline, at),
+         reward_amount_cents, reward_currency, status, deadline, fee_bp, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'USD', 'open', ?, ?, ?)`,
+    ).bind(id, agent.id, title, description, category, criteria, cents, deadline, PLATFORM_FEE_BP, at),
     eventStmt(db, at, "bounty_posted", id, agent.id, `"${title}" posted — ${fmtMoney(cents, "USD")} (stated)`),
   ]);
-  return { bounty_id: id, status: "open", reward: fmtMoney(cents, "USD"), deadline, settlement: SETTLEMENT_NOTE };
+  const fs = feeSplit(cents, PLATFORM_FEE_BP);
+  return {
+    bounty_id: id,
+    status: "open",
+    reward: fmtMoney(cents, "USD"),
+    // Disclosed at post time, not discovered at award time. The poster owes the
+    // full stated reward; the rake comes out of what the filler receives.
+    platform_fee: fmtMoney(fs.fee, "USD"),
+    platform_fee_bp: PLATFORM_FEE_BP,
+    net_to_filler: fmtMoney(fs.net, "USD"),
+    deadline,
+    settlement: SETTLEMENT_NOTE,
+  };
 }
 
 export const SETTLEMENT_NOTE =
@@ -345,7 +382,8 @@ export const SETTLEMENT_NOTE =
 const PUBLIC_BOUNTY_COLS =
   `b.id, b.poster_id, a.name AS poster_name, b.title, b.description, b.category,
    b.acceptance_criteria, b.reward_amount_cents, b.reward_currency, b.status,
-   b.deadline, b.awarded_submission_id, b.awarded_at, b.payment_ref, b.created_at,
+   b.deadline, b.awarded_submission_id, b.awarded_at, b.payment_ref,
+   b.fee_bp, b.fee_cents, b.created_at,
    (SELECT COUNT(*) FROM submissions s WHERE s.bounty_id = b.id) AS submission_count`;
 
 export type PublicBounty = Bounty & { poster_name: string; submission_count: number };
@@ -462,7 +500,7 @@ export async function submitToBounty(
   const roster =
     contributorsRaw == null
       ? [{ agent_id: agent.id, share_bp: 10_000 }]
-      : validateShares(contributorsRaw, agent.id, b.poster_id, b.reward_amount_cents);
+      : validateShares(contributorsRaw, agent.id, b.poster_id, feeSplit(b.reward_amount_cents, b.fee_bp).net);
 
   const ids = roster.map((r) => r.agent_id);
   const found = await db
@@ -529,7 +567,9 @@ export async function submitToBounty(
       share_bp: r.share_bp,
       share: `${(r.share_bp / 100).toFixed(2)}%`,
       payout_if_awarded: fmtMoney(
-        splitPayout(b.reward_amount_cents, roster.map((x) => x.share_bp))[roster.indexOf(r)],
+        splitPayout(feeSplit(b.reward_amount_cents, b.fee_bp).net, roster.map((x) => x.share_bp))[
+          roster.indexOf(r)
+        ],
         b.reward_currency,
       ),
       accepted: r.agent_id === agent.id,
@@ -653,9 +693,9 @@ export async function reviewSubmission(
   // the whole race arbiter. Two concurrent accepts cannot both pass it.
   const res = await db
     .prepare(
-      "UPDATE bounties SET status = 'awarded', awarded_submission_id = ?, awarded_at = ?, payment_ref = ? WHERE id = ? AND status = 'open'",
+      "UPDATE bounties SET status = 'awarded', awarded_submission_id = ?, awarded_at = ?, payment_ref = ?, fee_cents = ? WHERE id = ? AND status = 'open'",
     )
-    .bind(submissionId, at, ref, bountyId)
+    .bind(submissionId, at, ref, Math.floor((b.reward_amount_cents * b.fee_bp) / 10_000), bountyId)
     .run();
   if (!res.meta.changes) throw new OpError(409, "bounty is no longer open — it was awarded, cancelled or expired first");
 
@@ -665,7 +705,8 @@ export async function reviewSubmission(
   // than recomputing it later means a share can never be reinterpreted after the
   // fact, and the row is the receipt the off-platform settlement is made against.
   const team = await contributorsOf(db, submissionId);
-  const payouts = splitPayout(b.reward_amount_cents, team.map((t) => t.share_bp));
+  const { fee, net } = feeSplit(b.reward_amount_cents, b.fee_bp);
+  const payouts = splitPayout(net, team.map((t) => t.share_bp));
 
   await db.batch([
     db.prepare("UPDATE submissions SET status = 'accepted', review_note = ?, reviewed_at = ? WHERE id = ?")
@@ -687,6 +728,9 @@ export async function reviewSubmission(
     winning_submission_id: submissionId,
     winner_agent_id: s.agent_id,
     reward: fmtMoney(b.reward_amount_cents, b.reward_currency),
+    platform_fee: fmtMoney(fee, b.reward_currency),
+    platform_fee_bp: b.fee_bp,
+    net_to_contributors: fmtMoney(net, b.reward_currency),
     payouts: team.map((t, i) => ({
       agent_id: t.agent_id,
       share_bp: t.share_bp,

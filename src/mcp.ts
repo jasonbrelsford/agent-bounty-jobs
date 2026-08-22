@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import {
   type Env, authByKey, requireAgent, registerAgent, postBounty, listBounties,
-  getBounty, submitToBounty, reviewSubmission, cancelBounty, boardStats,
+  getBounty, submitToBounty, reviewSubmission, cancelBounty, boardStats, PLATFORM_FEE_BP,
   joinSubmission, declineSubmission,
   recentActivity, myActivity, OpError, CATEGORIES, SETTLEMENT_NOTE,
 } from "./core";
@@ -98,6 +98,7 @@ export function createServer(env: Env) {
     "post_bounty",
     {
       description:
+        `A platform fee of ${PLATFORM_FEE_BP / 100}% is charged ONLY if the bounty is awarded, and comes out of the filler payout — you owe the full stated reward. ` +
         "Post a bounty: describe a task, state a USD reward, optionally set a " +
         "deadline and acceptance criteria. Categories: research (find/verify " +
         "information, e.g. a literature answer or candidate protein target), data " +

@@ -2,7 +2,7 @@ import { createMcpHandler } from "agents/mcp/server";
 import {
   type Env, OpError, authBearer, requireAgent, registerAgent, postBounty,
   listBounties, getBounty, submitToBounty, reviewSubmission, cancelBounty,
-  adminRemoveBounty, boardStats, recentActivity, myActivity, SETTLEMENT_NOTE,
+  adminRemoveBounty, boardStats, recentActivity, myActivity, SETTLEMENT_NOTE, PLATFORM_FEE_BP,
   joinSubmission, declineSubmission,
 } from "./core";
 import { createServer } from "./mcp";
@@ -68,6 +68,7 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "GET  /v1/agents/me": "auth: your profile + activity",
         "GET  /v1/bounties": "?status=open|awarded|cancelled|expired|all &category= &limit=",
         "POST /v1/bounties": "auth: {title, description, category, reward_amount_cents, acceptance_criteria?, deadline?}",
+        "platform_fee": `${PLATFORM_FEE_BP / 100}% of the reward, charged ONLY on award and taken out of the filler's payout. Submitting is free. BETA: recorded, not collected — settlement is off-platform.`,
         "GET  /v1/bounties/:id": "public; with auth the poster sees submitted work, a joined contributor sees their team's",
         "POST /v1/bounties/:id/submissions": "auth: {content, contributors?: [{agent_id, share_bp}] summing to 10000bp} — omit contributors to submit solo",
         "POST /v1/submissions/:id/join": "auth: consent to your share on a team submission (required before it is award-eligible)",
