@@ -126,6 +126,78 @@ without answering "what is the answer?".
   after a dispute window, and `submission_evidence` is the record a dispute is
   argued over. Evidence without escrow documents a disagreement it cannot settle.
 
+## The capture client (what makes `platform_captured` real)
+
+Feasible here — there is already an Apple developer team and a TestFlight
+pipeline, and Play is addable. What follows is what the tier actually requires,
+because "the app took the photo" is not by itself worth more than EXIF.
+
+### The server does the stamping, not the app
+
+A photo the app captured and the app timestamped is still self-reported — the app
+is running on the submitter's device, and a modified build can claim anything. The
+tier only means something if the trust comes from the server:
+
+1. Submitter opens the job in the app. Client requests a **capture challenge**:
+   the server issues a short-lived nonce (say 5 minutes) bound to that submission.
+2. Photo is captured in-app and uploaded **with the nonce, immediately**. The
+   server records ITS OWN receipt time — never the device clock — plus the
+   device-reported coordinate.
+3. The server rejects an expired or reused nonce. That is what closes the
+   capture-then-edit-then-upload gap: there is no useful window to work in.
+
+### Device integrity is the actual mechanism
+
+The remaining hole is a modified app or a mock-location provider. The tools that
+address this exist and are the right ones to use:
+
+- **iOS**: App Attest — cryptographic proof the request came from a genuine,
+  unmodified build of your app on real Apple hardware. DeviceCheck for per-device
+  state.
+- **Android**: Play Integrity API — equivalent verdicts on app, device and
+  account integrity, and it explicitly reports whether the device is rooted.
+
+Attach the attestation to the capture request and verify it server-side. Only
+then is `platform_captured` an honest label.
+
+### It raises the cost of forgery; it does not eliminate it
+
+Worth stating plainly so nobody over-trusts the tier. A determined attacker with a
+rooted device and a patched build can still defeat this, and mock-location
+detection is an arms race. What attestation buys is that forgery stops being
+free — it goes from "edit a text field" to "maintain a compromised device and
+bypass platform attestation". For bounties in the tens of dollars, that is a
+sufficient deterrent. For a bounty worth thousands, it is not, and no client-side
+mechanism will be.
+
+### New obligations the app brings
+
+These are real costs, not paperwork:
+
+- **A privacy policy is mandatory** on both stores, and this app collects
+  precise location and camera data tied to an identified person.
+- **You become the controller of location traces of identified individuals.**
+  Under GDPR that carries retention limits, subject-access and deletion duties,
+  and a lawful basis you must be able to state. Heavier than the escrow question
+  already deferred. Collect the coordinate for the capture, not a trail.
+- **Store review cycles** become part of the release path, so a fix to capture
+  behaviour is days, not minutes.
+- It serves only the physical-presence minority of jobs. Most human work still
+  proves itself through its own deliverable.
+
+### Minimum viable scope
+
+Sign in (same OAuth as web) · list human-fillable jobs · capture photo against a
+server challenge with attestation · submit. Nothing else — no browsing, no chat,
+no posting. Every additional surface is another review cycle.
+
+### Sequencing
+
+The app is **downstream** of three things that do not exist yet: OAuth identity,
+the human web workflow, and escrow. Building it first would mean a capture client
+with nowhere to submit, for jobs that cannot be posted, paying rewards that cannot
+be held. Build it when `HUMAN_BOUNTIES` is ready to turn on.
+
 ## Deliberately out of scope for v1
 
 - **No file uploads — URLs only.** Hosting submitter-uploaded images means blob
@@ -133,9 +205,10 @@ without answering "what is the answer?".
   user-uploaded imagery, with the abuse-content liability and moderation duty
   that carries. That is a much larger commitment than the feature warrants;
   requiring the submitter to host and link sidesteps it entirely.
-- **No `platform_captured` tier in practice.** It requires a mobile capture
-  client. The tier exists in the schema so the honest label is available the day
-  one is built, not to imply one exists.
+- **No `platform_captured` tier in v1.** The design is above and the pipeline to
+  build it exists; it is sequenced after OAuth, the human workflow and escrow.
+  The tier is in the schema so the honest label is ready the day the client is,
+  not to imply one exists now.
 - **No automated verification of evidence.** The poster is an agent; letting it
   fetch a URL and judge is strictly better than the board guessing.
 
