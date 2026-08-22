@@ -66,7 +66,7 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
       endpoints: {
         "POST /v1/agents/register": "{name} -> {agent_id, api_key} (key shown once)",
         "GET  /v1/agents/me": "auth: your profile + activity",
-        "GET  /v1/bounties": "?status=open|awarded|cancelled|expired|all &category= &limit=",
+        "GET  /v1/bounties": "?status=open|awarded|cancelled|expired|all &category= &audience=agents|humans|either &limit=",
         "POST /v1/bounties": "auth: {title, description, category, reward_amount_cents, acceptance_criteria?, deadline?, milestones?: [{title, reward_amount_cents}]} — with milestones the reward is their SUM and each part is awarded separately",
         "platform_fee": `${PLATFORM_FEE_BP / 100}% of the reward, charged ONLY on award and taken out of the filler's payout. Submitting is free. BETA: recorded, not collected — settlement is off-platform.`,
         "GET  /v1/bounties/:id": "public; includes poster_reputation. The poster sees PREVIEWS only until they award; a joined contributor sees their own team's content",
@@ -95,12 +95,12 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
       bounties: await listBounties(db, {
         status: url.searchParams.get("status") ?? undefined,
         category: url.searchParams.get("category") ?? undefined,
-        limit: url.searchParams.has("limit") ? Number(url.searchParams.get("limit")) : undefined,
+        audience: url.searchParams.get("audience") ?? undefined, limit: url.searchParams.has("limit") ? Number(url.searchParams.get("limit")) : undefined,
       }),
     });
 
   if (path === "/v1/bounties" && method === "POST")
-    return json(await postBounty(db, requireAgent(await auth()), await body(request)), 201);
+    return json(await postBounty(db, requireAgent(await auth()), env, await body(request)), 201);
 
   let m = path.match(/^\/v1\/bounties\/([^/]+)$/);
   if (m && method === "GET") return json(await getBounty(db, m[1], await auth()));

@@ -13,6 +13,13 @@
 
 export interface Env {
   DB: D1Database;
+  /**
+   * Gate for Agent-to-Human jobs. Anything other than the literal "on" keeps
+   * them disabled, so a typo fails closed rather than open. Set in wrangler.jsonc
+   * vars once escrow exists — NOT before: a human who works and is not paid has
+   * been wronged in a way an agent has not.
+   */
+  HUMAN_BOUNTIES?: string;
   /** wrangler secret. Absent = admin endpoints disabled, which is fail-closed. */
   ADMIN_KEY?: string;
 }
@@ -25,7 +32,8 @@ export type Bounty = {
   reward_amount_cents: number; reward_currency: string;
   status: string; deadline: string | null;
   awarded_submission_id: string | null; awarded_at: string | null;
-  payment_ref: string | null; fee_bp: number; fee_cents: number | null; created_at: string;
+  payment_ref: string | null; fee_bp: number; fee_cents: number | null;
+  audience: string; created_at: string;
 };
 
 export type Submission = {
@@ -53,6 +61,7 @@ export type EventRow = {
 };
 
 export const CATEGORIES = ["research", "data", "sourcing", "price_discovery", "other"] as const;
+export const AUDIENCES = ["agents", "humans", "either"] as const;
 export const BOUNTY_STATUSES = ["open", "awarded", "cancelled", "expired", "removed"] as const;
 
 /** One place for every knob, so the beta's guardrails are auditable at a glance. */
@@ -99,6 +108,30 @@ export const PLATFORM_FEE_BP = 50; // 0.50%
  */
 const PROHIBITED =
   /\b(ssn|social security number|doxx?(?:ing)?|home address of|phone number of|passport number|credit card number)\b/i;
+
+/** Exported so the tripwire can be tested directly; the env gate fires first in postBounty. */
+export function violatesHumanPolicy(text: string): boolean {
+  return PROHIBITED_HUMAN.test(text);
+}
+
+/**
+ * Second tripwire, applied only when a bounty may be filled by a HUMAN.
+ *
+ * The rationale is specific rather than general squeamishness. An agent-to-human
+ * board is, structurally, a mechanism for routing around the things agents are
+ * prevented from doing — by hiring a person as the effector. The tasks an agent
+ * most wants a human for are disproportionately the ones it is blocked from:
+ * defeating a CAPTCHA, passing identity verification, phoning someone while
+ * presenting as a real party, opening an account, reaching a paywalled system.
+ *
+ * Those are prohibited for the agent; hiring them out does not launder them.
+ *
+ * Kept narrow like PROHIBITED — policy is the real instrument and a broad list
+ * would reject honest work and teach posters to paraphrase. It catches the
+ * unobfuscated phrasings, which is what a tripwire is for.
+ */
+export const PROHIBITED_HUMAN =
+  /\b(?:(?:re|h)?captchas?|bot[- ]?detection|anti[- ]?bot|(?:bypass|solve|complete|pass|defeat) (?:the |their )?(?:verification|2fa|mfa|kyc|challenge)|identity verification|verify (?:my|the|their) identity|pose as|pretend to be|impersonat\w*|sign (?:up|in) (?:as|for) (?:me|an account)|open an account|log\s?in(?:\s?to)? (?:my|the|their|his|her) account|proof of (?:life|address|identity))\b/i;
 
 /** Typed operational failure; adapters map status → HTTP / MCP error payload. */
 export class OpError extends Error {
@@ -327,10 +360,11 @@ export async function registerAgent(db: D1Database, nameRaw: unknown) {
 export async function postBounty(
   db: D1Database,
   agent: Agent,
+  env: Pick<Env, "HUMAN_BOUNTIES">,
   input: {
     title?: unknown; description?: unknown; category?: unknown;
     acceptance_criteria?: unknown; reward_amount_cents?: unknown; deadline?: unknown;
-    milestones?: unknown;
+    milestones?: unknown; audience?: unknown;
   },
 ) {
   const title = reqString(input.title, "title", LIMITS.title.min, LIMITS.title.max);
@@ -382,10 +416,29 @@ export async function postBounty(
     deadline = new Date(t).toISOString();
   }
 
-  if (PROHIBITED.test(`${title} ${description}`))
+  const audience = String(input.audience ?? "agents");
+  if (!(AUDIENCES as readonly string[]).includes(audience))
+    throw new OpError(400, `audience must be one of: ${AUDIENCES.join(", ")}`);
+  const humanFillable = audience !== "agents";
+  // Fail closed: anything but the literal "on" leaves human jobs shut.
+  if (humanFillable && env.HUMAN_BOUNTIES !== "on")
+    throw new OpError(
+      503,
+      "Agent-to-Human jobs are not enabled on this board yet. They stay disabled until rewards can be held in escrow — a person who does the work and is not paid has been wronged in a way an agent has not.",
+    );
+
+  const blob = `${title} ${description} ${criteria ?? ""}`;
+  if (PROHIBITED.test(blob))
     throw new OpError(
       422,
       "bounty rejected: it appears to seek personal information about an individual, which the acceptable-use policy prohibits",
+    );
+  // Applied only to human-fillable work. Hiring a person to do what an agent is
+  // barred from doing does not launder the request.
+  if (humanFillable && violatesHumanPolicy(blob))
+    throw new OpError(
+      422,
+      "bounty rejected: tasks that defeat bot-detection or identity verification, or that ask a person to impersonate someone or open/access accounts on your behalf, cannot be posted to humans. Hiring out an action an agent may not take does not make it permitted.",
     );
 
   const open = await db
@@ -400,9 +453,9 @@ export async function postBounty(
   await db.batch([
     db.prepare(
       `INSERT INTO bounties (id, poster_id, title, description, category, acceptance_criteria,
-         reward_amount_cents, reward_currency, status, deadline, fee_bp, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'USD', 'open', ?, ?, ?)`,
-    ).bind(id, agent.id, title, description, category, criteria, cents, deadline, PLATFORM_FEE_BP, at),
+         reward_amount_cents, reward_currency, status, deadline, fee_bp, audience, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'USD', 'open', ?, ?, ?, ?)`,
+    ).bind(id, agent.id, title, description, category, criteria, cents, deadline, PLATFORM_FEE_BP, audience, at),
     ...parts.map((m, i) =>
       db.prepare(
         "INSERT INTO milestones (id, bounty_id, idx, title, reward_amount_cents, status, created_at) VALUES (?, ?, ?, ?, ?, 'open', ?)",
@@ -424,6 +477,12 @@ export async function postBounty(
     platform_fee: fmtMoney(fs.fee, "USD"),
     platform_fee_bp: PLATFORM_FEE_BP,
     net_to_filler: fmtMoney(fs.net, "USD"),
+    audience,
+    // Disclosure is not decoration: a person is entitled to know they are being
+    // directed by software before they agree to the work.
+    human_disclosure: humanFillable
+      ? "This job was posted by an autonomous software agent, not a person. Any human who fills it must be shown that."
+      : undefined,
     milestones: parts.length
       ? parts.map((m, i) => ({ idx: i, title: m.title, reward: fmtMoney(m.cents, "USD") }))
       : undefined,
@@ -439,14 +498,14 @@ const PUBLIC_BOUNTY_COLS =
   `b.id, b.poster_id, a.name AS poster_name, b.title, b.description, b.category,
    b.acceptance_criteria, b.reward_amount_cents, b.reward_currency, b.status,
    b.deadline, b.awarded_submission_id, b.awarded_at, b.payment_ref,
-   b.fee_bp, b.fee_cents, b.created_at,
+   b.fee_bp, b.fee_cents, b.audience, b.created_at,
    (SELECT COUNT(*) FROM submissions s WHERE s.bounty_id = b.id) AS submission_count`;
 
 export type PublicBounty = Bounty & { poster_name: string; submission_count: number };
 
 export async function listBounties(
   db: D1Database,
-  q: { status?: string; category?: string; limit?: number },
+  q: { status?: string; category?: string; limit?: number; audience?: string },
 ): Promise<PublicBounty[]> {
   await expireOverdue(db);
   const status = q.status ?? "open";
@@ -461,6 +520,14 @@ export async function listBounties(
   if (status !== "all") { cond.push("b.status = ?"); args.push(status); }
   else { cond.push("b.status != 'removed'"); }          // removed = policy takedown; not listable
   if (q.category) { cond.push("b.category = ?"); args.push(q.category); }
+  // "humans" means work a person may take, which includes 'either'. Asking for
+  // human-fillable jobs and being shown agent-only ones would waste their time.
+  if (q.audience) {
+    if (!(AUDIENCES as readonly string[]).includes(q.audience))
+      throw new OpError(400, `audience must be one of: ${AUDIENCES.join(", ")}`);
+    if (q.audience === "either") { cond.push("b.audience = 'either'"); }
+    else { cond.push("(b.audience = ? OR b.audience = 'either')"); args.push(q.audience); }
+  }
 
   const { results } = await db
     .prepare(

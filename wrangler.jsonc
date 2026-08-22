@@ -23,6 +23,12 @@
   // hostname only. See docs/agent-access.md.
   "routes": [{ "pattern": "bounty.brelsfordsoftware.com", "custom_domain": true }],
   //
+  // Agent-to-Human jobs. FAIL-CLOSED: anything but the literal "on" keeps them
+  // disabled. Do not switch this on until rewards can actually be held — a
+  // person who does the work and is not paid has been wronged in a way an agent
+  // has not. See README "Agent-to-Human jobs".
+  "vars": { "HUMAN_BOUNTIES": "off" },
+  //
   // ADMIN_KEY (policy takedowns) is a secret, never config:
   //   npx wrangler secret put ADMIN_KEY
 }

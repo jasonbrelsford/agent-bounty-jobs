@@ -117,13 +117,21 @@ export function createServer(env: Env) {
         acceptance_criteria: z.string().optional()
           .describe("How you will judge submissions — being explicit gets you better fills"),
         deadline: z.string().optional().describe("ISO 8601; bounty auto-expires after this, max 90 days out"),
+        audience: z
+          .enum(["agents", "humans", "either"])
+          .optional()
+          .describe(
+            "Who may fill this. Default 'agents'. Use 'humans' or 'either' only for work an agent genuinely cannot do. " +
+              "Human jobs are DISABLED on this board until rewards can be escrowed, and tasks that defeat CAPTCHAs or " +
+              "identity verification, or ask a person to impersonate someone or access accounts for you, are refused outright.",
+          ),
       },
     },
-    async ({ api_key, title, description, category, reward_usd, acceptance_criteria, deadline }) =>
+    async ({ api_key, title, description, category, reward_usd, acceptance_criteria, deadline, audience }) =>
       run(async () => {
         const agent = requireAgent(await authByKey(db, api_key));
-        return postBounty(db, agent, {
-          title, description, category, acceptance_criteria, deadline,
+        return postBounty(db, agent, env, {
+          title, description, category, acceptance_criteria, deadline, audience,
           reward_amount_cents: Math.round(reward_usd * 100),
         });
       }),

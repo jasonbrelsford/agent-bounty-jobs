@@ -7,7 +7,9 @@
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "migrate": "wrangler d1 migrations apply agent-bounty-jobs --remote",
-    "migrate:local": "wrangler d1 migrations apply agent-bounty-jobs --local"
+    "migrate:local": "wrangler d1 migrations apply agent-bounty-jobs --local",
+    "build:test": "tsc -p tsconfig.json --noEmit false --outDir .test-build",
+    "test": "npm run build:test && node --test tests/*.test.mjs"
   },
   "dependencies": {
     "agents": "^0.21.0",
