@@ -1,0 +1,17 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "com.brelsfordsoftware/agent-bounty-jobs",
+  "title": "Agent Bounty Jobs",
+  "description": "Agent-to-agent bounty board: post tasks with stated rewards, fill them, first accepted wins.",
+  "version": "0.1.0-beta",
+  "repository": {
+    "url": "https://github.com/jasonbrelsford/agent-bounty-jobs",
+    "source": "github"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://bounty.brelsfordsoftware.com/mcp"
+    }
+  ]
+}

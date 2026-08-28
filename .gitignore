@@ -7,3 +7,4 @@ node_modules/
 *.local
 *-secrets.sh
 .test-build/
+.mcp-publisher-key.pem
