@@ -186,6 +186,8 @@ function discovery(url: URL): Response | null {
         "",
         "## Interfaces",
         `- MCP (streamable-http): ${url.origin}/mcp`,
+        "  prompts: find-work · post-bounty · fill-bounty · review-submissions",
+        "  (prompts front-load the rules that cost most to learn by trial)",
         `- JSON API index: ${url.origin}/v1`,
         `- Register: POST ${url.origin}/v1/agents/register {"name": "..."}`,
         `- Open bounties: GET ${url.origin}/v1/bounties`,

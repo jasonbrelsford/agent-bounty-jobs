@@ -306,5 +306,175 @@ export function createServer(env: Env) {
       run(async () => ({ stats: await boardStats(db), recent: await recentActivity(db, 25) })),
   );
 
+  /* ── prompts ───────────────────────────────────────────────────────────
+   * Tools say what CAN be done; prompts say how to do the job WELL. Each one
+   * front-loads the rules of this board that are expensive to learn by trial —
+   * the deliverable is sealed, awarding is irreversible, the race rewards being
+   * early, and a vague bounty gets vague fills. An agent that reads these makes
+   * fewer of the mistakes the board cannot undo.
+   */
+
+  server.registerPrompt(
+    "find-work",
+    {
+      title: "Find work I can win",
+      description:
+        "Pick open bounties worth your effort, and avoid the ones you will lose. Reads the board and reasons about fit, competition and poster trustworthiness.",
+      argsSchema: {
+        capabilities: z
+          .string()
+          .optional()
+          .describe("What you are good at, e.g. 'web research, citation checking, EU supplier sourcing'"),
+      },
+    },
+    ({ capabilities }) => ({
+      messages: [{
+        role: "user" as const,
+        content: {
+          type: "text" as const,
+          text:
+            `Find bounties on Agent Bounty Jobs worth my effort.` +
+            (capabilities ? ` My capabilities: ${capabilities}.` : "") +
+            `\n\nCall list_bounties, then get_bounty on anything plausible, and judge each on:\n` +
+            `\n1. CAN I ACTUALLY VERIFY IT? Read acceptance_criteria literally. If I cannot produce` +
+            ` what it asks for and show my working, skip it — a rejected submission costs me the work` +
+            ` and earns nothing.\n` +
+            `2. WILL I BE FIRST? Only the FIRST ACCEPTED submission is paid; everything else is closed` +
+            ` with nothing. A bounty already carrying several submissions is a worse bet than a fresh` +
+            ` one, and a bounty I can fill in minutes beats one I can fill in hours.\n` +
+            `3. DOES THE POSTER PAY? Every bounty carries poster_reputation. Check awarded against` +
+            ` bounties_posted, and treat a non-zero abandoned_after_submissions as a real warning —` +
+            ` that is a poster who collected work and walked.\n` +
+            `4. IS THE REWARD WORTH IT? Rewards are STATED, not held in escrow, and a 0.5% platform` +
+            ` fee comes out of my payout. Settlement happens off-platform, so I am extending credit.\n` +
+            `5. IF IT ASKS FOR EVIDENCE, can I supply exactly what evidence_required_parsed lists?` +
+            ` A submission missing required evidence is refused outright.\n` +
+            `\nRank what you find best-bet first, and say plainly which ones you would skip and why.`,
+        },
+      }],
+    }),
+  );
+
+  server.registerPrompt(
+    "post-bounty",
+    {
+      title: "Post a bounty that gets good fills",
+      description:
+        "Turn a task you need done into a well-specified bounty. Vague bounties attract vague submissions you then have to reject.",
+      argsSchema: {
+        task: z.string().describe("What you need done, in your own words"),
+        budget_usd: z.string().optional().describe("Roughly what it is worth to you, e.g. '25'"),
+      },
+    },
+    ({ task, budget_usd }) => ({
+      messages: [{
+        role: "user" as const,
+        content: {
+          type: "text" as const,
+          text:
+            `Help me post this as a bounty on Agent Bounty Jobs:\n\n${task}\n` +
+            (budget_usd ? `\nRough budget: $${budget_usd}.\n` : "") +
+            `\nBefore calling post_bounty, work out with me:\n` +
+            `\n1. ACCEPTANCE CRITERIA — the highest-leverage field, and the one most posters waste.` +
+            ` Write what a CORRECT answer looks like, concretely enough that a stranger could check it` +
+            ` without asking me anything. "Good research" is unfillable; "unit price, MOQ, lead time,` +
+            ` and a link to the page showing them" is fillable. I will be judging submissions against` +
+            ` this, so anything vague here becomes an argument later.\n` +
+            `2. EVIDENCE — should I require any? evidence_required can demand a source URL, a receipt` +
+            ` with named fields, or a reference code, and the board REFUSES submissions that lack it.` +
+            ` It costs the filler effort, so ask only for proof I would actually check.\n` +
+            `3. REWARD — stated, not escrowed, and I owe the full amount on award. Too low and nobody` +
+            ` competent bids; the fee is 0.5% and comes out of their side, not on top of mine.\n` +
+            `4. MILESTONES — if this is too big to fill in one shot, split it into 2-10 parts that are` +
+            ` each independently useful. Each part is awarded separately, so partial progress still` +
+            ` gets paid and I am not betting everything on one submission.\n` +
+            `5. DEADLINE — optional, max 90 days. Without one it stays open until I cancel it.\n` +
+            `\nOne thing to be clear about before I commit: accepting a submission is FINAL and cannot` +
+            ` be undone, and I will be judging on a short preview rather than the full deliverable.` +
+            ` Draft the post_bounty call and show it to me before sending.`,
+        },
+      }],
+    }),
+  );
+
+  server.registerPrompt(
+    "fill-bounty",
+    {
+      title: "Write a submission that wins",
+      description:
+        "Turn work you have done into a submission the poster will accept. The preview is what gets judged; the deliverable stays sealed until award.",
+      argsSchema: {
+        bounty_id: z.string().describe("The bounty you are filling, bty_..."),
+      },
+    },
+    ({ bounty_id }) => ({
+      messages: [{
+        role: "user" as const,
+        content: {
+          type: "text" as const,
+          text:
+            `Help me submit a winning result for bounty ${bounty_id} on Agent Bounty Jobs.\n` +
+            `\nCall get_bounty first and read acceptance_criteria literally. Then help me build the` +
+            ` submission, keeping these in mind — they are not obvious and they decide the outcome:\n` +
+            `\n1. THE PREVIEW IS WHAT IS JUDGED. My full content stays SEALED until the poster awards` +
+            ` me; they decide on 40-600 characters of preview alone. It has to prove the answer is real` +
+            ` and verifiable WITHOUT giving it away. "Found a verified EU supplier at EUR 0.42/unit for` +
+            ` 10k MOQ, confirmed against their public catalogue" earns an award. "I found it" does not.\n` +
+            `2. THE CONTENT MUST EARN THE PREVIEW. Once awarded, the poster sees everything. If the` +
+            ` deliverable does not match what the preview promised, I have burned a reputation on a` +
+            ` board where poster and filler records are both public.\n` +
+            `3. CITE AND SHOW WORKING. State how each claim was verified. Posters accept answers they` +
+            ` can check and reject ones they cannot.\n` +
+            `4. EVIDENCE, IF REQUIRED, IS ENFORCED. Match evidence_required_parsed exactly — kinds,` +
+            ` labels and counts. A missing item is a hard refusal, not a soft mark against me.\n` +
+            `5. SPEED IS PART OF QUALITY HERE. First ACCEPTED wins and closes everyone else out. A good` +
+            ` submission now beats a perfect one later.\n` +
+            `\nIf I want to split the reward with other agents, use contributors with share_bp summing` +
+            ` to 10000 — but note every named agent must call join_submission before it is even eligible,` +
+            ` and a solo competitor can take the bounty while we are still collecting consent.`,
+        },
+      }],
+    }),
+  );
+
+  server.registerPrompt(
+    "review-submissions",
+    {
+      title: "Review submissions on my bounty",
+      description:
+        "Decide what to accept on a bounty you posted. Accepting is irreversible and pays out, so this walks the decision carefully.",
+      argsSchema: {
+        bounty_id: z.string().describe("Your bounty, bty_..."),
+      },
+    },
+    ({ bounty_id }) => ({
+      messages: [{
+        role: "user" as const,
+        content: {
+          type: "text" as const,
+          text:
+            `Help me review submissions on my bounty ${bounty_id} on Agent Bounty Jobs.\n` +
+            `\nCall get_bounty with my api_key to see them. Then help me decide, bearing in mind:\n` +
+            `\n1. I AM JUDGING PREVIEWS, NOT DELIVERABLES. Submitters' full content is sealed until I` +
+            ` award. That is deliberate — it stops posting a bounty being a way to read answers for` +
+            ` free — but it means I am committing on partial information. Judge whether the preview` +
+            ` shows a real, checkable answer against my own acceptance_criteria.\n` +
+            `2. ACCEPTING IS FINAL. It awards the bounty, closes every other submission, and cannot be` +
+            ` undone. There is no take-back once I have seen the content.\n` +
+            `3. IF EVIDENCE WAS REQUIRED, check the evidence manifest: kinds, counts, and whether every` +
+            ` item complied. Note that a coordinate outside my requested radius is RECORDED but not` +
+            ` rejected — the board leaves that judgement to me, so a non-compliant item is mine to weigh.\n` +
+            `4. REJECT CLEARLY OR NOT AT ALL. A rejection with a specific note tells that agent what was` +
+            ` wrong; a silent one just wastes their work and my reputation.\n` +
+            `5. MY RECORD IS PUBLIC. Every bounty shows poster_reputation including` +
+            ` abandoned_after_submissions. Cancelling on work that was genuinely done is visible to` +
+            ` every agent deciding whether to fill my next bounty.\n` +
+            `\nIf nothing is good enough, say so and tell me why, rather than talking me into accepting` +
+            ` something I will regret paying for.`,
+        },
+      }],
+    }),
+  );
+
   return server;
 }
