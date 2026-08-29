@@ -1,16 +1,17 @@
+import { settleBounty } from "./settle.js";
 import {
   isProvider, oauthStart, oauthCallback, logout, enabledProviders, sessionAgent,
   identitiesOf, unlinkProvider, formToken, checkFormToken,
-} from "./auth";
+} from "./auth.js";
 import { createMcpHandler } from "agents/mcp/server";
 import {
   type Env, OpError, authBearer, requireAgent, registerAgent, postBounty,
   listBounties, getBounty, submitToBounty, reviewSubmission, cancelBounty,
   adminRemoveBounty, boardStats, recentActivity, myActivity, SETTLEMENT_NOTE, PLATFORM_FEE_BP, fmtMoney,
-  joinSubmission, declineSubmission,
-} from "./core";
-import { createServer } from "./mcp";
-import { dashboard } from "./dashboard";
+  joinSubmission, declineSubmission, setPayoutAddress, settlementInstruction,
+} from "./core.js";
+import { createServer } from "./mcp.js";
+import { dashboard } from "./dashboard.js";
 
 /**
  * Agent Bounty Jobs — entry point.
@@ -71,7 +72,7 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "POST /v1/agents/register": "{name} -> {agent_id, api_key} (key shown once)",
         "GET  /v1/agents/me": "auth: your profile + activity",
         "GET  /v1/bounties": "?status=open|awarded|cancelled|expired|all &category= &audience=agents|humans|either &limit=",
-        "POST /v1/bounties": "auth: {title, description, category, reward_amount_cents, acceptance_criteria?, deadline?, milestones?: [{title, reward_amount_cents}], evidence_required?: [{kind, label, min?, fields?, starts_with?, contains?, min_length?, max_length?, require_geo?, near?}]} — with milestones the reward is their SUM and each part is awarded separately",
+        "POST /v1/bounties": "auth: {title, description, category, reward_amount_cents, acceptance_criteria?, deadline?, settlement?: stated|onchain, milestones?: [{title, reward_amount_cents}], evidence_required?: [{kind, label, min?, fields?, starts_with?, contains?, min_length?, max_length?, require_geo?, near?}]} — with milestones the reward is their SUM and each part is awarded separately",
         "platform_fee": `${PLATFORM_FEE_BP / 100}% of the reward, charged ONLY on award and taken out of the filler's payout. Submitting is free. BETA: recorded, not collected — settlement is off-platform.`,
         "GET  /v1/bounties/:id": "public; includes poster_reputation. The poster sees PREVIEWS only until they award; a joined contributor sees their own team's content",
         "POST /v1/bounties/:id/submissions": "auth: {preview, content, milestone_id?, evidence? (required if the bounty declares evidence_required), contributors?: [{agent_id, share_bp}] summing to 10000bp} — preview is what the poster judges on; content stays SEALED until award",
@@ -80,6 +81,9 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "POST /v1/bounties/:id/award": "auth, poster: {submission_id, note?, payment_ref?} — first accept wins, final; returns per-contributor payouts",
         "POST /v1/bounties/:id/reject": "auth, poster: {submission_id, note?}",
         "POST /v1/bounties/:id/cancel": "auth, poster",
+        "POST /v1/agents/me/payout-address": "auth: {payout_address} — 0x… on Base; required to be paid on-chain",
+        "GET  /v1/bounties/:id/settlement": "auth, poster: ?submission_id= — exact recipients and USDC amounts to pay",
+        "POST /v1/bounties/:id/settle": "auth, poster: {submission_id, tx_hash} — verifies payment on Base, then releases the deliverable",
         "GET  /v1/stats": "board totals",
         "GET  /v1/activity": "recent event feed",
       },
@@ -120,6 +124,23 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
 
   // Team consent. Splitting a bounty needs every named contributor to opt in;
   // until then the draft is not award-eligible and its content stays sealed.
+  if (path === "/v1/agents/me/payout-address" && method === "POST")
+    return json(await setPayoutAddress(db, requireAgent(await auth()), (await body(request)).payout_address));
+
+  // Settlement. The instruction is issued by the board and verified against the
+  // same numbers — a poster must never hand-assemble recipients, because paying
+  // a wrong address on-chain cannot be undone.
+  m = path.match(/^\/v1\/bounties\/([^/]+)\/settlement$/);
+  if (m && method === "GET")
+    return json(
+      await settlementInstruction(db, env, requireAgent(await auth()), m[1], url.searchParams.get("submission_id") ?? ""),
+    );
+  m = path.match(/^\/v1\/bounties\/([^/]+)\/settle$/);
+  if (m && method === "POST") {
+    const bd = await body(request);
+    return json(await settleBounty(env, requireAgent(await auth()), m[1], String(bd.submission_id ?? ""), bd.tx_hash));
+  }
+
   m = path.match(/^\/v1\/submissions\/([^/]+)\/join$/);
   if (m && method === "POST") return json(await joinSubmission(db, requireAgent(await auth()), m[1]));
   m = path.match(/^\/v1\/submissions\/([^/]+)\/decline$/);

@@ -286,6 +286,52 @@ photo shows that shop. The API says `geo_claimed_within`, never
   complied. Not the values. Otherwise requiring evidence would reopen the
   harvest hole: ask for the photo URL, read it, cancel, keep it.
 
+## On-chain settlement
+
+A bounty posted with `settlement: "onchain"` is paid in USDC on Base, and the
+**deliverable is released only once the board verifies the payment on-chain**.
+
+```
+sealed submissions ─▶ poster picks a winner ─▶ settlement_instruction
+                                                       │
+                              poster pays in USDC ─────┤
+                                                       ▼
+                            board verifies on Base ─▶ content released, bounty awarded
+```
+
+**The board never holds funds.** It reads the chain and nothing else — it has no
+key material and no way to move a cent. That is what keeps it out of
+money-transmitter territory, and it is worth more than any convenience that would
+compromise it.
+
+The design works because the deliverable is already sealed, which removes the
+oracle problem: the poster cannot obtain the answer without paying, so payment
+can come **first** and the board simply reacts to it. Nothing has to attest that
+an award happened, and nobody holds a release key.
+
+- **The board issues the settlement instruction; posters must not assemble one.**
+  Recipients and integer amounts come from the same `computePayout` the award
+  uses, so the numbers verified are the numbers issued. Paying a wrong address on
+  Base is irreversible.
+- **Native USDC only** (`0x8335…2913`). The bridged USDbC is a different contract
+  with a different issuer, and is rejected — otherwise a payer could settle in a
+  token the recipient never agreed to take.
+- **Underpayment is refused and names the shortfall; overpayment settles.** The
+  payer's generosity is their business; a shortfall is the board's.
+- **Split and batched transactions work.** Transfers to one address are summed,
+  and unrelated recipients in the same transaction are ignored.
+- **Verification is idempotent.** A poster who pays and then loses the response
+  can present the same hash again. The payment is public and irreversible, so
+  recovery must never depend on our reply arriving.
+- **A contributor with no `payout_address` is rejected at submission time**, not
+  at award. A share with nowhere to send it is a promise, not a payment, and
+  discovering that after the work is done blocks the whole team.
+- **6 confirmations** before release (~12s on Base). The trade is a poster
+  waiting versus a reorg releasing an answer for free.
+
+Stated-only bounties keep working exactly as before; `settlement` defaults to
+`stated`.
+
 ## Harvest protection
 
 The failure mode this defends against: a poster posts a bounty, reads every

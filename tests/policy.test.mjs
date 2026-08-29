@@ -182,3 +182,110 @@ test("fee plus payouts always equals the pot, per milestone", () => {
   assert.equal(paid + feed, total, "and the whole bounty conserves");
   assert.equal(feed, feeSplit(total, bp).fee, "total fee equals the whole-bounty fee");
 });
+
+import { coversPayouts, isAddress, isTxHash } from "../.test-build/chain.js";
+import { UNITS_PER_CENT } from "../.test-build/core.js";
+
+const t = (to, cents) => ({ from: "0xdead", to: to.toLowerCase(), units: BigInt(cents) * UNITS_PER_CENT });
+const A = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const B = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const FEE = "0xffffffffffffffffffffffffffffffffffffffff";
+
+test("exact payment settles", () => {
+  const req = [{ address: A, amount_cents: 299 }, { address: FEE, amount_cents: 1 }];
+  assert.equal(coversPayouts([t(A, 299), t(FEE, 1)], req).ok, true);
+});
+
+test("underpayment is refused and names the shortfall", () => {
+  const req = [{ address: A, amount_cents: 299 }, { address: FEE, amount_cents: 1 }];
+  const r = coversPayouts([t(A, 298), t(FEE, 1)], req);
+  assert.equal(r.ok, false);
+  assert.equal(r.missing.length, 1);
+  assert.equal(r.missing[0].owed_cents, 299);
+  assert.equal(r.missing[0].paid_cents, 298);
+});
+
+test("a missing recipient entirely is refused", () => {
+  const req = [{ address: A, amount_cents: 100 }, { address: FEE, amount_cents: 1 }];
+  const r = coversPayouts([t(A, 100)], req);
+  assert.equal(r.ok, false);
+  assert.equal(r.missing[0].address, FEE);
+});
+
+test("overpayment settles — that is the payer's business, not ours", () => {
+  assert.equal(coversPayouts([t(A, 500)], [{ address: A, amount_cents: 299 }]).ok, true);
+});
+
+test("split transfers to one address are summed", () => {
+  // A poster paying in two chunks still paid. Treating each transfer separately
+  // would reject a legitimate settlement.
+  assert.equal(coversPayouts([t(A, 100), t(A, 199)], [{ address: A, amount_cents: 299 }]).ok, true);
+});
+
+test("unrelated extra recipients are ignored", () => {
+  const r = coversPayouts([t(A, 299), t(FEE, 1), t(B, 5000)], [{ address: A, amount_cents: 299 }, { address: FEE, amount_cents: 1 }]);
+  assert.equal(r.ok, true);
+});
+
+test("address comparison is case-insensitive", () => {
+  assert.equal(coversPayouts([t(A.toUpperCase(), 100)], [{ address: A.toUpperCase(), amount_cents: 100 }]).ok, true);
+});
+
+test("zero-fee settlements need no fee transfer", () => {
+  assert.equal(coversPayouts([t(A, 100)], [{ address: A, amount_cents: 100 }]).ok, true);
+});
+
+test("address and tx-hash shapes are validated", () => {
+  assert.ok(isAddress(A));
+  assert.ok(!isAddress("0x123"));
+  assert.ok(!isAddress(A + "ff"));
+  assert.ok(isTxHash("0x" + "a".repeat(64)));
+  assert.ok(!isTxHash("0x" + "a".repeat(63)));
+  assert.ok(!isTxHash(A));
+});
+
+import { parseTransferLogs } from "../.test-build/chain.js";
+
+const USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+const USDbC = "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca"; // bridged — NOT accepted
+const XFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const pad = (a) => "0x" + "0".repeat(24) + a.slice(2);
+const log = (addr, from, to, units, topic = XFER) => ({
+  address: addr, topics: [topic, pad(from), pad(to)], data: "0x" + units.toString(16),
+});
+
+test("decodes a USDC transfer to the right address and amount", () => {
+  // 2.99 USDC = 2_990_000 base units (6 decimals) = 299 cents
+  const out = parseTransferLogs([log(USDC, A, B, 2_990_000)]);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].to, B.toLowerCase());
+  assert.equal(out[0].units, 2_990_000n);
+  assert.equal(Number(out[0].units / UNITS_PER_CENT), 299);
+});
+
+test("ignores the bridged USDbC contract", () => {
+  // Different issuer, different contract. Accepting it would let someone settle
+  // in a token the recipient did not agree to take.
+  assert.equal(parseTransferLogs([log(USDbC, A, B, 5_000_000)]).length, 0);
+});
+
+test("ignores non-Transfer events from the USDC contract", () => {
+  const approval = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
+  assert.equal(parseTransferLogs([log(USDC, A, B, 1_000_000, approval)]).length, 0);
+});
+
+test("matches the USDC contract case-insensitively", () => {
+  assert.equal(parseTransferLogs([log(USDC.toUpperCase(), A, B, 1_000_000)]).length, 1);
+});
+
+test("handles empty data as zero rather than throwing", () => {
+  const l = log(USDC, A, B, 0); l.data = "0x";
+  assert.equal(parseTransferLogs([l])[0].units, 0n);
+});
+
+test("decodes several transfers in one transaction", () => {
+  const out = parseTransferLogs([log(USDC, A, B, 5_970_000), log(USDC, A, FEE, 50_000)]);
+  assert.equal(out.length, 2);
+  assert.equal(Number(out[0].units / UNITS_PER_CENT), 597);
+  assert.equal(Number(out[1].units / UNITS_PER_CENT), 5);
+});

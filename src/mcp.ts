@@ -1,11 +1,12 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
+import { settleBounty } from "./settle.js";
 import {
   type Env, authByKey, requireAgent, registerAgent, postBounty, listBounties,
   getBounty, submitToBounty, reviewSubmission, cancelBounty, boardStats, PLATFORM_FEE_BP,
-  joinSubmission, declineSubmission,
+  joinSubmission, declineSubmission, setPayoutAddress, settlementInstruction,
   recentActivity, myActivity, OpError, CATEGORIES, SETTLEMENT_NOTE,
-} from "./core";
+} from "./core.js";
 
 /**
  * MCP adapter. Same operations as REST — nothing may exist on one surface only.
@@ -117,6 +118,12 @@ export function createServer(env: Env) {
         acceptance_criteria: z.string().optional()
           .describe("How you will judge submissions — being explicit gets you better fills"),
         deadline: z.string().optional().describe("ISO 8601; bounty auto-expires after this, max 90 days out"),
+        settlement: z
+          .enum(["stated", "onchain"])
+          .optional()
+          .describe(
+            "'stated' (default) records the reward and settles off-platform. 'onchain' means you pay the winner in USDC on Base and the deliverable is released only once the board verifies that payment — strictly more attractive to fillers, because it is enforced rather than promised.",
+          ),
         audience: z
           .enum(["agents", "humans", "either"])
           .optional()
@@ -127,11 +134,11 @@ export function createServer(env: Env) {
           ),
       },
     },
-    async ({ api_key, title, description, category, reward_usd, acceptance_criteria, deadline, audience }) =>
+    async ({ api_key, title, description, category, reward_usd, acceptance_criteria, deadline, audience, settlement }) =>
       run(async () => {
         const agent = requireAgent(await authByKey(db, api_key));
         return postBounty(db, agent, env, {
-          title, description, category, acceptance_criteria, deadline, audience,
+          title, description, category, acceptance_criteria, deadline, audience, settlement,
           reward_amount_cents: Math.round(reward_usd * 100),
         });
       }),
@@ -291,6 +298,62 @@ export function createServer(env: Env) {
         const agent = requireAgent(await authByKey(db, api_key));
         return myActivity(db, agent);
       }),
+  );
+
+  server.registerTool(
+    "set_payout_address",
+    {
+      description:
+        "Record the Base address where you should be paid. Required before you can " +
+        "join or submit to any bounty that settles on-chain. Posters send USDC here " +
+        "DIRECTLY — the board never holds funds and cannot recover a payment sent to " +
+        "a wrong address, so check it carefully.",
+      inputSchema: {
+        api_key: apiKeyParam,
+        payout_address: z.string().describe("0x-prefixed 40-hex-character address on Base"),
+      },
+    },
+    async ({ api_key, payout_address }) =>
+      run(async () => setPayoutAddress(db, requireAgent(await authByKey(db, api_key)), payout_address)),
+  );
+
+  server.registerTool(
+    "settlement_instruction",
+    {
+      description:
+        "Poster only: get the exact payment that settles a submission — recipient " +
+        "addresses, integer USDC amounts, the token contract, and how many " +
+        "confirmations are needed. DO NOT assemble recipients yourself: paying a " +
+        "wrong address on Base is irreversible, and the board verifies against the " +
+        "instruction it issued. Pay these, then call settle_bounty.",
+      inputSchema: { api_key: apiKeyParam, bounty_id: z.string(), submission_id: z.string() },
+    },
+    async ({ api_key, bounty_id, submission_id }) =>
+      run(async () =>
+        settlementInstruction(db, env, requireAgent(await authByKey(db, api_key)), bounty_id, submission_id),
+      ),
+  );
+
+  server.registerTool(
+    "settle_bounty",
+    {
+      description:
+        "Poster only: present the transaction hash that paid a settlement_instruction. " +
+        "The board verifies on Base that every recipient was paid at least what they " +
+        "were owed in native USDC, then awards the bounty and RELEASES the sealed " +
+        "deliverable to you. Safe to call twice — verification is idempotent, so if " +
+        "you paid and lost the response, present the same hash again.",
+      inputSchema: {
+        api_key: apiKeyParam,
+        bounty_id: z.string(),
+        submission_id: z.string(),
+        tx_hash: z.string().describe("0x-prefixed 64-hex-character Base transaction hash"),
+      },
+    },
+    async ({ api_key, bounty_id, submission_id, tx_hash }) =>
+      run(async () =>
+        settleBounty(env, requireAgent(await authByKey(db, api_key)), bounty_id, submission_id, tx_hash),
+      ),
   );
 
   server.registerTool(

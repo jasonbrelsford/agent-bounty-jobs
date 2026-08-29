@@ -31,6 +31,14 @@ export interface Env {
   GOOGLE_CLIENT_ID?: string;
   GOOGLE_CLIENT_SECRET?: string;
   SESSION_SECRET?: string;
+  /**
+   * On-chain settlement. PLATFORM_FEE_ADDRESS absent = on-chain bounties cannot
+   * be posted at all, which is fail-closed: a bounty whose fee has nowhere to go
+   * is unsettleable, and discovering that at award time is far worse than at post
+   * time. BASE_RPC_URL defaults to the public endpoint.
+   */
+  PLATFORM_FEE_ADDRESS?: string;
+  BASE_RPC_URL?: string;
   /** wrangler secret. Absent = admin endpoints disabled, which is fail-closed. */
   ADMIN_KEY?: string;
 }
@@ -44,7 +52,8 @@ export type Bounty = {
   status: string; deadline: string | null;
   awarded_submission_id: string | null; awarded_at: string | null;
   payment_ref: string | null; fee_bp: number; fee_cents: number | null;
-  audience: string; evidence_required: string | null; created_at: string;
+  audience: string; evidence_required: string | null;
+  settlement_mode: string; settled_tx: string | null; created_at: string;
 };
 
 export type Submission = {
@@ -90,6 +99,29 @@ export type EventRow = {
 
 export const CATEGORIES = ["research", "data", "sourcing", "price_discovery", "other"] as const;
 export const AUDIENCES = ["agents", "humans", "either"] as const;
+export const SETTLEMENT_MODES = ["stated", "onchain"] as const;
+
+/**
+ * Native USDC on Base. NOT the bridged USDbC at 0xd9aAEc86…, which is a different
+ * contract with a different issuer. Accepting "some token that looks like USDC"
+ * would let a payer settle in something worthless, so this is checked exactly
+ * and is deliberately not configurable.
+ */
+export const USDC_BASE = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+
+/** USDC has 6 decimals. One cent = 10_000 base units. */
+export const UNITS_PER_CENT = 10_000n;
+
+/**
+ * Confirmations required before releasing sealed content.
+ *
+ * The trade is a poster waiting versus a reorg releasing an answer for free.
+ * Base blocks are ~2s, so 6 is about twelve seconds — cheap for the poster, and
+ * deep enough that a sequencer-level reorg would have to be extraordinary. True
+ * L1 finality takes minutes; waiting for it would make a $2 bounty feel broken,
+ * and the exposure if it ever went wrong is exactly one answer.
+ */
+export const MIN_CONFIRMATIONS = 6;
 export const BOUNTY_STATUSES = ["open", "awarded", "cancelled", "expired", "removed"] as const;
 
 /** One place for every knob, so the beta's guardrails are auditable at a glance. */
@@ -173,7 +205,7 @@ export class OpError extends Error {
 
 const hex = (b: Uint8Array) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
 
-function newId(prefix: string): string {
+export function newId(prefix: string): string {
   const b = new Uint8Array(8);
   crypto.getRandomValues(b);
   return `${prefix}_${hex(b)}`;
@@ -190,7 +222,7 @@ async function keyHash(key: string): Promise<string> {
   return hex(new Uint8Array(d));
 }
 
-const nowIso = () => new Date().toISOString();
+export const nowIso = () => new Date().toISOString();
 
 export function fmtMoney(cents: number, currency: string): string {
   return `${currency === "USD" ? "$" : `${currency} `}${(cents / 100).toFixed(2)}`;
@@ -566,11 +598,11 @@ export async function registerAgent(db: D1Database, nameRaw: unknown) {
 export async function postBounty(
   db: D1Database,
   agent: Agent,
-  env: Pick<Env, "HUMAN_BOUNTIES">,
+  env: Pick<Env, "HUMAN_BOUNTIES" | "PLATFORM_FEE_ADDRESS">,
   input: {
     title?: unknown; description?: unknown; category?: unknown;
     acceptance_criteria?: unknown; reward_amount_cents?: unknown; deadline?: unknown;
-    milestones?: unknown; audience?: unknown; evidence_required?: unknown;
+    milestones?: unknown; audience?: unknown; evidence_required?: unknown; settlement?: unknown;
   },
 ) {
   const title = reqString(input.title, "title", LIMITS.title.min, LIMITS.title.max);
@@ -622,6 +654,14 @@ export async function postBounty(
     deadline = new Date(t).toISOString();
   }
 
+  const settlementMode = String(input.settlement ?? "stated");
+  if (!(SETTLEMENT_MODES as readonly string[]).includes(settlementMode))
+    throw new OpError(400, `settlement must be one of: ${SETTLEMENT_MODES.join(", ")}`);
+  // Fail closed at POST time. A bounty whose fee has nowhere to go cannot be
+  // settled, and finding that out at award time — after someone has done the
+  // work — is far worse than finding it out now.
+  if (settlementMode === "onchain" && !env.PLATFORM_FEE_ADDRESS)
+    throw new OpError(503, "on-chain settlement is not configured on this board yet");
   const evidence = validateEvidenceSpec(input.evidence_required);
   const audience = String(input.audience ?? "agents");
   if (!(AUDIENCES as readonly string[]).includes(audience))
@@ -660,10 +700,10 @@ export async function postBounty(
   await db.batch([
     db.prepare(
       `INSERT INTO bounties (id, poster_id, title, description, category, acceptance_criteria,
-         reward_amount_cents, reward_currency, status, deadline, fee_bp, audience, evidence_required, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'USD', 'open', ?, ?, ?, ?, ?)`,
+         reward_amount_cents, reward_currency, status, deadline, fee_bp, audience, evidence_required, settlement_mode, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'USD', 'open', ?, ?, ?, ?, ?, ?)`,
     ).bind(id, agent.id, title, description, category, criteria, cents, deadline, PLATFORM_FEE_BP, audience,
-           evidence.length ? JSON.stringify(evidence) : null, at),
+           evidence.length ? JSON.stringify(evidence) : null, settlementMode, at),
     ...parts.map((m, i) =>
       db.prepare(
         "INSERT INTO milestones (id, bounty_id, idx, title, reward_amount_cents, status, created_at) VALUES (?, ?, ?, ?, ?, 'open', ?)",
@@ -686,6 +726,11 @@ export async function postBounty(
     platform_fee_bp: PLATFORM_FEE_BP,
     net_to_filler: fmtMoney(fs.net, "USD"),
     audience,
+    settlement_mode: settlementMode,
+    settlement_note:
+      settlementMode === "onchain"
+        ? "Fillers are paid in USDC on Base. You will be given exact recipients and amounts at award time, and the deliverable is released only once the payment is verified on-chain."
+        : undefined,
     evidence_required: evidence.length ? evidence : undefined,
     // Disclosure is not decoration: a person is entitled to know they are being
     // directed by software before they agree to the work.
@@ -972,12 +1017,23 @@ export async function submitToBounty(
 
   const ids = roster.map((r) => r.agent_id);
   const found = await db
-    .prepare(`SELECT id FROM agents WHERE id IN (${ids.map(() => "?").join(",")})`)
+    .prepare(`SELECT id, payout_address FROM agents WHERE id IN (${ids.map(() => "?").join(",")})`)
     .bind(...ids)
-    .all<{ id: string }>();
+    .all<{ id: string; payout_address: string | null }>();
   const known = new Set((found.results ?? []).map((r) => r.id));
   const missing = ids.filter((i) => !known.has(i));
   if (missing.length) throw new OpError(404, `unknown contributor agent(s): ${missing.join(", ")}`);
+  // Enforced HERE rather than at award: a share with nowhere to send it is a
+  // promise, not a payment, and discovering that after the work is done blocks
+  // the whole team on someone else's missing setup.
+  if (b.settlement_mode === "onchain") {
+    const noAddr = (found.results ?? []).filter((r) => !r.payout_address).map((r) => r.id);
+    if (noAddr.length)
+      throw new OpError(
+        409,
+        `this bounty pays on-chain, and ${noAddr.length} contributor(s) have no payout_address: ${noAddr.join(", ")}. Each must call set_payout_address before this submission can be made.`,
+      );
+  }
 
   // Per-bounty and pending caps count every submission the agent is ON, not
   // just ones they authored — otherwise joining teams is an unmetered way
@@ -1133,6 +1189,129 @@ export async function declineSubmission(db: D1Database, agent: Agent, submission
   return { submission_id: submissionId, status: "withdrawn", reason: "a contributor declined their share" };
 }
 
+/**
+ * What this submission would be paid, exactly.
+ *
+ * Extracted so the settlement INSTRUCTION and the AWARD are computed by the same
+ * code. If those two could drift, a poster would pay one set of amounts while
+ * the board expected another — and on-chain payments are irreversible, so the
+ * poster would eat the difference. One function, one answer.
+ */
+export async function computePayout(db: D1Database, b: Bounty, s: Submission) {
+  const team = await contributorsOf(db, s.id);
+  const mil = s.milestone_id
+    ? await db.prepare("SELECT * FROM milestones WHERE id = ?").bind(s.milestone_id).first<Milestone>()
+    : null;
+  const potCents = mil ? mil.reward_amount_cents : b.reward_amount_cents;
+  let fee: number;
+  if (mil) {
+    const parts = await milestonesOf(db, b.id);
+    const shares = allocate(
+      feeSplit(b.reward_amount_cents, b.fee_bp).fee,
+      parts.map((m) => m.reward_amount_cents),
+    );
+    fee = shares[parts.findIndex((m) => m.id === mil.id)] ?? 0;
+  } else {
+    fee = feeSplit(potCents, b.fee_bp).fee;
+  }
+  const net = potCents - fee;
+  const payouts = splitPayout(net, team.map((t) => t.share_bp));
+  return { team, mil, potCents, fee, net, payouts };
+}
+
+/** Record an agent's Base address. Without one they cannot be paid on-chain. */
+export async function setPayoutAddress(db: D1Database, agent: Agent, raw: unknown) {
+  const addr = String(raw ?? "").trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(addr))
+    throw new OpError(400, "payout_address must be a 0x-prefixed 40-hex-character Base address");
+  const at = nowIso();
+  await db.batch([
+    db.prepare("UPDATE agents SET payout_address = ? WHERE id = ?").bind(addr.toLowerCase(), agent.id),
+    eventStmt(db, at, "payout_address_set", null, agent.id, "an agent set a payout address"),
+  ]);
+  return {
+    agent_id: agent.id,
+    payout_address: addr.toLowerCase(),
+    note: "Payments are sent here directly by posters. The board never holds funds and cannot recover a payment sent to a wrong address — check it.",
+  };
+}
+
+/**
+ * The exact payment that settles this submission: who, how much, on what chain.
+ *
+ * The poster must NOT hand-assemble this. Paying the wrong address on-chain is
+ * irreversible, so the board issues the instruction and verifies against the
+ * same numbers it issued.
+ */
+export async function settlementInstruction(
+  db: D1Database,
+  env: Pick<Env, "PLATFORM_FEE_ADDRESS">,
+  agent: Agent,
+  bountyId: string,
+  submissionId: string,
+) {
+  const b = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(bountyId).first<Bounty>();
+  if (!b || b.status === "removed") throw new OpError(404, `no bounty ${bountyId}`);
+  if (b.poster_id !== agent.id) throw new OpError(403, "only the bounty poster can settle it");
+  if (!env.PLATFORM_FEE_ADDRESS)
+    throw new OpError(503, "on-chain settlement is not configured on this board");
+  const sub = await db
+    .prepare("SELECT * FROM submissions WHERE id = ? AND bounty_id = ?")
+    .bind(submissionId, bountyId)
+    .first<Submission>();
+  if (!sub) throw new OpError(404, `no submission ${submissionId} on bounty ${bountyId}`);
+  if (sub.status !== "pending") throw new OpError(409, `submission is ${sub.status}, not pending`);
+
+  const { team, mil, potCents, fee, payouts } = await computePayout(db, b, sub);
+
+  const addrs = await db
+    .prepare(
+      `SELECT id, payout_address FROM agents WHERE id IN (${team.map(() => "?").join(",")})`,
+    )
+    .bind(...team.map((t) => t.agent_id))
+    .all<{ id: string; payout_address: string | null }>();
+  const byId = new Map((addrs.results ?? []).map((r) => [r.id, r.payout_address]));
+  const unpaid = team.filter((t) => !byId.get(t.agent_id));
+  if (unpaid.length)
+    throw new OpError(
+      409,
+      `cannot settle: ${unpaid.length} contributor(s) have no payout_address — ${unpaid.map((u) => u.agent_id).join(", ")}. They must call set_payout_address first.`,
+    );
+
+  const recipients = [
+    ...team.map((t, i) => ({
+      role: "contributor" as const,
+      agent_id: t.agent_id,
+      address: byId.get(t.agent_id)!,
+      amount_cents: payouts[i],
+      amount_usdc: (payouts[i] / 100).toFixed(2),
+    })),
+    {
+      role: "platform_fee" as const,
+      agent_id: null,
+      address: env.PLATFORM_FEE_ADDRESS.toLowerCase(),
+      amount_cents: fee,
+      amount_usdc: (fee / 100).toFixed(2),
+    },
+  ].filter((r) => r.amount_cents > 0);
+
+  return {
+    bounty_id: bountyId,
+    submission_id: submissionId,
+    milestone_id: mil?.id ?? null,
+    chain: "base",
+    asset: "USDC",
+    token_contract: USDC_BASE,
+    recipients,
+    total_cents: recipients.reduce((a, r) => a + r.amount_cents, 0),
+    total_usdc: (recipients.reduce((a, r) => a + r.amount_cents, 0) / 100).toFixed(2),
+    confirmations_required: MIN_CONFIRMATIONS,
+    note:
+      "Send these USDC amounts on Base — one transaction paying every recipient is simplest, but separate transactions work if you settle each and present each hash. " +
+      "Then call settle_bounty with the transaction hash. The deliverable is released only after the payment is verified on-chain, and paying a wrong address is irreversible.",
+  };
+}
+
 export async function reviewSubmission(
   db: D1Database,
   agent: Agent,
@@ -1141,6 +1320,7 @@ export async function reviewSubmission(
   decision: "accept" | "reject",
   note?: unknown,
   paymentRef?: unknown,
+  settled = false,
 ) {
   const b = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(bountyId).first<Bounty>();
   if (!b || b.status === "removed") throw new OpError(404, `no bounty ${bountyId}`);
@@ -1151,6 +1331,14 @@ export async function reviewSubmission(
     .first<Submission>();
   if (!s) throw new OpError(404, `no submission ${submissionId} on bounty ${bountyId}`);
   if (s.status !== "pending") throw new OpError(409, `submission is ${s.status}, not pending`);
+  // On an on-chain bounty the money moves FIRST and the award is the board's
+  // reaction to it. Allowing a bare accept here would release the deliverable
+  // for free and quietly turn a funded bounty back into a promise.
+  if (decision === "accept" && b.settlement_mode === "onchain" && !settled)
+    throw new OpError(
+      409,
+      "this bounty settles on-chain: call settlement_instruction, pay the recipients in USDC on Base, then settle_bounty with the transaction hash. Accepting directly is not available.",
+    );
 
   const reviewNote = note == null ? null : reqString(note, "note", 1, 1000);
   const at = nowIso();

@@ -1,7 +1,7 @@
 import {
   type Env, boardStats, recentActivity, listBounties, fmtMoney, SETTLEMENT_NOTE,
   milestonesOf, posterReputation, PLATFORM_FEE_BP,
-} from "./core";
+} from "./core.js";
 
 /**
  * Human dashboard. Server-rendered on purpose — no client

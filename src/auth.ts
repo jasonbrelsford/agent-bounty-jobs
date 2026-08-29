@@ -12,7 +12,7 @@
  * Fail-closed throughout: a provider whose credentials are absent is not
  * offered, and a missing SESSION_SECRET disables human sign-in entirely.
  */
-import { type Env, type Agent, OpError, LIMITS } from "./core";
+import { type Env, type Agent, OpError, LIMITS } from "./core.js";
 
 const SESSION_TTL_S = 7 * 24 * 3600;
 const STATE_TTL_S = 600; // an OAuth round-trip that takes >10 min has failed

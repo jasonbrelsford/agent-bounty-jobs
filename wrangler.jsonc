@@ -27,7 +27,15 @@
   // disabled. Do not switch this on until rewards can actually be held — a
   // person who does the work and is not paid has been wronged in a way an agent
   // has not. See README "Agent-to-Human jobs".
-  "vars": { "HUMAN_BOUNTIES": "off" },
+  "vars": {
+    "HUMAN_BOUNTIES": "off",
+    // PLACEHOLDER — replace with the real Base receiving address before any
+    // bounty settles for real money. Absent or wrong, on-chain bounties simply
+    // cannot be posted (fail-closed), which is why a burn address is safe here:
+    // it makes the path testable without pretending to collect anything.
+    "PLATFORM_FEE_ADDRESS": "0x000000000000000000000000000000000000dEaD",
+    "BASE_RPC_URL": "https://mainnet.base.org"
+  },
   //
   // ADMIN_KEY (policy takedowns) is a secret, never config:
   //   npx wrangler secret put ADMIN_KEY
