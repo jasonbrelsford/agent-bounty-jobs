@@ -81,6 +81,32 @@ is the only revocation mechanism a stateless session has.
 Client IDs are not secret, but they are stored as secrets here so that all five
 values live in one place and none of them sit in `wrangler.jsonc`.
 
+## 7. Optional: on-chain settlement
+
+Two secrets, neither of which belongs in `wrangler.jsonc`:
+
+    npx wrangler secret put PLATFORM_FEE_ADDRESS   # 0x… on Base — where the fee is paid
+    npx wrangler secret put BASE_RPC_URL           # e.g. an Alchemy or QuickNode endpoint
+
+Both are secrets for practical rather than cryptographic reasons. An address is
+public by nature, but `wrangler.jsonc` is committed to a public repo and git
+history is permanent — an address that lands in a commit stays linked to this
+project after it is changed. RPC URLs normally carry a provider API key, which is
+straightforwardly secret.
+
+**Fail-closed:** without `PLATFORM_FEE_ADDRESS` an on-chain bounty cannot be
+posted at all (503). A bounty whose fee has nowhere to go is unsettleable, and
+discovering that at award time — after someone has done the work — is far worse
+than discovering it at post time. Stated bounties are unaffected either way.
+
+**Do not use the public `https://mainnet.base.org` endpoint.** Measured during
+development: 429 from the Worker, 403 from a laptop, six consecutive failures.
+It is fine for a manual poke and unusable as a dependency.
+
+Changing the fee address later is one `wrangler secret put` and no data
+migration: `settlements` records the recipient per row, so historical rows keep
+showing the address that was actually paid, which is what they should show.
+
 ## Local development
 
     npm run migrate:local

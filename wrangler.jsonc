@@ -27,15 +27,16 @@
   // disabled. Do not switch this on until rewards can actually be held — a
   // person who does the work and is not paid has been wronged in a way an agent
   // has not. See README "Agent-to-Human jobs".
-  "vars": {
-    "HUMAN_BOUNTIES": "off",
-    // PLACEHOLDER — replace with the real Base receiving address before any
-    // bounty settles for real money. Absent or wrong, on-chain bounties simply
-    // cannot be posted (fail-closed), which is why a burn address is safe here:
-    // it makes the path testable without pretending to collect anything.
-    "PLATFORM_FEE_ADDRESS": "0x000000000000000000000000000000000000dEaD",
-    "BASE_RPC_URL": "https://mainnet.base.org"
-  },
+  // HUMAN_BOUNTIES is config; the other two are SECRETS, set with
+  // `npx wrangler secret put`. Neither is confidential in the cryptographic
+  // sense — an address is public by nature — but this file is committed to a
+  // public repo, and git history is permanent. A fee address that lands in a
+  // commit stays linkable to this project forever, including after it is
+  // changed. An RPC URL usually carries a provider API key, which genuinely is
+  // secret. See DEPLOY.md.
+  //   npx wrangler secret put PLATFORM_FEE_ADDRESS   # 0x… on Base
+  //   npx wrangler secret put BASE_RPC_URL           # provider endpoint
+  "vars": { "HUMAN_BOUNTIES": "off" },
   //
   // ADMIN_KEY (policy takedowns) is a secret, never config:
   //   npx wrangler secret put ADMIN_KEY
