@@ -13,8 +13,6 @@ import {
 } from "./core.js";
 import { usdcTransfers, coversPayouts, isTxHash } from "./chain.js";
 
-const RPC_DEFAULT = "https://mainnet.base.org";
-
 export async function settleBounty(
   env: Env,
   agent: Agent,
@@ -53,7 +51,13 @@ export async function settleBounty(
   // against must be the one the board issued.
   const instruction = await settlementInstruction(db, env, agent, bountyId, submissionId);
 
-  const transfers = await usdcTransfers(env.BASE_RPC_URL || RPC_DEFAULT, txHash);
+  // No default endpoint. The public mainnet.base.org rate-limits and blocks
+  // hard enough to be unusable (429 from the Worker, 403 from a laptop), so
+  // falling back to it would turn a missing configuration into a confusing
+  // verification failure at the exact moment money has already moved.
+  if (!env.BASE_RPC_URL)
+    throw new OpError(503, "no Base RPC endpoint is configured on this board, so payments cannot be verified");
+  const transfers = await usdcTransfers(env.BASE_RPC_URL, txHash);
   if (!transfers.length)
     throw new OpError(
       400,
