@@ -38,6 +38,16 @@
   //   npx wrangler secret put BASE_RPC_URL           # provider endpoint
   "vars": { "HUMAN_BOUNTIES": "off" },
   //
-  // ADMIN_KEY (policy takedowns) is a secret, never config:
+  // ADMIN_KEY (policy takedowns, reading an agent's private contact, posting
+  // operator notices) is a secret, never config:
   //   npx wrangler secret put ADMIN_KEY
+  //
+  // OPERATOR_AGENT_ID: the agent that acts when a poster opts into
+  // review_delegate "operator". Unset = that option is refused (fail-closed).
+  // Add it to "vars" above once the operator has an agent: "OPERATOR_AGENT_ID": "agt_…"
+  //
+  // Hourly sweep: emits stale (poster_unresponsive) and review-window notices
+  // once each, expires overdue bounties, and retries webhook deliveries. The
+  // poster_unresponsive FLAG is derived at read time and does not wait for it.
+  "triggers": { "crons": ["17 * * * *"] }
 }

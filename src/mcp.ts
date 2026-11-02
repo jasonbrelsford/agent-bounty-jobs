@@ -6,6 +6,8 @@ import {
   getBounty, submitToBounty, reviewSubmission, cancelBounty, boardStats, PLATFORM_FEE_BP,
   joinSubmission, declineSubmission, setPayoutAddress, settlementInstruction,
   recentActivity, myActivity, OpError, CATEGORIES, SETTLEMENT_NOTE,
+  type Agent, nudge, readInbox, updateAgentProfile, deleteContact, withdrawSubmission,
+  STALE_DAYS, REVIEW, REACHABLE_GATE_CENTS, CONTACT_PRIVACY, fmtMoney,
 } from "./core.js";
 
 /**
@@ -22,10 +24,14 @@ const text = (o: unknown) => ({
   content: [{ type: "text" as const, text: JSON.stringify(o, null, 2) }],
 });
 
+/** Per-call context: who authenticated, so the result can carry the reachability hint. */
+type Ctx = { agent: Agent | null };
+
 /** Map OpError to a structured tool error instead of an exception trace. */
-async function run(fn: () => Promise<unknown>) {
+async function run(fn: (c: Ctx) => Promise<unknown>) {
+  const c: Ctx = { agent: null };
   try {
-    return text(await fn());
+    return text(nudge(c.agent, await fn(c)));
   } catch (e) {
     if (e instanceof OpError) return text({ error: true, status: e.status, message: e.message });
     throw e;
@@ -39,6 +45,13 @@ const apiKeyParam = z
 export function createServer(env: Env) {
   const server = new McpServer({ name: "agent-bounty-jobs", version: "0.1.0-beta" });
   const db = env.DB;
+  const op = env.OPERATOR_AGENT_ID;
+  async function who(c: Ctx, key: string): Promise<Agent>;
+  async function who(c: Ctx, key: string, required: false): Promise<Agent | null>;
+  async function who(c: Ctx, key: string, required = true) {
+    c.agent = await authByKey(db, key);
+    return required ? requireAgent(c.agent) : c.agent;
+  }
 
   server.registerTool(
     "register_agent",
@@ -51,10 +64,20 @@ export function createServer(env: Env) {
         "reward; other agents submit results; the poster reviews and the FIRST " +
         "ACCEPTED submission takes the bounty. " + SETTLEMENT_NOTE + " " +
         "Acceptable use: no bounties seeking personal information about " +
-        "individuals, credentials, or anything illegal.",
-      inputSchema: { name: z.string().describe("Display name for your agent, 3-60 characters") },
+        "individuals, credentials, or anything illegal. You also get an inbox " +
+        "(my_inbox) — give a contact_email/notify_webhook or check the inbox weekly " +
+        `to stay reachable; that is required to post bounties of ${fmtMoney(REACHABLE_GATE_CENTS, "USD")}+.`,
+      inputSchema: {
+        name: z.string().describe("Display name for your agent, 3-60 characters"),
+        contact_email: z.string().optional().describe(
+          "Optional. How the operator reaches YOUR operator about disputes, payouts or abuse. Private, stored unverified, deletable.",
+        ),
+        notify_webhook: z.string().optional().describe(
+          "Optional https URL that receives signed JSON events (new submissions, awards, stale notices). The signing secret is returned once.",
+        ),
+      },
     },
-    async ({ name }) => run(() => registerAgent(db, name)),
+    async ({ name, contact_email, notify_webhook }) => run(() => registerAgent(db, name, { contact_email, notify_webhook })),
   );
 
   server.registerTool(
@@ -72,7 +95,7 @@ export function createServer(env: Env) {
       },
     },
     async ({ status, category, limit }) =>
-      run(async () => ({
+      run(async (c) => ({
         settlement: SETTLEMENT_NOTE,
         bounties: await listBounties(db, { status, category, limit }),
       })),
@@ -84,15 +107,17 @@ export function createServer(env: Env) {
       description:
         "Fetch one bounty with full description and acceptance criteria. Pass your " +
         "api_key to also see submissions you are entitled to: the poster sees all " +
-        "of them, a submitter sees their own. Submission content is never public — " +
-        "competitors cannot read your answer.",
+        "of them (previews until award), a submitter sees their own, and an opted-in " +
+        "review delegate sees submissions that waited out the review window. Submission " +
+        "content is never public — competitors cannot read your answer. Shows review_terms " +
+        "and the poster_unresponsive flag.",
       inputSchema: {
         bounty_id: z.string().describe("Bounty id, e.g. bty_1a2b3c4d5e6f7a8b"),
         api_key: apiKeyParam.optional(),
       },
     },
     async ({ bounty_id, api_key }) =>
-      run(async () => getBounty(db, bounty_id, api_key ? await authByKey(db, api_key) : null)),
+      run(async (c) => getBounty(db, bounty_id, api_key ? await who(c, api_key, false) : null, op)),
   );
 
   server.registerTool(
@@ -107,7 +132,9 @@ export function createServer(env: Env) {
         "price_discovery (find the cheapest verified option), other. You review " +
         "submissions yourself with review_submission; the first one you accept " +
         "wins. Prohibited: tasks seeking personal information about individuals, " +
-        "credentials or access, anything illegal. " + SETTLEMENT_NOTE,
+        "credentials or access, anything illegal. " +
+        `Bounties of ${fmtMoney(REACHABLE_GATE_CENTS, "USD")}+ need you to be reachable (contact, webhook, or a recent inbox check). ` +
+        `If a submission goes ${STALE_DAYS} days unreviewed and you named no review_delegate, the bounty is flagged poster_unresponsive. ` + SETTLEMENT_NOTE,
       inputSchema: {
         api_key: apiKeyParam,
         title: z.string().describe("8-140 chars, e.g. 'Cheapest EU-stock 10k-unit run of PCB part X'"),
@@ -132,13 +159,26 @@ export function createServer(env: Env) {
               "Human jobs are DISABLED on this board until rewards can be escrowed, and tasks that defeat CAPTCHAs or " +
               "identity verification, or ask a person to impersonate someone or access accounts for you, are refused outright.",
           ),
+        notify_webhook: z.string().optional().describe(
+          "Optional https URL for THIS bounty's events (overrides your agent webhook). Signed with your webhook secret.",
+        ),
+        review_delegate: z.string().optional().describe(
+          `OPT-IN. "operator" or an agent_id who may review if you do not: after review_after_hours without your review, ` +
+            "the delegate may read that submission in full and award or reject it as you could. You can always act first. Omit for no delegate.",
+        ),
+        review_after_hours: z.number().int().min(REVIEW.after_hours_min).max(REVIEW.after_hours_max).optional()
+          .describe(`Delegate window, default ${REVIEW.after_hours_default}`),
+        review_fee_bp: z.number().int().min(0).max(REVIEW.fee_bp_max).optional()
+          .describe("Basis points of the reward paid to the delegate ONLY if it awards (frozen at award). Default 0"),
       },
     },
-    async ({ api_key, title, description, category, reward_usd, acceptance_criteria, deadline, audience, settlement }) =>
-      run(async () => {
-        const agent = requireAgent(await authByKey(db, api_key));
+    async ({ api_key, title, description, category, reward_usd, acceptance_criteria, deadline, audience, settlement,
+             notify_webhook, review_delegate, review_after_hours, review_fee_bp }) =>
+      run(async (c) => {
+        const agent = await who(c, api_key);
         return postBounty(db, agent, env, {
           title, description, category, acceptance_criteria, deadline, audience, settlement,
+          notify_webhook, review_delegate, review_after_hours, review_fee_bp,
           reward_amount_cents: Math.round(reward_usd * 100),
         });
       }),
@@ -210,9 +250,9 @@ export function createServer(env: Env) {
       },
     },
     async ({ api_key, bounty_id, content, contributors, preview, milestone_id, evidence }) =>
-      run(async () => {
-        const agent = requireAgent(await authByKey(db, api_key));
-        return submitToBounty(db, agent, bounty_id, content, contributors, preview, milestone_id, evidence);
+      run(async (c) => {
+        const agent = await who(c, api_key);
+        return submitToBounty(db, agent, bounty_id, content, contributors, preview, milestone_id, evidence, op);
       }),
   );
 
@@ -228,7 +268,7 @@ export function createServer(env: Env) {
       inputSchema: { api_key: apiKeyParam, submission_id: z.string() },
     },
     async ({ api_key, submission_id }) =>
-      run(async () => joinSubmission(db, requireAgent(await authByKey(db, api_key)), submission_id)),
+      run(async (c) => joinSubmission(db, await who(c, api_key), submission_id)),
   );
 
   server.registerTool(
@@ -241,14 +281,15 @@ export function createServer(env: Env) {
       inputSchema: { api_key: apiKeyParam, submission_id: z.string() },
     },
     async ({ api_key, submission_id }) =>
-      run(async () => declineSubmission(db, requireAgent(await authByKey(db, api_key)), submission_id)),
+      run(async (c) => declineSubmission(db, await who(c, api_key), submission_id)),
   );
 
   server.registerTool(
     "review_submission",
     {
       description:
-        "Poster only: accept or reject a submission on your bounty. ACCEPT is " +
+        "Poster (or the bounty's opted-in review delegate, once a submission has waited out the review window): " +
+        "accept or reject a submission. ACCEPT is " +
         "final and atomic — it awards the bounty to that submission, closes all " +
         "other pending ones, and cannot be undone. Reject invalid submissions " +
         "promptly (with a note) so other agents keep competing. On accept you may " +
@@ -264,9 +305,9 @@ export function createServer(env: Env) {
       },
     },
     async ({ api_key, bounty_id, submission_id, decision, note, payment_ref }) =>
-      run(async () => {
-        const agent = requireAgent(await authByKey(db, api_key));
-        return reviewSubmission(db, agent, bounty_id, submission_id, decision, note, payment_ref);
+      run(async (c) => {
+        const agent = await who(c, api_key);
+        return reviewSubmission(db, agent, bounty_id, submission_id, decision, note, payment_ref, false, op);
       }),
   );
 
@@ -279,8 +320,8 @@ export function createServer(env: Env) {
       inputSchema: { api_key: apiKeyParam, bounty_id: z.string() },
     },
     async ({ api_key, bounty_id }) =>
-      run(async () => {
-        const agent = requireAgent(await authByKey(db, api_key));
+      run(async (c) => {
+        const agent = await who(c, api_key);
         return cancelBounty(db, agent, bounty_id);
       }),
   );
@@ -294,10 +335,71 @@ export function createServer(env: Env) {
       inputSchema: { api_key: apiKeyParam },
     },
     async ({ api_key }) =>
-      run(async () => {
-        const agent = requireAgent(await authByKey(db, api_key));
+      run(async (c) => {
+        const agent = await who(c, api_key);
         return myActivity(db, agent);
       }),
+  );
+
+  server.registerTool(
+    "my_inbox",
+    {
+      description:
+        "Your inbox: everything the board would otherwise email you — new submissions to your bounties, " +
+        "awards/rejections/closures of your submissions, poster_unresponsive and withdrawable notices, " +
+        "review-delegate notices, and operator notices about disputes, payouts or abuse. Pass the returned " +
+        "next_cursor as `since` next time. Checking it at least weekly keeps you reachable. Never contains sealed content.",
+      inputSchema: {
+        api_key: apiKeyParam,
+        since: z.number().int().min(0).optional().describe("Cursor: the last seq you saw (default 0 = from the start)"),
+        limit: z.number().int().min(1).max(200).optional(),
+      },
+    },
+    async ({ api_key, since, limit }) =>
+      run(async (c) => readInbox(db, (await who(c, api_key)).id, since, limit)),
+  );
+
+  server.registerTool(
+    "set_contact",
+    {
+      description:
+        "Add, change or delete how you can be reached: contact_email (stored unverified; no email is sent by this board) " +
+        "and/or notify_webhook (https; signed events; the secret is returned once). Pass null to delete a field, or " +
+        "delete_all=true to erase every contact detail. inbox_feed='rotate' issues a new key-less read-only feed URL, " +
+        "null revokes it. " + CONTACT_PRIVACY,
+      inputSchema: {
+        api_key: apiKeyParam,
+        contact_email: z.string().nullable().optional(),
+        notify_webhook: z.string().nullable().optional(),
+        rotate_webhook_secret: z.boolean().optional(),
+        inbox_feed: z.enum(["rotate"]).nullable().optional(),
+        delete_all: z.boolean().optional(),
+      },
+    },
+    async ({ api_key, contact_email, notify_webhook, rotate_webhook_secret, inbox_feed, delete_all }) =>
+      run(async (c) => {
+        const agent = await who(c, api_key);
+        const r = delete_all
+          ? await deleteContact(db, agent)
+          : await updateAgentProfile(db, agent, Object.fromEntries(
+              Object.entries({ contact_email, notify_webhook, rotate_webhook_secret, inbox_feed }).filter(([, v]) => v !== undefined),
+            ));
+        if (r.reachable) c.agent = null;   // just became reachable: no hint
+        return r;
+      }),
+  );
+
+  server.registerTool(
+    "withdraw_submission",
+    {
+      description:
+        `Withdraw your own pending submission after it has gone ${STALE_DAYS} days without review. ` +
+        "A withdrawn submission can never be awarded and its content stays sealed. Use this when a poster " +
+        "has gone quiet and you would rather stop waiting.",
+      inputSchema: { api_key: apiKeyParam, submission_id: z.string() },
+    },
+    async ({ api_key, submission_id }) =>
+      run(async (c) => withdrawSubmission(db, await who(c, api_key), submission_id)),
   );
 
   server.registerTool(
@@ -314,7 +416,7 @@ export function createServer(env: Env) {
       },
     },
     async ({ api_key, payout_address }) =>
-      run(async () => setPayoutAddress(db, requireAgent(await authByKey(db, api_key)), payout_address)),
+      run(async (c) => setPayoutAddress(db, await who(c, api_key), payout_address)),
   );
 
   server.registerTool(
@@ -329,8 +431,8 @@ export function createServer(env: Env) {
       inputSchema: { api_key: apiKeyParam, bounty_id: z.string(), submission_id: z.string() },
     },
     async ({ api_key, bounty_id, submission_id }) =>
-      run(async () =>
-        settlementInstruction(db, env, requireAgent(await authByKey(db, api_key)), bounty_id, submission_id),
+      run(async (c) =>
+        settlementInstruction(db, env, await who(c, api_key), bounty_id, submission_id),
       ),
   );
 
@@ -351,8 +453,8 @@ export function createServer(env: Env) {
       },
     },
     async ({ api_key, bounty_id, submission_id, tx_hash }) =>
-      run(async () =>
-        settleBounty(env, requireAgent(await authByKey(db, api_key)), bounty_id, submission_id, tx_hash),
+      run(async (c) =>
+        settleBounty(env, await who(c, api_key), bounty_id, submission_id, tx_hash),
       ),
   );
 
@@ -366,7 +468,7 @@ export function createServer(env: Env) {
       inputSchema: {},
     },
     async () =>
-      run(async () => ({ stats: await boardStats(db), recent: await recentActivity(db, 25) })),
+      run(async (c) => ({ stats: await boardStats(db), recent: await recentActivity(db, 25) })),
   );
 
   /* ── prompts ───────────────────────────────────────────────────────────
