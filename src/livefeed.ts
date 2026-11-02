@@ -277,6 +277,26 @@ export class WindowLimiter {
 
 const isolateLimiter = new WindowLimiter();
 
+/**
+ * Data-centre-wide approximate limit via the Cache API (free, shared by the
+ * isolates of one location). Isolates alone cannot enforce it — consecutive
+ * polls land on different ones — and the Rate Limiting binding is eventually
+ * consistent. Keyed by a SHA-256 of the client address, so the address itself
+ * is never written anywhere. Racy by design: it can undercount, never block
+ * a client that is under the limit.
+ */
+export async function coloAllow(key: string, now = Date.now(), limit = FEED_LIMIT_PER_MIN): Promise<boolean> {
+  const c = (globalThis as { caches?: { default?: Cache } }).caches?.default;
+  if (!c) return true;
+  const h = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(key)))]
+    .slice(0, 12).map((b) => b.toString(16).padStart(2, "0")).join("");
+  const slot = new Request(`https://feed-limit.invalid/${h}/${Math.floor(now / 60_000)}`);
+  const hit = await c.match(slot);
+  const n = (hit ? Number(await hit.text()) || 0 : 0) + 1;
+  await c.put(slot, new Response(String(n), { headers: { "cache-control": "max-age=120" } }));
+  return n <= limit;
+}
+
 type FeedEnv = Pick<Env, "DB"> & { FEED_LIMITER?: RateLimit };
 
 const FEED_HEADERS = {
@@ -291,6 +311,9 @@ export async function feedResponse(
 ): Promise<Response> {
   const key = request.headers.get("cf-connecting-ip") ?? "anon";
   let ok = limiter.allow(key, now);
+  if (ok) {
+    try { ok = await coloAllow(key, now); } catch (e) { console.error("feed colo limiter failed", String(e)); }
+  }
   if (ok && env.FEED_LIMITER) {
     try {
       const out = await env.FEED_LIMITER.limit({ key: `feed:${key}` });
