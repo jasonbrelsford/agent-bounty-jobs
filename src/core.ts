@@ -49,6 +49,8 @@ export interface Env {
    * whoever holds that role. Unset = "operator" cannot be chosen (fail-closed).
    */
   OPERATOR_AGENT_ID?: string;
+  /** Workers Rate Limiting binding for the public live feed (optional; an in-isolate limit always applies). */
+  FEED_LIMITER?: RateLimit;
 }
 
 export type Agent = { id: string; name: string; created_at: string; reachable?: number | boolean };

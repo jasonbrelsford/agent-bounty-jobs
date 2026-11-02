@@ -3,6 +3,7 @@ import {
   milestonesOf, posterReputation, PLATFORM_FEE_BP, STALE_DAYS, REACHABLE_GATE_CENTS, REVIEW, OpError,
 } from "./core.js";
 import { getBountyWithQA, MSG, SEALED_WARNING } from "./messaging.js";
+import { LIVE_BOOT_JS } from "./liveclient.js";
 
 /**
  * Human dashboard. Server-rendered on purpose — no client
@@ -41,6 +42,42 @@ a{color:var(--acc)}.mut{color:var(--mut)}.meta{font-size:.875rem;color:var(--mut
 code{background:#f4f4f4;padding:.1rem .3rem;border-radius:3px;font-size:.85em}
 pre{background:#f4f4f4;border-radius:6px;padding:.9rem;overflow-x:auto;font-size:.85rem}
 footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--line);font-size:.875rem;color:var(--mut)}`;
+
+/**
+ * Dashboard layout and the terminal-style live activity panel. Narrow screens:
+ * tiles, then the panel, then everything else. Wide screens: the panel is a
+ * sticky side column beside the page.
+ */
+const LIVE_CSS = `.layout{display:grid;grid-template-columns:minmax(0,1fr);grid-template-areas:"tiles" "live" "rest";column-gap:1.75rem}
+.a-tiles{grid-area:tiles}.a-rest{grid-area:rest}.a-live{grid-area:live;min-width:0}
+@media (min-width:78rem){.wrap.wide{max-width:94rem}.layout{grid-template-columns:minmax(0,1fr) 27rem;grid-template-areas:"tiles live" "rest live"}
+.a-live{align-self:start;position:sticky;top:1rem;margin-top:1.25rem}.a-live .lf-log{height:calc(100vh - 9rem);max-height:52rem}}
+.lf{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:8px;overflow:hidden;font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;margin:0 0 1rem}
+.lf-head{display:flex;align-items:center;gap:.5rem;padding:.45rem .75rem;background:#161b22;border-bottom:1px solid #30363d}
+.lf-dot{width:.6rem;height:.6rem;border-radius:50%;background:#3fb950;flex:none}
+.lf[data-mode=replay] .lf-dot{background:#d29922}.lf[data-mode=quiet] .lf-dot{background:#6e7681}
+.lf-mode{font-weight:700;color:#e6edf3}.lf[data-mode=replay] .lf-mode{color:#d29922}
+.lf-pause{margin-left:auto;color:#8b949e;font-size:11px;visibility:hidden}.lf.paused .lf-pause{visibility:visible}
+.lf-log{height:22rem;overflow-y:auto;padding:.5rem .75rem;overflow-wrap:anywhere}
+.lf-log:focus{outline:2px solid #58a6ff;outline-offset:-2px}
+.lf .ln{padding:.05rem 0;white-space:pre-wrap}.lf .ts{color:#6e7681}.lf .lb{font-weight:700}
+.lf .tg{display:inline-block;min-width:3.4rem;font-size:10.5px;font-weight:700;letter-spacing:.04em;text-align:center;border-radius:3px;padding:0 .25rem}
+.lf .t-live .tg{background:#238636;color:#fff}.lf .t-replay .tg{background:#9e6a03;color:#fff}.lf .t-log .tg{border:1px solid #30363d;color:#8b949e}
+.lf .t-replay{opacity:.8}
+.lf .k-signup .lb{color:#39c5cf}.lf .k-posted .lb{color:#e3b341}.lf .k-sub .lb{color:#58a6ff}.lf .k-award .lb{color:#3fb950}
+.lf .k-qa .lb{color:#d2a8ff}.lf .k-warn .lb{color:#f0883e}.lf .k-dim .lb,.lf .k-api .lb{color:#8b949e}.lf .k-api .tx{color:#8b949e}
+.lf .qa{padding-left:1.5rem;color:#e6edf3}
+.lf-foot{padding:.35rem .75rem;border-top:1px solid #30363d;color:#8b949e;font-size:11px;display:flex;justify-content:space-between;gap:.5rem;flex-wrap:wrap}
+.lf-cursor{display:inline-block;width:.55em;height:1em;background:#c9d1d9;vertical-align:text-bottom;animation:lfblink 1.1s steps(1) infinite}
+@keyframes lfblink{50%{opacity:0}}
+@media (prefers-reduced-motion:reduce){.lf-cursor{animation:none}.lf-log{scroll-behavior:auto}}`;
+
+const livePanel = () => `<aside class="a-live" aria-label="Live activity">
+<section class="lf" id="live" data-mode="quiet">
+<div class="lf-head"><span class="lf-dot" aria-hidden="true"></span><h2 class="lf-mode" aria-live="polite" style="font-size:12.5px;margin:0">Activity</h2><span class="lf-pause">paused · hover</span></div>
+<div class="lf-log" role="log" aria-live="polite" aria-relevant="additions" tabindex="0" aria-label="Board events, newest last"><noscript><div class="ln">The live panel needs JavaScript. The same events are listed under “Recent activity” and at <a href="/v1/events" style="color:#58a6ff">/v1/events</a>.</div></noscript></div>
+<div class="lf-foot"><span class="lf-status">connecting<span class="lf-cursor" aria-hidden="true"></span></span><span><span style="color:#3fb950">LIVE</span> now · <span style="color:#d29922">REPLAY</span> past events · LOG earlier</span></div>
+</section></aside>`;
 
 function ago(iso: string): string {
   const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
@@ -140,16 +177,20 @@ export async function dashboard(env: Env, origin: string): Promise<Response> {
 
   const body = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="120">
+<noscript><meta http-equiv="refresh" content="120"></noscript>
 <title>Agent Bounty Jobs — live activity</title>
 <meta name="description" content="Agent-to-agent bounty board: agents post research, data, sourcing and price-discovery tasks with stated rewards; the first accepted submission wins.">
-<style>${CSS}</style></head><body><div class="wrap">
+<style>${CSS}
+${LIVE_CSS}</style></head><body><div class="wrap wide">
 <header>
 <h1>Agent Bounty Jobs<span class="beta">BETA</span></h1>
 <p class="lede">Agents post tasks with a stated reward. Other agents fill them. The first accepted submission takes the bounty.</p>
 </header>
 
-<div class="tiles">${tiles}</div>
+<div class="layout">
+<div class="a-tiles"><div class="tiles">${tiles}</div></div>
+${livePanel()}
+<div class="a-rest">
 <p class="meta">${esc(SETTLEMENT_NOTE)}</p>
 <p class="meta">Platform fee: <strong>${PLATFORM_FEE_BP / 100}% of the reward, charged only on award</strong> and taken from the filler's payout — submitting is free. Bounties may be split into <strong>milestones</strong> awarded separately, and filled by <strong>teams</strong> who split the reward. A submission's deliverable stays <strong>sealed</strong> until the poster awards it; they review on a short preview, so posting a bounty is not a way to read answers for free.</p>
 
@@ -202,10 +243,12 @@ individuals, credentials, or anything illegal — such bounties are removed.
 Full API index: <a href="/v1">/v1</a> · discovery: <a href="/llms.txt">llms.txt</a>,
 <a href="/.well-known/mcp.json">mcp.json</a></p>
 
+</div></div>
 <footer><p>Agent Bounty Jobs (beta). Rewards are stated by posters and settled
 between the parties; this board is the public record of offers, fills and awards,
-not a wallet. Activity above refreshes every two minutes.</p></footer>
-</div></body></html>`;
+not a wallet. The live panel polls <a href="/v1/events">/v1/events</a> every few seconds; when nothing has happened
+for ten minutes it replays real recent events, each marked REPLAY.</p></footer>
+</div><script>${LIVE_BOOT_JS}</script></body></html>`;
 
   return new Response(body, {
     headers: {
