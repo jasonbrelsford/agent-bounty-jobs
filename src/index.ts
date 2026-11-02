@@ -21,6 +21,10 @@ import {
 import { bountyPage } from "./dashboard.js";
 import { createServer } from "./mcp.js";
 import { dashboard } from "./dashboard.js";
+import { feedResponse, RequestCounter, routeLabel, mcpLabels, pruneRequestMinutes } from "./livefeed.js";
+
+// Aggregate request counts for the live panel (route templates only).
+const counter = new RequestCounter();
 
 /**
  * Agent Bounty Jobs — entry point.
@@ -121,6 +125,7 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "POST /v1/bounties/:id/settle": "auth, poster: {submission_id, tx_hash} — verifies payment on Base, then releases the deliverable",
         "GET  /v1/stats": "board totals",
         "GET  /v1/activity": "recent event feed",
+        "GET  /v1/events": "public live feed: ?since=<seq>&req_since=<minute>&replay=1 — allowlisted board events (incl. public Q&A text) plus per-minute API request counts by route. Never submissions, private messages, contact details, keys or IPs. Rate-limited (60/min); poll every 4s or slower",
       },
       mcp: `${url.origin}/mcp`,
       dashboard: url.origin,
@@ -464,6 +469,8 @@ export default {
       await expireOverdue(env.DB);
       await sweepNotices(env.DB, env.OPERATOR_AGENT_ID);
       await flushWebhooks(env.DB, { limit: 100 });
+      await counter.flush(env.DB);
+      await pruneRequestMinutes(env.DB);
     })());
   },
 
@@ -475,6 +482,17 @@ export default {
       ctx.waitUntil(flushWebhooks(env.DB).catch((e) => console.error("webhooks", e)));
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
     if (url.pathname === "/" && request.method === "GET") return dashboard(env, url.origin);
+    // The live feed itself is not counted, or watching the panel would look like activity.
+    if ((url.pathname === "/v1/events" || url.pathname === "/v1/events/") && request.method === "GET")
+      return feedResponse(env, request, url);
+    const label = routeLabel(request.method, url.pathname);
+    if (label) counter.count(label);
+    if (url.pathname === "/mcp" && request.method === "POST") {
+      // Parse a copy after responding; only allowlisted method/tool names are kept.
+      const copy = request.clone();
+      ctx.waitUntil(copy.json().then((b) => { for (const l of mcpLabels(b)) counter.count(l); counter.schedule(env.DB, ctx); }).catch(() => {}));
+    }
+    if (label) counter.schedule(env.DB, ctx);
 
     // Human sign-in. These return redirects and HTML rather than JSON, so they
     // sit ahead of the REST router and outside its CORS envelope.
