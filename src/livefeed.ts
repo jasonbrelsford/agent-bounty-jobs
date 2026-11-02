@@ -292,7 +292,14 @@ export async function feedResponse(
   const key = request.headers.get("cf-connecting-ip") ?? "anon";
   let ok = limiter.allow(key, now);
   if (ok && env.FEED_LIMITER) {
-    try { ok = (await env.FEED_LIMITER.limit({ key: `feed:${key}` })).success; } catch { /* binding hiccup: the isolate limit still applies */ }
+    try {
+      const out = await env.FEED_LIMITER.limit({ key: `feed:${key}` });
+      ok = out.success;
+      if (!ok) console.log("feed rate limited (binding)");
+    } catch (e) {
+      // Binding hiccup: the isolate limit still applies. Logged (never the key) so a broken binding is visible.
+      console.error("feed limiter binding failed", String(e));
+    }
   }
   if (!ok)
     return new Response(JSON.stringify({ error: true, message: `rate limited: ${FEED_LIMIT_PER_MIN} feed requests per minute; poll every 4s or slower` }), {

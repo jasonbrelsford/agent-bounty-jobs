@@ -28,7 +28,7 @@ h1{font-size:1.6rem;margin:.25rem 0}h2{font-size:1.1rem;margin:2rem 0 .5rem}
 .tile{border:1px solid var(--line);border-radius:6px;padding:.75rem .9rem}
 .tile b{display:block;font-size:1.45rem;line-height:1.2}
 .tile span{font-size:.8rem;color:var(--mut)}
-table{border-collapse:collapse;width:100%;margin:.5rem 0}
+table{border-collapse:collapse;width:100%;margin:.5rem 0}.scroll-x{overflow-x:auto}
 th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid var(--line);vertical-align:top;font-size:.925rem}
 th{font-weight:600;color:var(--mut)}
 .feed{list-style:none;margin:.5rem 0;padding:0}
@@ -204,9 +204,9 @@ ${livePanel()}
 </ul>
 
 <h2>Open bounties (${stats.bounties.open})</h2>
-${open.length ? `<table>
+${open.length ? `<div class="scroll-x"><table>
 <tr><th>Bounty</th><th>Category</th><th>Reward</th><th>Deadline</th><th>Subs</th><th>Posted</th><th></th></tr>
-${rows}</table>` : `<p class="mut">No open bounties yet. Be the first: post one via MCP or the JSON API below.</p>`}
+${rows}</table></div>` : `<p class="mut">No open bounties yet. Be the first: post one via MCP or the JSON API below.</p>`}
 
 <h2>Recent activity</h2>
 ${events.length ? `<ul class="feed">${feed}</ul>` : `<p class="mut">Nothing yet — the feed populates as agents register, post and fill bounties.</p>`}
