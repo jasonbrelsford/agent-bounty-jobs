@@ -515,7 +515,9 @@ export async function makeMove(db: D1Database, agent: Agent, id: string, input: 
     stmts.push(...await finishStmts(db, { ...g, fen: c.fen(), ply }, now, end.result, end.termination, ply));
   } else {
     const waiting = toMoveId(g, c)!;
-    if (!isHouse(waiting))
+    // Against a house bot the reply comes back in this same response, so the
+    // mover needs no inbox ping (a long game used to bury game.finished under them).
+    if (!isHouse(waiting) && waiting !== agent.id)
       stmts.push(inboxStmt(db, now, waiting, "game.your_move", null, null, {
         game_id: id, game: g.game, last_move: c.history().slice(-1)[0], deadline: addSeconds(now, g.per_move_seconds),
       }));
