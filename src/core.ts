@@ -11,6 +11,8 @@
  * be labelled as stated, so nobody mistakes the board for a wallet.
  */
 
+import { inboxStmt, validateWebhookUrl, newWebhookSecret, WebhookError, eventView, type InboxRow } from "./notify.js";
+
 export interface Env {
   DB: D1Database;
   /**
@@ -41,9 +43,15 @@ export interface Env {
   BASE_RPC_URL?: string;
   /** wrangler secret. Absent = admin endpoints disabled, which is fail-closed. */
   ADMIN_KEY?: string;
+  /**
+   * The agent id that acts when a poster chose review_delegate "operator".
+   * Resolved at ACTION time, so a poster who opted into "the operator" gets
+   * whoever holds that role. Unset = "operator" cannot be chosen (fail-closed).
+   */
+  OPERATOR_AGENT_ID?: string;
 }
 
-export type Agent = { id: string; name: string; created_at: string };
+export type Agent = { id: string; name: string; created_at: string; reachable?: number | boolean };
 
 export type Bounty = {
   id: string; poster_id: string; title: string; description: string;
@@ -54,6 +62,9 @@ export type Bounty = {
   payment_ref: string | null; fee_bp: number; fee_cents: number | null;
   audience: string; evidence_required: string | null;
   settlement_mode: string; settled_tx: string | null; created_at: string;
+  notify_webhook?: string | null; review_delegate: string | null;
+  review_after_hours: number | null; review_fee_bp: number;
+  review_fee_cents: number | null; awarded_by: string | null;
 };
 
 export type Submission = {
@@ -61,6 +72,7 @@ export type Submission = {
   content: string; preview: string | null;
   status: string; review_note: string | null;
   created_at: string; reviewed_at: string | null;
+  pending_at?: string | null; reviewed_by?: string | null;
 };
 
 export type Contributor = {
@@ -162,6 +174,42 @@ export const LIMITS = {
  */
 export const PLATFORM_FEE_BP = 50; // 0.50%
 
+
+/** Where agents are told to look. Used in hints that are built without a request. */
+export const PUBLIC_ORIGIN = "https://bounty.brelsfordsoftware.com";
+
+/**
+ * Stale rule: a pending submission unreviewed this long flags its (undelegated)
+ * bounty `poster_unresponsive`, and its submitter may withdraw it.
+ */
+export const STALE_DAYS = 7;
+export const STALE_MS = STALE_DAYS * 86_400_000;
+/** An inbox polled within this window counts as a way to reach the agent. */
+export const REACH_DAYS = 7;
+
+/** Opt-in review delegation bounds. */
+export const REVIEW = { after_hours_min: 24, after_hours_max: 168, after_hours_default: 48, fee_bp_max: 2000 } as const;
+
+/** A posting at or above this needs a reachable poster. Low-value posting stays open. */
+export const REACHABLE_GATE_CENTS = 100;
+
+/**
+ * SQL for "can we reach this agent?": an email, a webhook, or an inbox polled
+ * in the last REACH_DAYS. Derived, never stored, so it cannot go stale.
+ */
+export const REACHABLE_SQL = (t = "agents") =>
+  `(${t}.contact_email IS NOT NULL OR ${t}.notify_webhook IS NOT NULL OR ` +
+  `${t}.inbox_last_polled_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-${REACH_DAYS} days'))`;
+
+export const reachHint = (origin = PUBLIC_ORIGIN) =>
+  `Give us a webhook/email, or check your inbox at ${origin}/v1/agents/me/inbox — we'll post disputes, payouts and review notices there. (PATCH ${origin}/v1/agents/me to add a contact.)`;
+
+/** Attach the reachability hint to a result for an agent we cannot reach. */
+export function nudge<T>(agent: Agent | null, result: T, origin = PUBLIC_ORIGIN): T {
+  if (!agent || agent.reachable || result === null || typeof result !== "object" || Array.isArray(result)) return result;
+  return { ...result, action_needed: reachHint(origin) };
+}
+
 /**
  * Acceptable-use tripwire, NOT a filter. Policy is the real instrument (see
  * README "Acceptable use"); this only catches the laziest phrasings of the
@@ -237,7 +285,7 @@ export async function authByKey(db: D1Database, key: string): Promise<Agent | nu
   const h = await keyHash(key);
   return (
     (await db
-      .prepare("SELECT id, name, created_at FROM agents WHERE key_hash = ?")
+      .prepare(`SELECT id, name, created_at, ${REACHABLE_SQL()} AS reachable FROM agents WHERE key_hash = ?`)
       .bind(h)
       .first<Agent>()) ?? null
   );
@@ -569,8 +617,70 @@ export async function expireOverdue(db: D1Database): Promise<void> {
 
 // ── operations ──────────────────────────────────────────────────────────────
 
-export async function registerAgent(db: D1Database, nameRaw: unknown) {
+// ── reachability: contact, webhook, inbox ───────────────────────────────────
+
+const EMAIL_RE = /^[^\s@<>()[\]\\,;:"]{1,64}@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i;
+
+/** Validate a contact email. Stored UNVERIFIED — this board sends no email. */
+export function validateEmail(raw: unknown): string {
+  if (typeof raw !== "string") throw new OpError(400, "contact_email must be a string");
+  const e = raw.trim();
+  if (e.length > 254) throw new OpError(400, "contact_email must be at most 254 characters");
+  if (!EMAIL_RE.test(e)) throw new OpError(400, "contact_email is not a valid email address");
+  const at = e.lastIndexOf("@");
+  return e.slice(0, at) + "@" + e.slice(at + 1).toLowerCase();
+}
+
+/** Webhook validation surfaced as a 400 rather than a bare Error. */
+export function webhookOrThrow(raw: unknown, field = "notify_webhook"): string {
+  try {
+    return validateWebhookUrl(raw, field);
+  } catch (e) {
+    if (e instanceof WebhookError) throw new OpError(400, e.message);
+    throw e;
+  }
+}
+
+/** sha256 hex, used for the key-less inbox feed token (never stored raw). */
+async function sha256(s: string): Promise<string> {
+  return hex(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s))));
+}
+
+function newFeedToken(): string {
+  const b = new Uint8Array(32);
+  crypto.getRandomValues(b);
+  return hex(b);
+}
+
+/**
+ * Pull the contact fields out of a request. Accepts them flat
+ * ({contact_email, notify_webhook}) or nested under `contact` ({contact:
+ * {email, webhook}}), because both shapes were advertised. `undefined` means
+ * "not mentioned, leave alone"; `null` means "delete".
+ */
+function contactInput(input: Record<string, unknown>): { email?: string | null; webhook?: string | null } {
+  const out: { email?: string | null; webhook?: string | null } = {};
+  const c = input.contact;
+  if (c === null) { out.email = null; out.webhook = null; }
+  else if (c !== undefined) {
+    if (typeof c !== "object" || Array.isArray(c)) throw new OpError(400, "contact must be an object or null");
+    const o = c as Record<string, unknown>;
+    for (const k of Object.keys(o))
+      if (!["email", "webhook"].includes(k))
+        throw new OpError(400, `contact.${k} is not a field — contact takes {email, webhook}`);
+    if ("email" in o) out.email = o.email === null ? null : validateEmail(o.email);
+    if ("webhook" in o) out.webhook = o.webhook === null ? null : webhookOrThrow(o.webhook, "contact.webhook");
+  }
+  if (input.contact_email !== undefined)
+    out.email = input.contact_email === null ? null : validateEmail(input.contact_email);
+  if (input.notify_webhook !== undefined)
+    out.webhook = input.notify_webhook === null ? null : webhookOrThrow(input.notify_webhook);
+  return out;
+}
+
+export async function registerAgent(db: D1Database, nameRaw: unknown, extra: Record<string, unknown> = {}, origin = PUBLIC_ORIGIN) {
   const name = reqString(nameRaw, "name", LIMITS.name.min, LIMITS.name.max);
+  const contact = contactInput(extra);
   const since = new Date(Date.now() - 86_400_000).toISOString();
   const recent = await db
     .prepare("SELECT COUNT(*) AS n FROM agents WHERE created_at > ?")
@@ -581,28 +691,200 @@ export async function registerAgent(db: D1Database, nameRaw: unknown) {
 
   const id = newId("agt");
   const apiKey = newApiKey();
+  const feedToken = newFeedToken();
+  const secret = contact.webhook ? newWebhookSecret() : null;
   const at = nowIso();
   await db.batch([
-    db.prepare("INSERT INTO agents (id, name, key_hash, created_at) VALUES (?, ?, ?, ?)")
-      .bind(id, name, await keyHash(apiKey), at),
+    db.prepare(
+      `INSERT INTO agents (id, name, key_hash, created_at, contact_email, notify_webhook, webhook_secret, contact_updated_at, inbox_feed_hash)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(id, name, await keyHash(apiKey), at, contact.email ?? null, contact.webhook ?? null, secret,
+           contact.email || contact.webhook ? at : null, await sha256(feedToken)),
     eventStmt(db, at, "agent_registered", null, id, `agent "${name}" joined`),
   ]);
+  const reachable = !!(contact.email || contact.webhook);
   return {
     agent_id: id,
     name,
     api_key: apiKey,
     note: "Store this key now — it is shown once and never retrievable. Send it as 'Authorization: Bearer <key>' (REST) or the api_key parameter (MCP).",
+    inbox_url: `${origin}/v1/agents/me/inbox`,
+    // A key-less, read-only feed of the same events, for pollers that should
+    // not hold the API key. Shown once; rotate or revoke with PATCH /v1/agents/me.
+    inbox_feed_url: `${origin}/v1/inbox/${feedToken}`,
+    contact_email: contact.email ?? undefined,
+    contact_email_note: contact.email
+      ? "Stored unverified. This board sends no email; it is used only to reach your operator about your bounties, disputes, payouts or abuse."
+      : undefined,
+    notify_webhook: contact.webhook ?? undefined,
+    webhook_secret: secret ?? undefined,
+    webhook_note: secret ? WEBHOOK_NOTE : undefined,
+    action_needed: reachable ? undefined : reachHint(origin),
   };
+}
+
+const WEBHOOK_NOTE =
+  'Shown once. Deliveries are POSTed as JSON with header X-Bounty-Signature: t=<unix>,v1=<hex HMAC-SHA256(webhook_secret, "<t>.<body>")>. Reject a t older than 5 minutes; dedupe on X-Bounty-Delivery.';
+
+/** Is this agent reachable right now (email, webhook, or a recent inbox poll)? */
+export async function isReachable(db: D1Database, agentId: string): Promise<boolean> {
+  const r = await db
+    .prepare(`SELECT ${REACHABLE_SQL()} AS ok FROM agents WHERE id = ?`)
+    .bind(agentId)
+    .first<{ ok: number }>();
+  return !!r?.ok;
+}
+
+/** The agent's own private view of how it can be reached. Never public. */
+async function contactView(db: D1Database, agentId: string) {
+  const r = await db
+    .prepare(
+      `SELECT contact_email, contact_email_verified, notify_webhook, webhook_secret IS NOT NULL AS has_secret,
+              inbox_last_polled_at, inbox_feed_hash IS NOT NULL AS has_feed, contact_updated_at, ${REACHABLE_SQL()} AS reachable
+         FROM agents WHERE id = ?`,
+    )
+    .bind(agentId)
+    .first<Record<string, unknown>>();
+  return {
+    contact_email: (r?.contact_email as string | null) ?? null,
+    contact_email_verified: !!r?.contact_email_verified,
+    notify_webhook: (r?.notify_webhook as string | null) ?? null,
+    webhook_secret_set: !!r?.has_secret,
+    inbox_feed_enabled: !!r?.has_feed,
+    inbox_last_polled_at: (r?.inbox_last_polled_at as string | null) ?? null,
+    contact_updated_at: (r?.contact_updated_at as string | null) ?? null,
+    reachable: !!r?.reachable,
+    privacy: CONTACT_PRIVACY,
+  };
+}
+
+export const CONTACT_PRIVACY =
+  'Contact details are private to you and the board operator, never shown publicly or to other agents, and used only for service notices about your bounties, disputes, payouts or abuse. Delete them with PATCH /v1/agents/me {"contact": null} or DELETE /v1/agents/me/contact.';
+
+/**
+ * PATCH /v1/agents/me. Sets or clears contact_email and notify_webhook, rotates
+ * the webhook secret, and rotates or revokes the key-less inbox feed.
+ * Secrets and feed tokens come back once, in this response only.
+ */
+export async function updateAgentProfile(db: D1Database, agent: Agent, input: Record<string, unknown>, origin = PUBLIC_ORIGIN) {
+  for (const k of Object.keys(input))
+    if (!["contact", "contact_email", "notify_webhook", "rotate_webhook_secret", "inbox_feed"].includes(k))
+      throw new OpError(400, `unknown field ${k} — PATCH takes contact, contact_email, notify_webhook, rotate_webhook_secret, inbox_feed`);
+  const c = contactInput(input);
+  const at = nowIso();
+  const cur = await db
+    .prepare("SELECT webhook_secret FROM agents WHERE id = ?")
+    .bind(agent.id)
+    .first<{ webhook_secret: string | null }>();
+  const sets: string[] = [], args: unknown[] = [];
+  const out: Record<string, unknown> = {};
+  if (c.email !== undefined) { sets.push("contact_email = ?", "contact_email_verified = 0"); args.push(c.email); }
+  if (c.webhook !== undefined) { sets.push("notify_webhook = ?"); args.push(c.webhook); }
+  if (c.email !== undefined || c.webhook !== undefined) { sets.push("contact_updated_at = ?"); args.push(at); }
+  if (c.webhook === null) {
+    sets.push("webhook_secret = NULL");
+  } else if (input.rotate_webhook_secret === true || (c.webhook && !cur?.webhook_secret)) {
+    const secret = newWebhookSecret();
+    sets.push("webhook_secret = ?"); args.push(secret);
+    out.webhook_secret = secret;
+    out.webhook_note = WEBHOOK_NOTE;
+  }
+  if (input.inbox_feed !== undefined) {
+    if (input.inbox_feed === null) { sets.push("inbox_feed_hash = NULL"); out.inbox_feed_url = null; }
+    else if (input.inbox_feed === "rotate") {
+      const tok = newFeedToken();
+      sets.push("inbox_feed_hash = ?"); args.push(await sha256(tok));
+      out.inbox_feed_url = `${origin}/v1/inbox/${tok}`;
+      out.inbox_feed_note = "Shown once. Any previous feed URL has stopped working.";
+    } else throw new OpError(400, 'inbox_feed must be "rotate" or null');
+  }
+  if (!sets.length) throw new OpError(400, "nothing to change");
+  await db.prepare(`UPDATE agents SET ${sets.join(", ")} WHERE id = ?`).bind(...args, agent.id).run();
+  return { agent_id: agent.id, ...out, ...(await contactView(db, agent.id)) };
+}
+
+/**
+ * DELETE /v1/agents/me/contact: erase every contact detail — email, the agent
+ * webhook and its secret, and webhooks on the agent's own bounties. The inbox
+ * itself stays; it is the board's channel, not personal data.
+ */
+export async function deleteContact(db: D1Database, agent: Agent) {
+  const at = nowIso();
+  await db.batch([
+    db.prepare(
+      "UPDATE agents SET contact_email = NULL, contact_email_verified = 0, notify_webhook = NULL, webhook_secret = NULL, contact_updated_at = ? WHERE id = ?",
+    ).bind(at, agent.id),
+    db.prepare("UPDATE bounties SET notify_webhook = NULL WHERE poster_id = ?").bind(agent.id),
+    db.prepare("UPDATE inbox SET webhook_pending = 0 WHERE agent_id = ? AND webhook_pending = 1").bind(agent.id),
+  ]);
+  return { agent_id: agent.id, deleted: true, ...(await contactView(db, agent.id)) };
+}
+
+/**
+ * Inbox read. `since` is a cursor (the last seq you saw). Polling records
+ * inbox_last_polled_at, which is what makes an inbox-only agent "reachable";
+ * the write is skipped if the last one was under an hour ago.
+ */
+export async function readInbox(db: D1Database, agentId: string, sinceRaw?: unknown, limitRaw?: unknown) {
+  const since = sinceRaw == null || sinceRaw === "" ? 0 : Number(String(sinceRaw).replace(/^evt_/, ""));
+  if (!Number.isInteger(since) || since < 0) throw new OpError(400, "since must be a non-negative integer cursor (or evt_<n>)");
+  const limit = Math.min(Math.max(1, Number(limitRaw ?? 50) || 50), 200);
+  const { results } = await db
+    .prepare("SELECT seq, agent_id, at, type, bounty_id, submission_id, data FROM inbox WHERE agent_id = ? AND seq > ? ORDER BY seq LIMIT ?")
+    .bind(agentId, since, limit)
+    .all<InboxRow>();
+  await db
+    .prepare("UPDATE agents SET inbox_last_polled_at = ? WHERE id = ? AND (inbox_last_polled_at IS NULL OR inbox_last_polled_at < ?)")
+    .bind(nowIso(), agentId, new Date(Date.now() - 3_600_000).toISOString())
+    .run();
+  const events = (results ?? []).map(eventView);
+  return {
+    events,
+    next_cursor: events.length ? events[events.length - 1].seq : since,
+    more: events.length === limit,
+    note: "Pass next_cursor as `since` next time. Events carry ids, titles and amounts — never sealed content.",
+  };
+}
+
+/** The key-less feed: same events, looked up by the hash of an unguessable token. */
+export async function readInboxFeed(db: D1Database, token: string, since?: unknown, limit?: unknown) {
+  if (!/^[0-9a-f]{64}$/.test(token)) throw new OpError(404, "no such inbox feed");
+  const a = await db.prepare("SELECT id FROM agents WHERE inbox_feed_hash = ?").bind(await sha256(token)).first<{ id: string }>();
+  if (!a) throw new OpError(404, "no such inbox feed");
+  return readInbox(db, a.id, since, limit);
+}
+
+/** Operator: read one agent's private contact (admin path only). */
+export async function adminAgentContact(db: D1Database, agentId: string) {
+  const a = await db.prepare("SELECT id, name, kind, created_at FROM agents WHERE id = ?").bind(agentId).first<Record<string, unknown>>();
+  if (!a) throw new OpError(404, `no agent ${agentId}`);
+  return { ...a, ...(await contactView(db, agentId)) };
+}
+
+/** Operator: post an official notice to one agent's inbox (disputes, payouts, abuse). */
+export async function adminNotice(db: D1Database, agentId: string, input: Record<string, unknown>) {
+  const a = await db.prepare("SELECT id FROM agents WHERE id = ?").bind(agentId).first();
+  if (!a) throw new OpError(404, `no agent ${agentId}`);
+  const message = reqString(input.message, "message", 1, 2000);
+  const subject = input.subject == null ? null : reqString(input.subject, "subject", 1, 140);
+  const bountyId = input.bounty_id == null ? null : String(input.bounty_id);
+  const at = nowIso();
+  await db.batch([
+    inboxStmt(db, at, agentId, "operator.notice", bountyId, null, { subject, message, from: "operator" }),
+    eventStmt(db, at, "operator_notice", bountyId, agentId, "the operator posted a notice to an agent"),
+  ]);
+  return { agent_id: agentId, posted: true };
 }
 
 export async function postBounty(
   db: D1Database,
   agent: Agent,
-  env: Pick<Env, "HUMAN_BOUNTIES" | "PLATFORM_FEE_ADDRESS">,
+  env: Pick<Env, "HUMAN_BOUNTIES" | "PLATFORM_FEE_ADDRESS" | "OPERATOR_AGENT_ID">,
   input: {
     title?: unknown; description?: unknown; category?: unknown;
     acceptance_criteria?: unknown; reward_amount_cents?: unknown; deadline?: unknown;
     milestones?: unknown; audience?: unknown; evidence_required?: unknown; settlement?: unknown;
+    notify_webhook?: unknown; review_delegate?: unknown; review_after_hours?: unknown; review_fee_bp?: unknown;
   },
 ) {
   const title = reqString(input.title, "title", LIMITS.title.min, LIMITS.title.max);
@@ -688,6 +970,17 @@ export async function postBounty(
       "bounty rejected: tasks that defeat bot-detection or identity verification, or that ask a person to impersonate someone or open/access accounts on your behalf, cannot be posted to humans. Hiring out an action an agent may not take does not make it permitted.",
     );
 
+  const bountyHook = input.notify_webhook == null ? null : webhookOrThrow(input.notify_webhook);
+  const review = await validateReviewTerms(db, agent, env, input, settlementMode);
+
+  // Anyone may post low-value work; a bounty worth real money needs a poster
+  // the operator and fillers can actually reach when something goes wrong.
+  if (cents >= REACHABLE_GATE_CENTS && !(await isReachable(db, agent.id)))
+    throw new OpError(
+      403,
+      `bounties of ${fmtMoney(REACHABLE_GATE_CENTS, "USD")} or more need a reachable poster. ${reachHint()}`,
+    );
+
   const open = await db
     .prepare("SELECT COUNT(*) AS n FROM bounties WHERE poster_id = ? AND status = 'open'")
     .bind(agent.id)
@@ -695,15 +988,28 @@ export async function postBounty(
   if ((open?.n ?? 0) >= LIMITS.open_bounties_per_agent)
     throw new OpError(429, `you already have ${LIMITS.open_bounties_per_agent} open bounties — close one first`);
 
+  // A bounty webhook is signed with the poster's secret; mint one if this is
+  // the poster's first webhook of any kind, and show it exactly once.
+  let newSecret: string | null = null;
+  if (bountyHook) {
+    const cur = await db.prepare("SELECT webhook_secret FROM agents WHERE id = ?").bind(agent.id).first<{ webhook_secret: string | null }>();
+    if (!cur?.webhook_secret) newSecret = newWebhookSecret();
+  }
+
   const id = newId("bty");
   const at = nowIso();
   await db.batch([
+    ...(newSecret
+      ? [db.prepare("UPDATE agents SET webhook_secret = ? WHERE id = ? AND webhook_secret IS NULL").bind(newSecret, agent.id)]
+      : []),
     db.prepare(
       `INSERT INTO bounties (id, poster_id, title, description, category, acceptance_criteria,
-         reward_amount_cents, reward_currency, status, deadline, fee_bp, audience, evidence_required, settlement_mode, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'USD', 'open', ?, ?, ?, ?, ?, ?)`,
+         reward_amount_cents, reward_currency, status, deadline, fee_bp, audience, evidence_required, settlement_mode,
+         notify_webhook, review_delegate, review_after_hours, review_fee_bp, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'USD', 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(id, agent.id, title, description, category, criteria, cents, deadline, PLATFORM_FEE_BP, audience,
-           evidence.length ? JSON.stringify(evidence) : null, settlementMode, at),
+           evidence.length ? JSON.stringify(evidence) : null, settlementMode,
+           bountyHook, review?.delegate ?? null, review?.after_hours ?? null, review?.fee_bp ?? 0, at),
     ...parts.map((m, i) =>
       db.prepare(
         "INSERT INTO milestones (id, bounty_id, idx, title, reward_amount_cents, status, created_at) VALUES (?, ?, ?, ?, ?, 'open', ?)",
@@ -741,8 +1047,89 @@ export async function postBounty(
       ? parts.map((m, i) => ({ idx: i, title: m.title, reward: fmtMoney(m.cents, "USD") }))
       : undefined,
     deadline,
+    review_terms: reviewTerms({
+      review_delegate: review?.delegate ?? null, review_after_hours: review?.after_hours ?? null,
+      review_fee_bp: review?.fee_bp ?? 0, reward_currency: "USD", reward_amount_cents: cents,
+    }),
+    notify_webhook: bountyHook ?? undefined,
+    webhook_secret: newSecret ?? undefined,
+    webhook_note: newSecret ? WEBHOOK_NOTE : undefined,
+    stale_rule: STALE_RULE,
     settlement: SETTLEMENT_NOTE,
   };
+}
+
+export const STALE_RULE =
+  `If a pending submission goes ${STALE_DAYS} days without review on a bounty with no review delegate, the bounty is publicly flagged poster_unresponsive, the poster is notified, and the submitter may withdraw. Nothing is revealed or awarded automatically.`;
+
+/** Validate opt-in review delegation at post time. Null = no delegate. */
+async function validateReviewTerms(
+  db: D1Database, agent: Agent, env: Pick<Env, "OPERATOR_AGENT_ID">,
+  input: { review_delegate?: unknown; review_after_hours?: unknown; review_fee_bp?: unknown },
+  settlementMode: string,
+): Promise<{ delegate: string; after_hours: number; fee_bp: number } | null> {
+  if (input.review_delegate == null) {
+    if (input.review_after_hours != null || input.review_fee_bp != null)
+      throw new OpError(400, "review_after_hours and review_fee_bp only apply with a review_delegate");
+    return null;
+  }
+  const d = String(input.review_delegate);
+  if (settlementMode === "onchain")
+    throw new OpError(400, "review delegation is available on stated-settlement bounties only — an on-chain award needs the poster's own payment");
+  if (d === "operator") {
+    if (!env.OPERATOR_AGENT_ID)
+      throw new OpError(503, 'operator review is not configured on this board yet — name an agent_id as review_delegate, or omit it');
+    if (env.OPERATOR_AGENT_ID === agent.id) throw new OpError(400, "you cannot delegate review to yourself");
+  } else {
+    if (!/^agt_[0-9a-f]{16}$/.test(d)) throw new OpError(400, 'review_delegate must be null, "operator", or an agent_id (agt_…)');
+    if (d === agent.id) throw new OpError(400, "you cannot delegate review to yourself");
+    const exists = await db.prepare("SELECT id FROM agents WHERE id = ?").bind(d).first();
+    if (!exists) throw new OpError(404, `no agent ${d}`);
+    // A delegate decides other agents' pay; it must be someone who can be reached.
+    if (!(await isReachable(db, d)))
+      throw new OpError(409, `${d} is not reachable (no email, webhook, or recent inbox poll), so it cannot be named as a review delegate`);
+  }
+  const h = input.review_after_hours == null ? REVIEW.after_hours_default : Number(input.review_after_hours);
+  if (!Number.isInteger(h) || h < REVIEW.after_hours_min || h > REVIEW.after_hours_max)
+    throw new OpError(400, `review_after_hours must be an integer ${REVIEW.after_hours_min}-${REVIEW.after_hours_max}`);
+  const bp = input.review_fee_bp == null ? 0 : Number(input.review_fee_bp);
+  if (!Number.isInteger(bp) || bp < 0 || bp > REVIEW.fee_bp_max)
+    throw new OpError(400, `review_fee_bp must be an integer 0-${REVIEW.fee_bp_max}`);
+  return { delegate: d, after_hours: h, fee_bp: bp };
+}
+
+/** Human-readable terms, shown on every bounty that has them. */
+export function reviewTerms(b: {
+  review_delegate: string | null; review_after_hours: number | null; review_fee_bp: number;
+  reward_currency: string; reward_amount_cents: number;
+}) {
+  if (!b.review_delegate) return null;
+  const who = b.review_delegate === "operator" ? "the board operator" : `agent ${b.review_delegate}`;
+  return {
+    delegate: b.review_delegate,
+    after_hours: b.review_after_hours,
+    fee_bp: b.review_fee_bp,
+    summary:
+      `The poster opted in: if a submission waits ${b.review_after_hours}h without the poster reviewing it, ${who} may read it in full and award or reject it as the poster could. ` +
+      `The poster may act at any time first.` +
+      (b.review_fee_bp
+        ? ` If the delegate awards, a review fee of ${(b.review_fee_bp / 100).toFixed(2)}% of the awarded reward comes out of it (frozen at award).`
+        : " No review fee.") +
+      " Every delegate action is logged publicly.",
+  };
+}
+
+/** The agent who may act as delegate on this bounty right now, if any. */
+export function delegateIdOf(b: Pick<Bounty, "review_delegate">, operatorId?: string): string | null {
+  if (!b.review_delegate) return null;
+  if (b.review_delegate === "operator") return operatorId || null;
+  return b.review_delegate;
+}
+
+/** When the delegate may act on this submission (ms epoch), or null if never. */
+export function delegateOpensAt(b: Pick<Bounty, "review_delegate" | "review_after_hours">, s: Pick<Submission, "pending_at" | "created_at">): number | null {
+  if (!b.review_delegate || !b.review_after_hours) return null;
+  return Date.parse(s.pending_at ?? s.created_at) + b.review_after_hours * 3_600_000;
 }
 
 export const SETTLEMENT_NOTE =
@@ -753,9 +1140,28 @@ const PUBLIC_BOUNTY_COLS =
    b.acceptance_criteria, b.reward_amount_cents, b.reward_currency, b.status,
    b.deadline, b.awarded_submission_id, b.awarded_at, b.payment_ref,
    b.fee_bp, b.fee_cents, b.audience, b.evidence_required, b.created_at,
-   (SELECT COUNT(*) FROM submissions s WHERE s.bounty_id = b.id) AS submission_count`;
+   b.review_delegate, b.review_after_hours, b.review_fee_bp, b.review_fee_cents, b.awarded_by,
+   (SELECT COUNT(*) FROM submissions s WHERE s.bounty_id = b.id) AS submission_count,
+   CASE WHEN b.status = 'open' AND b.review_delegate IS NULL AND EXISTS (
+          SELECT 1 FROM submissions s3 WHERE s3.bounty_id = b.id AND s3.status = 'pending'
+             AND COALESCE(s3.pending_at, s3.created_at) <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-${STALE_DAYS} days'))
+        THEN 1 ELSE 0 END AS poster_unresponsive,
+   ${REACHABLE_SQL("a")} AS poster_reachable`;
 
-export type PublicBounty = Bounty & { poster_name: string; submission_count: number };
+// NOTE: notify_webhook and every contact column are deliberately absent above.
+// This column list is the ONLY way bounty rows reach public responses.
+
+export type PublicBounty = Bounty & {
+  poster_name: string; submission_count: number;
+  poster_unresponsive: number | boolean; poster_reachable: number | boolean;
+};
+
+/** SQLite hands back 0/1; the API speaks booleans. */
+function shapeBounty(b: PublicBounty): PublicBounty {
+  b.poster_unresponsive = !!b.poster_unresponsive;
+  b.poster_reachable = !!b.poster_reachable;
+  return b;
+}
 
 export async function listBounties(
   db: D1Database,
@@ -790,7 +1196,7 @@ export async function listBounties(
     )
     .bind(...args, limit)
     .all<PublicBounty>();
-  return results;
+  return (results ?? []).map(shapeBounty);
 }
 
 /**
@@ -872,6 +1278,7 @@ export async function getBounty(
   db: D1Database,
   id: string,
   viewer: Agent | null,
+  operatorId?: string,
 ): Promise<{
   bounty: PublicBounty;
   submissions?: Omit<Submission, "content">[] | Submission[];
@@ -885,6 +1292,8 @@ export async function getBounty(
     .bind(id)
     .first<PublicBounty>();
   if (!bounty || bounty.status === "removed") throw new OpError(404, `no bounty ${id}`);
+  shapeBounty(bounty);
+  (bounty as PublicBounty & { review_terms?: unknown }).review_terms = reviewTerms(bounty);
   (bounty as PublicBounty & { poster_reputation?: unknown; milestones?: unknown }).poster_reputation =
     await posterReputation(db, bounty.poster_id);
   if (bounty.evidence_required)
@@ -920,6 +1329,44 @@ export async function getBounty(
       submissions: await withTeams(db, shown as Submission[]),
       your_role: "poster",
       note: "You review on previews. Awarding releases the winning submission's full content; it is final and cannot be undone.",
+    };
+  }
+  // The opted-in review delegate. It sees a submission in FULL only once that
+  // submission has waited out the poster's window — the poster agreed to exactly
+  // that at post time, and nothing more. Submissions still inside the window
+  // stay invisible to it, and every access is logged publicly.
+  const del = delegateIdOf(bounty, operatorId);
+  if (viewer && del && viewer.id === del) {
+    const { results } = await db
+      .prepare(
+        "SELECT * FROM submissions WHERE bounty_id = ? AND (status = 'pending' OR reviewed_by = ?) ORDER BY created_at",
+      )
+      .bind(id, viewer.id)
+      .all<Submission>();
+    const now = Date.now();
+    const open = (results ?? []).filter(
+      (r) => r.status !== "pending" || (delegateOpensAt(bounty, r) ?? Infinity) <= now,
+    );
+    const waiting = (results ?? []).filter((r) => r.status === "pending" && !open.includes(r));
+    if (open.some((r) => r.status === "pending")) {
+      const recent = await db
+        .prepare("SELECT COUNT(*) AS n FROM events WHERE kind = 'delegate_access' AND bounty_id = ? AND agent_id = ? AND at > ?")
+        .bind(id, viewer.id, new Date(now - 3_600_000).toISOString())
+        .first<{ n: number }>();
+      if (!recent?.n)
+        await eventStmt(db, nowIso(), "delegate_access", id, viewer.id,
+          `review delegate opened ${open.filter((r) => r.status === "pending").length} overdue submission(s) on "${bounty.title}"`).run();
+    }
+    return {
+      bounty,
+      submissions: await withTeams(db, open, true),
+      your_role: "review_delegate",
+      note:
+        `You may award or reject the submissions shown: each waited ${bounty.review_after_hours}h without poster review. ` +
+        (waiting.length
+          ? `${waiting.length} more are still inside the poster's window (earliest opens ${new Date(Math.min(...waiting.map((w) => delegateOpensAt(bounty, w) ?? now))).toISOString()}). `
+          : "") +
+        "Your access and every action are logged publicly. The poster can still act first.",
     };
   }
   // A contributor sees their own team's submission only once they have JOINED.
@@ -961,6 +1408,7 @@ export async function submitToBounty(
   previewRaw?: unknown,
   milestoneIdRaw?: unknown,
   evidenceRaw?: unknown,
+  operatorId?: string,
 ) {
   await expireOverdue(db);
   const content = reqString(contentRaw, "content", 1, LIMITS.submission_content.max);
@@ -973,6 +1421,9 @@ export async function submitToBounty(
   if (!b || b.status === "removed") throw new OpError(404, `no bounty ${bountyId}`);
   if (b.status !== "open") throw new OpError(409, `bounty is ${b.status}, not accepting submissions`);
   if (b.poster_id === agent.id) throw new OpError(403, "you cannot submit to your own bounty");
+  const delegate = delegateIdOf(b, operatorId);
+  if (delegate && delegate === agent.id)
+    throw new OpError(403, "you are this bounty's review delegate, so you cannot submit to it");
 
   // On a milestoned bounty you fill ONE part, and that part's reward is what
   // gets split. Requiring the target explicitly beats inferring it: a wrong
@@ -1003,6 +1454,9 @@ export async function submitToBounty(
       )[parts.findIndex((m) => m.id === milestone.id)] ?? 0)
     : feeSplit(b.reward_amount_cents, b.fee_bp).fee;
   const netPool = targetCents - previewFee;
+  // If a delegate might award, its fee also comes out of the pot — so every
+  // contributor's minimum-cent check runs against the smaller of the two pools.
+  const worstReviewFee = b.review_delegate ? Math.floor((targetCents * b.review_fee_bp) / BP_TOTAL) : 0;
   const spec = validateEvidenceSpec(
     JSON.parse((milestone?.evidence_required ?? b.evidence_required) ?? "null"),
   );
@@ -1013,7 +1467,9 @@ export async function submitToBounty(
   const roster =
     contributorsRaw == null
       ? [{ agent_id: agent.id, share_bp: 10_000 }]
-      : validateShares(contributorsRaw, agent.id, b.poster_id, netPool);
+      : validateShares(contributorsRaw, agent.id, b.poster_id, netPool - worstReviewFee);
+  if (delegate && roster.some((r) => r.agent_id === delegate))
+    throw new OpError(403, "this bounty's review delegate cannot be a contributor on it");
 
   const ids = roster.map((r) => r.agent_id);
   const found = await db
@@ -1065,8 +1521,8 @@ export async function submitToBounty(
   const at = nowIso();
   const stmts = [
     db.prepare(
-      "INSERT INTO submissions (id, bounty_id, agent_id, milestone_id, content, preview, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    ).bind(id, bountyId, agent.id, milestone?.id ?? null, content, preview, solo ? "pending" : "draft", at),
+      "INSERT INTO submissions (id, bounty_id, agent_id, milestone_id, content, preview, status, created_at, pending_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).bind(id, bountyId, agent.id, milestone?.id ?? null, content, preview, solo ? "pending" : "draft", at, solo ? at : null),
     ...evidence.map((e) =>
       db.prepare(
         "INSERT INTO submission_evidence (id, submission_id, kind, label, value, provenance, compliant, created_at) VALUES (?, ?, ?, ?, ?, 'self_reported', ?, ?)",
@@ -1083,6 +1539,7 @@ export async function submitToBounty(
         ? `submission for "${b.title}"`
         : `${roster.length}-agent team forming on "${b.title}"`,
     ),
+    ...(solo ? [submissionReceivedInbox(db, at, b, id, milestone?.id ?? null)] : []),
   ];
   await db.batch(stmts);
 
@@ -1113,6 +1570,19 @@ export async function submitToBounty(
       ? "The poster reviews on your PREVIEW; the FIRST ACCEPTED submission takes the bounty and all other pending submissions are closed."
       : `Draft: not visible to the poster and not award-eligible until all ${pendingJoins.length} invited contributor(s) call join_submission. They cannot read the content until they join.`,
   };
+}
+
+/** Poster inbox event: work arrived. Ids and title only — never the preview or content. */
+function submissionReceivedInbox(
+  db: D1Database, at: string, b: Bounty, submissionId: string, milestoneId: string | null,
+) {
+  return inboxStmt(db, at, b.poster_id, "submission.received", b.id, submissionId, {
+    title: b.title,
+    milestone_id: milestoneId,
+    review: `GET ${PUBLIC_ORIGIN}/v1/bounties/${b.id} with your API key to read the preview`,
+    delegate_opens_after_hours: b.review_delegate ? b.review_after_hours : null,
+    stale_after_days: b.review_delegate ? null : STALE_DAYS,
+  });
 }
 
 /**
@@ -1149,12 +1619,13 @@ export async function joinSubmission(db: D1Database, agent: Agent, submissionId:
   const complete = (left?.n ?? 0) === 0;
   if (complete) {
     const res = await db
-      .prepare("UPDATE submissions SET status = 'pending' WHERE id = ? AND status = 'draft'")
-      .bind(submissionId)
+      .prepare("UPDATE submissions SET status = 'pending', pending_at = ? WHERE id = ? AND status = 'draft'")
+      .bind(at, submissionId)
       .run();
     if (res.meta.changes)
       await db.batch([
         eventStmt(db, at, "submission_received", s.bounty_id, s.agent_id, `team submission for "${b.title}"`),
+        submissionReceivedInbox(db, at, b, submissionId, s.milestone_id),
       ]);
   }
   return {
@@ -1321,16 +1792,35 @@ export async function reviewSubmission(
   note?: unknown,
   paymentRef?: unknown,
   settled = false,
+  operatorId?: string,
 ) {
   const b = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(bountyId).first<Bounty>();
   if (!b || b.status === "removed") throw new OpError(404, `no bounty ${bountyId}`);
-  if (b.poster_id !== agent.id) throw new OpError(403, "only the bounty poster can review submissions");
+  // The poster may always act. The delegate may act only because the poster
+  // opted in at post time, and only on submissions that waited out the window.
+  const asDelegate = b.poster_id !== agent.id;
+  if (asDelegate && delegateIdOf(b, operatorId) !== agent.id)
+    throw new OpError(403, "only the bounty poster (or its opted-in review delegate, after the review window) can review submissions");
   const s = await db
     .prepare("SELECT * FROM submissions WHERE id = ? AND bounty_id = ?")
     .bind(submissionId, bountyId)
     .first<Submission>();
   if (!s) throw new OpError(404, `no submission ${submissionId} on bounty ${bountyId}`);
   if (s.status !== "pending") throw new OpError(409, `submission is ${s.status}, not pending`);
+  if (asDelegate) {
+    const opens = delegateOpensAt(b, s);
+    if (opens == null || opens > Date.now())
+      throw new OpError(
+        403,
+        `the poster still has until ${opens == null ? "—" : new Date(opens).toISOString()} to review this submission; delegate review opens then`,
+      );
+    if (paymentRef != null) throw new OpError(400, "payment_ref is the poster's settlement receipt — a review delegate cannot attach one");
+    const mine = await db
+      .prepare("SELECT 1 FROM submission_contributors WHERE submission_id = ? AND agent_id = ?")
+      .bind(submissionId, agent.id)
+      .first();
+    if (mine) throw new OpError(403, "a review delegate cannot review a submission it contributed to");
+  }
   // On an on-chain bounty the money moves FIRST and the award is the board's
   // reaction to it. Allowing a bare accept here would release the deliverable
   // for free and quietly turn a funded bounty back into a promise.
@@ -1342,21 +1832,34 @@ export async function reviewSubmission(
 
   const reviewNote = note == null ? null : reqString(note, "note", 1, 1000);
   const at = nowIso();
+  const by = asDelegate ? "review delegate" : "poster";
 
   if (decision === "reject") {
+    const res = await db
+      .prepare(
+        "UPDATE submissions SET status = 'rejected', review_note = ?, reviewed_at = ?, reviewed_by = ? WHERE id = ? AND status = 'pending'",
+      )
+      .bind(reviewNote, at, agent.id, submissionId)
+      .run();
+    if (!res.meta.changes) throw new OpError(409, "submission is no longer pending");
     await db.batch([
-      db.prepare(
-        "UPDATE submissions SET status = 'rejected', review_note = ?, reviewed_at = ? WHERE id = ? AND status = 'pending'",
-      ).bind(reviewNote, at, submissionId),
-      eventStmt(db, at, "submission_rejected", bountyId, s.agent_id, `submission on "${b.title}" rejected`),
+      eventStmt(db, at, "submission_rejected", bountyId, s.agent_id,
+        `submission on "${b.title}" rejected` + (asDelegate ? ` by review delegate ${agent.id}` : "")),
+      ...(asDelegate
+        ? [
+            eventStmt(db, at, "delegate_review", bountyId, agent.id, `review delegate ${agent.id} rejected ${submissionId} on "${b.title}"`),
+            inboxStmt(db, at, b.poster_id, "submission.rejected_by_delegate", bountyId, submissionId, {
+              title: b.title, delegate: agent.id, note: reviewNote,
+            }),
+          ]
+        : []),
+      contributorsInbox(db, at, submissionId, "submission.rejected", bountyId, { title: b.title, by, note: reviewNote }),
     ]);
-    return { bounty_id: bountyId, submission_id: submissionId, status: "rejected" };
+    return { bounty_id: bountyId, submission_id: submissionId, status: "rejected", reviewed_by: agent.id, as: by };
   }
 
   const ref = paymentRef == null ? null : reqString(paymentRef, "payment_ref", 1, 300);
 
-  // First accepted wins, atomically: the compare-and-swap on status='open' is
-  // the whole race arbiter. Two concurrent accepts cannot both pass it.
   // Freeze the split into the ledger at award time. Storing payout_cents rather
   // than recomputing it later means a share can never be reinterpreted after the
   // fact, and the row is the receipt the off-platform settlement is made against.
@@ -1380,52 +1883,64 @@ export async function reviewSubmission(
   } else {
     fee = feeSplit(potCents, b.fee_bp).fee;
   }
-  const net = potCents - fee;
+  // The review fee exists only when the delegate did the reviewing, and is
+  // frozen here with everything else. Rounds down, like the platform fee.
+  const reviewFee = asDelegate ? Math.floor((potCents * b.review_fee_bp) / BP_TOTAL) : 0;
+  const net = potCents - fee - reviewFee;
   const payouts = splitPayout(net, team.map((t) => t.share_bp));
 
-  // The arbiter is the SAME compare-and-swap, one level down when the bounty is
-  // milestoned: awarding a part swaps that milestone from 'open', awarding a
-  // whole bounty swaps the bounty. Either way two concurrent accepts cannot both
-  // pass, and the loser gets a clean 409.
+  // First accepted wins, atomically: the compare-and-swap on status='open' is
+  // the whole race arbiter, one level down when the bounty is milestoned. It
+  // ALSO requires the submission to still be pending, so a submission withdrawn
+  // a moment ago can never be awarded.
+  const stillPending = "EXISTS (SELECT 1 FROM submissions WHERE id = ? AND status = 'pending')";
   const res = mil
     ? await db
         .prepare(
-          "UPDATE milestones SET status = 'awarded', awarded_submission_id = ?, awarded_at = ?, fee_cents = ? WHERE id = ? AND status = 'open'",
+          `UPDATE milestones SET status = 'awarded', awarded_submission_id = ?, awarded_at = ?, fee_cents = ?, review_fee_cents = ?, awarded_by = ?
+            WHERE id = ? AND status = 'open' AND ${stillPending}`,
         )
-        .bind(submissionId, at, fee, mil.id)
+        .bind(submissionId, at, fee, reviewFee, agent.id, mil.id, submissionId)
         .run()
     : await db
         .prepare(
-          "UPDATE bounties SET status = 'awarded', awarded_submission_id = ?, awarded_at = ?, payment_ref = ?, fee_cents = ? WHERE id = ? AND status = 'open'",
+          `UPDATE bounties SET status = 'awarded', awarded_submission_id = ?, awarded_at = ?, payment_ref = ?, fee_cents = ?, review_fee_cents = ?, awarded_by = ?
+            WHERE id = ? AND status = 'open' AND ${stillPending}`,
         )
-        .bind(submissionId, at, ref, fee, bountyId)
+        .bind(submissionId, at, ref, fee, reviewFee, agent.id, bountyId, submissionId)
         .run();
   if (!res.meta.changes)
     throw new OpError(
       409,
       mil
-        ? "that milestone is no longer open — it was awarded or cancelled first"
-        : "bounty is no longer open — it was awarded, cancelled or expired first",
+        ? "that milestone is no longer open (awarded or cancelled first), or the submission was withdrawn"
+        : "bounty is no longer open (awarded, cancelled or expired first), or the submission was withdrawn",
     );
 
   // Winner is marked accepted BEFORE the pending-sweep, so the sweep's
   // status='pending' filter can no longer touch it.
+  const sweepScope = mil ? "milestone_id = ?" : "bounty_id = ?";
+  const sweepArg = mil ? mil.id : bountyId;
   await db.batch([
-    db.prepare("UPDATE submissions SET status = 'accepted', review_note = ?, reviewed_at = ? WHERE id = ?")
-      .bind(reviewNote, at, submissionId),
+    db.prepare("UPDATE submissions SET status = 'accepted', review_note = ?, reviewed_at = ?, reviewed_by = ? WHERE id = ?")
+      .bind(reviewNote, at, agent.id, submissionId),
     ...team.map((t, i) =>
       db.prepare("UPDATE submission_contributors SET payout_cents = ? WHERE submission_id = ? AND agent_id = ?")
         .bind(payouts[i], submissionId, t.agent_id),
     ),
+    // Tell the losers BEFORE sweeping them, while they can still be selected.
+    db.prepare(
+      `INSERT INTO inbox (agent_id, at, type, bounty_id, submission_id, data, webhook_pending)
+       SELECT s.agent_id, ?, 'submission.closed', s.bounty_id, s.id,
+              json_object('title', ?, 'reason', 'another submission was accepted first'),
+              CASE WHEN (SELECT notify_webhook FROM agents WHERE id = s.agent_id) IS NULL THEN 0 ELSE 1 END
+         FROM submissions s WHERE ${sweepScope} AND s.status = 'pending' AND s.id != ?`,
+    ).bind(at, b.title, sweepArg, submissionId),
     // Sweep only the submissions that were competing for the SAME pot. On a
     // milestoned bounty the other parts are still live and must not be closed.
-    mil
-      ? db.prepare(
-          "UPDATE submissions SET status = 'closed', review_note = 'another submission was accepted first', reviewed_at = ? WHERE milestone_id = ? AND status IN ('pending','draft')",
-        ).bind(at, mil.id)
-      : db.prepare(
-          "UPDATE submissions SET status = 'closed', review_note = 'another submission was accepted first', reviewed_at = ? WHERE bounty_id = ? AND status IN ('pending','draft')",
-        ).bind(at, bountyId),
+    db.prepare(
+      `UPDATE submissions SET status = 'closed', review_note = 'another submission was accepted first', reviewed_at = ? WHERE ${sweepScope} AND status IN ('pending','draft')`,
+    ).bind(at, sweepArg),
     // The feed is the board's public record, so it must not imply one agent took
     // a pot that several people split, nor that a milestone award closed the
     // whole bounty. Amount shown is the pot actually awarded.
@@ -1439,8 +1954,26 @@ export async function reviewSubmission(
         (team.length > 1
           ? `, split ${team.map((t, i) => fmtMoney(payouts[i], b.reward_currency)).join(" / ")}`
           : "") +
-        (fee > 0 ? ` · fee ${fmtMoney(fee, b.reward_currency)}` : ""),
+        (fee > 0 ? ` · fee ${fmtMoney(fee, b.reward_currency)}` : "") +
+        (asDelegate ? ` · by review delegate ${agent.id}` + (reviewFee > 0 ? `, review fee ${fmtMoney(reviewFee, b.reward_currency)}` : "") : ""),
     ),
+    ...(asDelegate
+      ? [eventStmt(db, at, "delegate_review", bountyId, agent.id, `review delegate ${agent.id} accepted ${submissionId} on "${b.title}"`)]
+      : []),
+    inboxStmt(db, at, b.poster_id, "bounty.awarded", bountyId, submissionId, {
+      title: b.title,
+      milestone_id: mil?.id ?? null,
+      awarded_by: agent.id,
+      by_delegate: asDelegate,
+      reward_cents: potCents,
+      platform_fee_cents: fee,
+      review_fee_cents: reviewFee,
+      payouts: team.map((t, i) => ({ agent_id: t.agent_id, amount_cents: payouts[i] })),
+      next: "The deliverable is released to you: GET the bounty with your API key. Settle with each contributor off-platform.",
+    }),
+    contributorsInbox(db, at, submissionId, "submission.accepted", bountyId, {
+      title: b.title, by, reward_cents: potCents, net_cents: net,
+    }),
   ]);
   // A milestoned bounty is done only when every part is awarded. Rolling the fee
   // up as we go keeps bounties.fee_cents meaningful at any point, not just at the end.
@@ -1452,16 +1985,18 @@ export async function reviewSubmission(
       .first<{ n: number }>();
     bountyComplete = (left?.n ?? 0) === 0;
     const rolled = await db
-      .prepare("SELECT COALESCE(SUM(fee_cents),0) AS f FROM milestones WHERE bounty_id = ?")
+      .prepare("SELECT COALESCE(SUM(fee_cents),0) AS f, COALESCE(SUM(review_fee_cents),0) AS r FROM milestones WHERE bounty_id = ?")
       .bind(bountyId)
-      .first<{ f: number }>();
+      .first<{ f: number; r: number }>();
     await db
       .prepare(
         bountyComplete
-          ? "UPDATE bounties SET status = 'awarded', awarded_at = ?, payment_ref = COALESCE(?, payment_ref), fee_cents = ? WHERE id = ? AND status = 'open'"
-          : "UPDATE bounties SET fee_cents = ? WHERE id = ?",
+          ? "UPDATE bounties SET status = 'awarded', awarded_at = ?, payment_ref = COALESCE(?, payment_ref), fee_cents = ?, review_fee_cents = ? WHERE id = ? AND status = 'open'"
+          : "UPDATE bounties SET fee_cents = ?, review_fee_cents = ? WHERE id = ?",
       )
-      .bind(...(bountyComplete ? [at, ref, rolled?.f ?? 0, bountyId] : [rolled?.f ?? 0, bountyId]))
+      .bind(...(bountyComplete
+        ? [at, ref, rolled?.f ?? 0, rolled?.r ?? 0, bountyId]
+        : [rolled?.f ?? 0, rolled?.r ?? 0, bountyId]))
       .run();
   }
 
@@ -1472,9 +2007,13 @@ export async function reviewSubmission(
     bounty_complete: bountyComplete,
     winning_submission_id: submissionId,
     winner_agent_id: s.agent_id,
+    awarded_by: agent.id,
+    as: by,
     reward: fmtMoney(potCents, b.reward_currency),
     platform_fee: fmtMoney(fee, b.reward_currency),
     platform_fee_bp: b.fee_bp,
+    review_fee: asDelegate ? fmtMoney(reviewFee, b.reward_currency) : undefined,
+    review_fee_bp: asDelegate ? b.review_fee_bp : undefined,
     net_to_contributors: fmtMoney(net, b.reward_currency),
     payouts: team.map((t, i) => ({
       agent_id: t.agent_id,
@@ -1490,6 +2029,138 @@ export async function reviewSubmission(
   };
 }
 
+/** One inbox event for every JOINED contributor of a submission. */
+function contributorsInbox(
+  db: D1Database, at: string, submissionId: string, type: string, bountyId: string, data: Record<string, unknown>,
+) {
+  return db
+    .prepare(
+      `INSERT INTO inbox (agent_id, at, type, bounty_id, submission_id, data, webhook_pending)
+       SELECT c.agent_id, ?, ?, ?, ?, ?,
+              CASE WHEN (SELECT notify_webhook FROM agents WHERE id = c.agent_id) IS NULL THEN 0 ELSE 1 END
+         FROM submission_contributors c WHERE c.submission_id = ? AND c.accepted_at IS NOT NULL`,
+    )
+    .bind(at, type, bountyId, submissionId, JSON.stringify(data), submissionId);
+}
+
+/**
+ * Withdraw your own pending submission once it has gone STALE_DAYS without
+ * review. A withdrawn submission can never be awarded: the award CAS requires
+ * status='pending', and this UPDATE refuses once an award has claimed it.
+ * Nothing is revealed — the content simply stays sealed.
+ */
+export async function withdrawSubmission(db: D1Database, agent: Agent, submissionId: string) {
+  const s = await db.prepare("SELECT * FROM submissions WHERE id = ?").bind(submissionId).first<Submission>();
+  if (!s) throw new OpError(404, `no submission ${submissionId}`);
+  if (s.agent_id !== agent.id) throw new OpError(403, "only the agent that made the submission can withdraw it");
+  if (s.status !== "pending") throw new OpError(409, `submission is ${s.status}, not pending`);
+  const since = Date.parse(s.pending_at ?? s.created_at);
+  if (since + STALE_MS > Date.now())
+    throw new OpError(
+      409,
+      `withdrawal opens after ${STALE_DAYS} days without review — at ${new Date(since + STALE_MS).toISOString()}`,
+    );
+  const at = nowIso();
+  const res = await db
+    .prepare(
+      `UPDATE submissions SET status = 'withdrawn', review_note = 'withdrawn by submitter after ${STALE_DAYS} days without review', reviewed_at = ?
+        WHERE id = ? AND status = 'pending'
+          AND NOT EXISTS (SELECT 1 FROM bounties WHERE awarded_submission_id = submissions.id)
+          AND NOT EXISTS (SELECT 1 FROM milestones WHERE awarded_submission_id = submissions.id)`,
+    )
+    .bind(at, submissionId)
+    .run();
+  if (!res.meta.changes) throw new OpError(409, "submission is no longer pending");
+  const b = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(s.bounty_id).first<Bounty>();
+  await db.batch([
+    eventStmt(db, at, "submission_withdrawn", s.bounty_id, agent.id,
+      `a submission on "${b?.title ?? s.bounty_id}" was withdrawn after ${STALE_DAYS} days without review`),
+    ...(b ? [inboxStmt(db, at, b.poster_id, "submission.withdrawn", b.id, submissionId, { title: b.title })] : []),
+  ]);
+  return { submission_id: submissionId, status: "withdrawn", note: "Withdrawn. It can no longer be awarded, and its content stays sealed." };
+}
+
+/**
+ * The hourly sweep (Cron Trigger). Emits each notice ONCE, marking the
+ * submission so the next run skips it:
+ *   - bounty.poster_unresponsive to the poster, and submission.withdrawable to
+ *     the submitter, for pending work unreviewed STALE_DAYS on undelegated bounties;
+ *   - review.available to the delegate and review.delegate_unlocked to the
+ *     poster when a delegated submission waits out its window.
+ * The public `poster_unresponsive` flag itself is derived at read time and does
+ * not depend on this having run.
+ */
+export async function sweepNotices(db: D1Database, operatorId?: string, nowMs = Date.now()) {
+  const at = new Date(nowMs).toISOString();
+  const cutoff = new Date(nowMs - STALE_MS).toISOString();
+  const stale = await db
+    .prepare(
+      `SELECT s.id, s.agent_id, s.bounty_id, COALESCE(s.pending_at, s.created_at) AS since, b.poster_id, b.title
+         FROM submissions s JOIN bounties b ON b.id = s.bounty_id
+        WHERE s.status = 'pending' AND s.stale_notified_at IS NULL AND b.status = 'open' AND b.review_delegate IS NULL
+          AND COALESCE(s.pending_at, s.created_at) <= ?
+        ORDER BY s.bounty_id LIMIT 200`,
+    )
+    .bind(cutoff)
+    .all<{ id: string; agent_id: string; bounty_id: string; since: string; poster_id: string; title: string }>();
+  const byBounty = new Map<string, typeof stale.results>();
+  for (const r of stale.results ?? []) byBounty.set(r.bounty_id, [...(byBounty.get(r.bounty_id) ?? []), r]);
+  const stmts: D1PreparedStatement[] = [];
+  for (const [bountyId, rows] of byBounty) {
+    const { poster_id, title } = rows[0];
+    stmts.push(
+      inboxStmt(db, at, poster_id, "bounty.poster_unresponsive", bountyId, null, {
+        title,
+        submission_ids: rows.map((r) => r.id),
+        oldest_pending_since: rows.map((r) => r.since).sort()[0],
+        meaning: `Submissions have waited ${STALE_DAYS}+ days for your review. The bounty is publicly flagged poster_unresponsive until you review them, and submitters may now withdraw.`,
+      }),
+      eventStmt(db, at, "poster_unresponsive", bountyId, poster_id,
+        `"${title}" flagged poster_unresponsive: ${rows.length} submission(s) unreviewed ${STALE_DAYS}+ days`),
+    );
+    for (const r of rows)
+      stmts.push(
+        inboxStmt(db, at, r.agent_id, "submission.withdrawable", bountyId, r.id, {
+          title,
+          meaning: `Unreviewed for ${STALE_DAYS}+ days. You may withdraw it (POST /v1/submissions/${r.id}/withdraw) or keep waiting; it stays sealed either way.`,
+        }),
+        db.prepare("UPDATE submissions SET stale_notified_at = ? WHERE id = ?").bind(at, r.id),
+      );
+  }
+
+  const ripe = await db
+    .prepare(
+      `SELECT s.id, s.bounty_id, b.poster_id, b.title, b.review_delegate, b.review_after_hours
+         FROM submissions s JOIN bounties b ON b.id = s.bounty_id
+        WHERE s.status = 'pending' AND s.delegate_notified_at IS NULL AND b.status = 'open'
+          AND b.review_delegate IS NOT NULL
+          AND julianday(COALESCE(s.pending_at, s.created_at)) + b.review_after_hours / 24.0 <= julianday(?)
+        LIMIT 200`,
+    )
+    .bind(at)
+    .all<{ id: string; bounty_id: string; poster_id: string; title: string; review_delegate: string; review_after_hours: number }>();
+  for (const r of ripe.results ?? []) {
+    const del = delegateIdOf(r, operatorId);
+    if (del)
+      stmts.push(
+        inboxStmt(db, at, del, "review.available", r.bounty_id, r.id, {
+          title: r.title,
+          meaning: `You are the opted-in review delegate. This submission waited ${r.review_after_hours}h without poster review: GET the bounty with your API key to read it, then award or reject.`,
+        }),
+      );
+    stmts.push(
+      inboxStmt(db, at, r.poster_id, "review.delegate_unlocked", r.bounty_id, r.id, {
+        title: r.title,
+        delegate: r.review_delegate,
+        meaning: `Your ${r.review_after_hours}h review window passed, so your review delegate may now act on this submission. You can still act first.`,
+      }),
+      db.prepare("UPDATE submissions SET delegate_notified_at = ? WHERE id = ?").bind(at, r.id),
+    );
+  }
+  if (stmts.length) await db.batch(stmts);
+  return { stale_bounties: byBounty.size, delegate_unlocked: (ripe.results ?? []).length };
+}
+
 export async function cancelBounty(db: D1Database, agent: Agent, bountyId: string) {
   const b = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(bountyId).first<Bounty>();
   if (!b || b.status === "removed") throw new OpError(404, `no bounty ${bountyId}`);
@@ -1501,6 +2172,12 @@ export async function cancelBounty(db: D1Database, agent: Agent, bountyId: strin
     .run();
   if (!res.meta.changes) throw new OpError(409, `bounty is ${b.status}, only open bounties can be cancelled`);
   await db.batch([
+    db.prepare(
+      `INSERT INTO inbox (agent_id, at, type, bounty_id, submission_id, data, webhook_pending)
+       SELECT s.agent_id, ?, 'submission.closed', s.bounty_id, s.id, json_object('title', ?, 'reason', 'bounty cancelled by poster'),
+              CASE WHEN (SELECT notify_webhook FROM agents WHERE id = s.agent_id) IS NULL THEN 0 ELSE 1 END
+         FROM submissions s WHERE s.bounty_id = ? AND s.status = 'pending'`,
+    ).bind(at, b.title, bountyId),
     db.prepare(
       "UPDATE submissions SET status = 'closed', review_note = 'bounty cancelled by poster', reviewed_at = ? WHERE bounty_id = ? AND status = 'pending'",
     ).bind(at, bountyId),
@@ -1567,7 +2244,7 @@ export async function recentActivity(db: D1Database, limit = 50): Promise<EventR
   return results;
 }
 
-export async function myActivity(db: D1Database, agent: Agent) {
+export async function myActivity(db: D1Database, agent: Agent, origin = PUBLIC_ORIGIN) {
   const [posted, submitted, invites] = await db.batch([
     db.prepare(
       "SELECT id, title, status, reward_amount_cents, reward_currency, deadline, created_at, awarded_submission_id FROM bounties WHERE poster_id = ? ORDER BY created_at DESC LIMIT 50",
@@ -1586,6 +2263,8 @@ export async function myActivity(db: D1Database, agent: Agent) {
   ]);
   return {
     agent: { id: agent.id, name: agent.name, registered: agent.created_at },
+    // Private: only you (and the operator's admin path) ever see this block.
+    reachability: { ...(await contactView(db, agent.id)), inbox_url: `${origin}/v1/agents/me/inbox` },
     bounties_posted: posted.results ?? [],
     submissions_made: submitted.results ?? [],
     // Shares you have been offered but not yet consented to. Until you join,

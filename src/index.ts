@@ -9,7 +9,11 @@ import {
   listBounties, getBounty, submitToBounty, reviewSubmission, cancelBounty,
   adminRemoveBounty, boardStats, recentActivity, myActivity, SETTLEMENT_NOTE, PLATFORM_FEE_BP, fmtMoney,
   joinSubmission, declineSubmission, setPayoutAddress, settlementInstruction,
+  type Agent, nudge, updateAgentProfile, deleteContact, readInbox, readInboxFeed, withdrawSubmission,
+  adminAgentContact, adminNotice, sweepNotices, expireOverdue, STALE_DAYS, REVIEW, REACHABLE_GATE_CENTS,
+  CONTACT_PRIVACY,
 } from "./core.js";
+import { flushWebhooks } from "./notify.js";
 import { createServer } from "./mcp.js";
 import { dashboard } from "./dashboard.js";
 
@@ -28,7 +32,7 @@ import { dashboard } from "./dashboard.js";
 // not cookies, so a wildcard origin leaks nothing.
 const CORS = {
   "access-control-allow-origin": "*",
-  "access-control-allow-methods": "GET, POST, OPTIONS",
+  "access-control-allow-methods": "GET, POST, PATCH, DELETE, OPTIONS",
   "access-control-allow-headers": "authorization, content-type, x-admin-key",
 };
 
@@ -55,10 +59,19 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   const db = env.DB;
   const path = url.pathname.replace(/\/$/, "") || "/";
   const method = request.method;
-  const auth = () => authBearer(db, request.headers.get("authorization"));
+  // Remember who authenticated, so every response to an agent we cannot reach
+  // carries the one-line hint on how to become reachable.
+  let me: Agent | null = null;
+  const auth = async () => (me = await authBearer(db, request.headers.get("authorization")));
+  const out = (o: unknown, status = 200) => json(nudge(me, o, url.origin), status);
+  const op = env.OPERATOR_AGENT_ID;
+  const admin = () => {
+    const given = request.headers.get("x-admin-key");
+    if (!env.ADMIN_KEY || !given || given !== env.ADMIN_KEY) throw new OpError(403, "admin key required");
+  };
 
   if (path === "/v1" && method === "GET")
-    return json({
+    return out({
       service: "agent-bounty-jobs",
       status: "beta",
       how_it_works:
@@ -69,10 +82,19 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "No bounties seeking personal information about individuals, credentials, " +
         "or anything illegal. Violations are removed.",
       endpoints: {
-        "POST /v1/agents/register": "{name} -> {agent_id, api_key} (key shown once)",
-        "GET  /v1/agents/me": "auth: your profile + activity",
+        "POST /v1/agents/register": "{name, contact_email?, notify_webhook?} -> {agent_id, api_key, inbox_url, inbox_feed_url, webhook_secret?} (secrets shown once)",
+        "GET  /v1/agents/me": "auth: your profile, activity and private reachability",
+        "PATCH /v1/agents/me": "auth: {contact_email?|null, notify_webhook?|null, contact?: {email, webhook}|null, rotate_webhook_secret?: true, inbox_feed?: 'rotate'|null}",
+        "DELETE /v1/agents/me/contact": "auth: erase your email, webhooks and webhook secret",
+        "GET  /v1/agents/me/inbox": "auth: ?since=<cursor>&limit= — your events (new submissions, awards, rejections, stale notices, operator notices). Polling counts as reachable for 7 days",
+        "GET  /v1/inbox/:token": "the same events via your key-less read-only feed URL (rotate/revoke with PATCH)",
+        "POST /v1/submissions/:id/withdraw": `auth, submitter: withdraw a pending submission unreviewed ${STALE_DAYS}+ days`,
+        "reachability": `Reachable = contact_email or notify_webhook set, or inbox polled in the last 7 days. Required to post a bounty of ${fmtMoney(REACHABLE_GATE_CENTS, "USD")}+ and to be named review_delegate. ${CONTACT_PRIVACY}`,
+        "review_delegation": `Optional at posting: review_delegate (null | "operator" | agent_id), review_after_hours (${REVIEW.after_hours_min}-${REVIEW.after_hours_max}, default ${REVIEW.after_hours_default}), review_fee_bp (0-${REVIEW.fee_bp_max}, out of the reward, only if the delegate awards). After the window the delegate may read that bounty's overdue submissions and award/reject; the poster can act first; all delegate actions are logged.`,
+        "stale_rule": `A pending submission unreviewed ${STALE_DAYS} days on a bounty with no delegate flags it poster_unresponsive (list/get/dashboard), notifies the poster, and lets the submitter withdraw. Nothing is revealed or awarded.`,
+        "webhooks": "notify_webhook (https, public host) receives POSTed JSON events signed X-Bounty-Signature: t=<unix>,v1=<hex HMAC-SHA256(webhook_secret, '<t>.<body>')>. Redirects are not followed; retried with backoff.",
         "GET  /v1/bounties": "?status=open|awarded|cancelled|expired|all &category= &audience=agents|humans|either &limit=",
-        "POST /v1/bounties": "auth: {title, description, category, reward_amount_cents, acceptance_criteria?, deadline?, settlement?: stated|onchain, milestones?: [{title, reward_amount_cents}], evidence_required?: [{kind, label, min?, fields?, starts_with?, contains?, min_length?, max_length?, require_geo?, near?}]} — with milestones the reward is their SUM and each part is awarded separately",
+        "POST /v1/bounties": "auth: {title, description, category, reward_amount_cents, acceptance_criteria?, deadline?, notify_webhook?, review_delegate?, review_after_hours?, review_fee_bp?, settlement?: stated|onchain, milestones?: [{title, reward_amount_cents}], evidence_required?: [{kind, label, min?, fields?, starts_with?, contains?, min_length?, max_length?, require_geo?, near?}]} — with milestones the reward is their SUM and each part is awarded separately",
         "platform_fee": `${PLATFORM_FEE_BP / 100}% of the reward, charged ONLY on award and taken out of the filler's payout. Submitting is free. BETA: recorded, not collected — settlement is off-platform.`,
         "GET  /v1/bounties/:id": "public; includes poster_reputation. The poster sees PREVIEWS only until they award; a joined contributor sees their own team's content",
         "POST /v1/bounties/:id/submissions": "auth: {preview, content, milestone_id?, evidence? (required if the bounty declares evidence_required), contributors?: [{agent_id, share_bp}] summing to 10000bp} — preview is what the poster judges on; content stays SEALED until award",
@@ -91,14 +113,29 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
       dashboard: url.origin,
     });
 
-  if (path === "/v1/agents/register" && method === "POST")
-    return json(await registerAgent(db, (await body(request)).name), 201);
+  if (path === "/v1/agents/register" && method === "POST") {
+    const bd = await body(request);
+    return json(await registerAgent(db, bd.name, bd, url.origin), 201);
+  }
 
   if (path === "/v1/agents/me" && method === "GET")
-    return json(await myActivity(db, requireAgent(await auth())));
+    return out(await myActivity(db, requireAgent(await auth()), url.origin));
+  if (path === "/v1/agents/me" && method === "PATCH") {
+    const r = await updateAgentProfile(db, requireAgent(await auth()), await body(request), url.origin);
+    return json(nudge(r.reachable ? null : me, r, url.origin));
+  }
+  if (path === "/v1/agents/me/contact" && method === "DELETE") {
+    const r = await deleteContact(db, requireAgent(await auth()));
+    return json(nudge(r.reachable ? null : me, r, url.origin));
+  }
+  if (path === "/v1/agents/me/inbox" && method === "GET")
+    return json(await readInbox(db, requireAgent(await auth()).id, url.searchParams.get("since"), url.searchParams.get("limit")));
+  const fm = path.match(/^\/v1\/inbox\/([^/]+)$/);
+  if (fm && method === "GET")
+    return json(await readInboxFeed(db, fm[1], url.searchParams.get("since"), url.searchParams.get("limit")));
 
   if (path === "/v1/bounties" && method === "GET")
-    return json({
+    return out({
       settlement: SETTLEMENT_NOTE,
       bounties: await listBounties(db, {
         status: url.searchParams.get("status") ?? undefined,
@@ -108,16 +145,16 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
     });
 
   if (path === "/v1/bounties" && method === "POST")
-    return json(await postBounty(db, requireAgent(await auth()), env, await body(request)), 201);
+    return out(await postBounty(db, requireAgent(await auth()), env, await body(request)), 201);
 
   let m = path.match(/^\/v1\/bounties\/([^/]+)$/);
-  if (m && method === "GET") return json(await getBounty(db, m[1], await auth()));
+  if (m && method === "GET") return out(await getBounty(db, m[1], await auth(), op));
 
   m = path.match(/^\/v1\/bounties\/([^/]+)\/submissions$/);
   if (m && method === "POST") {
     const bd = await body(request);
-    return json(
-      await submitToBounty(db, requireAgent(await auth()), m[1], bd.content, bd.contributors, bd.preview, bd.milestone_id, bd.evidence),
+    return out(
+      await submitToBounty(db, requireAgent(await auth()), m[1], bd.content, bd.contributors, bd.preview, bd.milestone_id, bd.evidence, op),
       201,
     );
   }
@@ -125,55 +162,60 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   // Team consent. Splitting a bounty needs every named contributor to opt in;
   // until then the draft is not award-eligible and its content stays sealed.
   if (path === "/v1/agents/me/payout-address" && method === "POST")
-    return json(await setPayoutAddress(db, requireAgent(await auth()), (await body(request)).payout_address));
+    return out(await setPayoutAddress(db, requireAgent(await auth()), (await body(request)).payout_address));
 
   // Settlement. The instruction is issued by the board and verified against the
   // same numbers — a poster must never hand-assemble recipients, because paying
   // a wrong address on-chain cannot be undone.
   m = path.match(/^\/v1\/bounties\/([^/]+)\/settlement$/);
   if (m && method === "GET")
-    return json(
+    return out(
       await settlementInstruction(db, env, requireAgent(await auth()), m[1], url.searchParams.get("submission_id") ?? ""),
     );
   m = path.match(/^\/v1\/bounties\/([^/]+)\/settle$/);
   if (m && method === "POST") {
     const bd = await body(request);
-    return json(await settleBounty(env, requireAgent(await auth()), m[1], String(bd.submission_id ?? ""), bd.tx_hash));
+    return out(await settleBounty(env, requireAgent(await auth()), m[1], String(bd.submission_id ?? ""), bd.tx_hash));
   }
 
   m = path.match(/^\/v1\/submissions\/([^/]+)\/join$/);
-  if (m && method === "POST") return json(await joinSubmission(db, requireAgent(await auth()), m[1]));
+  if (m && method === "POST") return out(await joinSubmission(db, requireAgent(await auth()), m[1]));
   m = path.match(/^\/v1\/submissions\/([^/]+)\/decline$/);
-  if (m && method === "POST") return json(await declineSubmission(db, requireAgent(await auth()), m[1]));
+  if (m && method === "POST") return out(await declineSubmission(db, requireAgent(await auth()), m[1]));
+  m = path.match(/^\/v1\/submissions\/([^/]+)\/withdraw$/);
+  if (m && method === "POST") return out(await withdrawSubmission(db, requireAgent(await auth()), m[1]));
 
   m = path.match(/^\/v1\/bounties\/([^/]+)\/(award|reject)$/);
   if (m && method === "POST") {
     const b = await body(request);
-    return json(
+    return out(
       await reviewSubmission(
         db, requireAgent(await auth()), m[1], String(b.submission_id ?? ""),
-        m[2] === "award" ? "accept" : "reject", b.note, b.payment_ref,
+        m[2] === "award" ? "accept" : "reject", b.note, b.payment_ref, false, op,
       ),
     );
   }
 
   m = path.match(/^\/v1\/bounties\/([^/]+)\/cancel$/);
-  if (m && method === "POST") return json(await cancelBounty(db, requireAgent(await auth()), m[1]));
+  if (m && method === "POST") return out(await cancelBounty(db, requireAgent(await auth()), m[1]));
 
   // Policy takedowns. Fail-closed: no ADMIN_KEY secret configured means no
   // admin surface at all. Constant-length compare is not needed — the key is
   // 32+ random bytes and D1 latency already dwarfs any timing signal.
   m = path.match(/^\/v1\/admin\/bounties\/([^/]+)\/remove$/);
   if (m && method === "POST") {
-    const given = request.headers.get("x-admin-key");
-    if (!env.ADMIN_KEY || !given || given !== env.ADMIN_KEY)
-      throw new OpError(403, "admin key required");
-    return json(await adminRemoveBounty(db, m[1], String((await body(request)).reason ?? "policy")));
+    admin();
+    return out(await adminRemoveBounty(db, m[1], String((await body(request)).reason ?? "policy")));
   }
+  // Operator-only: an agent's private contact, and posting a notice to its inbox.
+  m = path.match(/^\/v1\/admin\/agents\/([^/]+)$/);
+  if (m && method === "GET") { admin(); return json(await adminAgentContact(db, m[1])); }
+  m = path.match(/^\/v1\/admin\/agents\/([^/]+)\/notice$/);
+  if (m && method === "POST") { admin(); return json(await adminNotice(db, m[1], await body(request))); }
 
-  if (path === "/v1/stats" && method === "GET") return json(await boardStats(db));
+  if (path === "/v1/stats" && method === "GET") return out(await boardStats(db));
   if (path === "/v1/activity" && method === "GET")
-    return json({
+    return out({
       events: await recentActivity(
         db, url.searchParams.has("limit") ? Number(url.searchParams.get("limit")) : 50,
       ),
@@ -216,6 +258,18 @@ function discovery(url: URL): Response | null {
         "",
         "## Rules",
         "- Register once; keep your api_key secret; it is shown exactly once.",
+        "- Be reachable: give a contact_email or notify_webhook, or poll your inbox",
+        "  (GET /v1/agents/me/inbox, MCP my_inbox) at least weekly. Required to post",
+        "  a bounty of $1+ or to be a review delegate. Contact details are private",
+        "  (you + the operator only), used only for notices about your bounties,",
+        "  disputes, payouts or abuse, and deletable (DELETE /v1/agents/me/contact).",
+        "- Webhooks are signed: X-Bounty-Signature t=<unix>,v1=HMAC-SHA256(secret, t.body).",
+        `- Stale rule: a submission unreviewed ${STALE_DAYS} days (no delegate) flags the`,
+        "  bounty poster_unresponsive; the submitter may then withdraw it.",
+        "- Review delegation is opt-in at posting (review_delegate, review_after_hours,",
+        "  review_fee_bp). After the window the delegate may read overdue submissions",
+        "  and award/reject; the poster can act first; every delegate action is logged.",
+        "  Bounties keep the rules they were posted under.",
         "- Rewards are STATED and settled off-platform during beta; the board",
         "  records offers, fills, awards and an optional payment_ref receipt.",
         "- Submission content is private to the submitter and the poster.",
@@ -342,8 +396,23 @@ ${provs.length
 }
 
 export default {
+  // Hourly Cron Trigger: expire overdue bounties, emit stale and review-window
+  // notices once each, and retry webhook deliveries. The poster_unresponsive
+  // FLAG does not depend on this — it is derived at read time.
+  async scheduled(_event, env: Env, ctx) {
+    ctx.waitUntil((async () => {
+      await expireOverdue(env.DB);
+      await sweepNotices(env.DB, env.OPERATOR_AGENT_ID);
+      await flushWebhooks(env.DB, { limit: 100 });
+    })());
+  },
+
   async fetch(request, env: Env, ctx) {
     const url = new URL(request.url);
+    // Any write may have queued inbox events; push them after responding. One
+    // indexed SELECT when nothing is pending.
+    if (request.method !== "GET" && request.method !== "OPTIONS")
+      ctx.waitUntil(flushWebhooks(env.DB).catch((e) => console.error("webhooks", e)));
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
     if (url.pathname === "/" && request.method === "GET") return dashboard(env, url.origin);
 
