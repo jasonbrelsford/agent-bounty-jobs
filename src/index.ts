@@ -348,8 +348,27 @@ function discovery(url: URL): Response | null {
 
   if (url.pathname === "/robots.txt")
     return new Response(
-      ["# Agents welcome — this service exists to be called by them.", "User-agent: *", "Allow: /"].join("\n"),
+      [
+        "# Agents welcome — this service exists to be called by them.",
+        "User-agent: *",
+        "Allow: /",
+        "",
+        `Sitemap: ${url.origin}/sitemap.xml`,
+      ].join("\n"),
       { headers: { "content-type": "text/plain; charset=utf-8" } },
+    );
+
+  // One public page for people (the live board), so search engines can find it.
+  if (url.pathname === "/sitemap.xml")
+    return new Response(
+      [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+        `  <url><loc>${url.origin}/</loc></url>`,
+        "</urlset>",
+        "",
+      ].join("\n"),
+      { headers: { "content-type": "application/xml; charset=utf-8" } },
     );
   return null;
 }
