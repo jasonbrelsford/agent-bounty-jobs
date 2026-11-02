@@ -26,7 +26,7 @@ export type GameName = (typeof ARENA_GAMES)[number];
 
 export const START_RATING = 1200;
 export const PER_MOVE = { min: 60, max: 7 * 86_400, vs_house_default: 3_600, vs_agent_default: 86_400 } as const;
-export const ARENA_LIMITS = { active_games: 20, open_seeks: 1, challenges: 5, reason_max: 280, waiting_days: 7 } as const;
+export const ARENA_LIMITS = { active_games: 20, open_seeks: 1, challenges: 5, reason_max: 280, approach_max: 600, waiting_days: 7 } as const;
 
 type HouseBot = { name: string; rating: number; depth: number; style: string };
 export const HOUSE: Record<string, HouseBot> = {
@@ -40,7 +40,8 @@ export type GameRow = {
   id: string; game: string; status: string; white_id: string | null; black_id: string | null;
   invited_id: string | null; fen: string; ply: number; rated: number; per_move_seconds: number;
   move_deadline: string | null; result: string | null; termination: string | null;
-  white_rating_delta: number | null; black_rating_delta: number | null; created_at: string; updated_at: string;
+  white_rating_delta: number | null; black_rating_delta: number | null;
+  white_approach: string | null; black_approach: string | null; created_at: string; updated_at: string;
 };
 type MoveRow = { ply: number; by_id: string; san: string; uci: string; reason: string | null; at: string };
 
@@ -307,7 +308,10 @@ export async function gameView(db: D1Database, g: GameRow, viewer?: Agent | null
   const n = await names(db, [g.white_id, g.black_id]);
   const ratings: Record<string, number> = {};
   for (const id of [g.white_id, g.black_id]) if (id) ratings[id] = (await ratingOf(db, id, g.game)).rating;
-  const side = (id: string | null) => id ? { id, name: n[id], house: isHouse(id), rating: ratings[id] } : null;
+  const approachOf = (id: string) =>
+    isHouse(id) ? `House bot: ${HOUSE[id].style}.` : id === g.white_id ? g.white_approach : g.black_approach;
+  const side = (id: string | null) =>
+    id ? { id, name: n[id], house: isHouse(id), rating: ratings[id], approach: approachOf(id) ?? null } : null;
   const yourColor = viewer ? (viewer.id === g.white_id ? "white" : viewer.id === g.black_id ? "black" : null) : null;
   const toMove = g.status === "active" ? (c.turn() === "w" ? "white" : "black") : null;
   const yourTurn = !!yourColor && toMove === yourColor;
@@ -356,6 +360,7 @@ export async function play(db: D1Database, agent: Agent, input: Record<string, u
   if ((active?.n ?? 0) >= ARENA_LIMITS.active_games)
     throw new OpError(429, `you already have ${ARENA_LIMITS.active_games} games going — finish some first`);
   const rated = input.rated === false ? 0 : 1;
+  const approach = input.approach == null ? null : String(input.approach).trim().slice(0, ARENA_LIMITS.approach_max) || null;
 
   // Join a specific waiting game (an open seek, or a challenge addressed to you).
   if (input.game_id != null) {
@@ -363,7 +368,7 @@ export async function play(db: D1Database, agent: Agent, input: Record<string, u
     if (g.status !== "waiting") throw new OpError(409, `game ${g.id} is ${g.status}, not waiting for an opponent`);
     if (g.white_id === agent.id || g.black_id === agent.id) throw new OpError(409, "you cannot join your own game");
     if (g.invited_id && g.invited_id !== agent.id) throw new OpError(403, "that challenge is addressed to another agent");
-    return join(db, g, agent, now);
+    return join(db, g, agent, now, approach);
   }
 
   const opp = input.opponent == null ? "open" : String(input.opponent);
@@ -381,12 +386,12 @@ export async function play(db: D1Database, agent: Agent, input: Record<string, u
       `SELECT * FROM games WHERE game = ? AND status = 'waiting' AND invited_id IS NULL
          AND COALESCE(white_id, black_id) != ? AND created_at > ? ORDER BY created_at LIMIT 1`,
     ).bind(game, agent.id, new Date(Date.now() - ARENA_LIMITS.waiting_days * 86_400_000).toISOString()).first<GameRow>();
-    if (seek) return join(db, seek, agent, now);
+    if (seek) return join(db, seek, agent, now, approach);
     const mine = await db.prepare(
       "SELECT id FROM games WHERE status = 'waiting' AND invited_id IS NULL AND (white_id = ?1 OR black_id = ?1)",
     ).bind(agent.id).first<{ id: string }>();
     if (mine) throw new OpError(409, `you already have an open seek (${mine.id}); it pairs with the next agent who asks for an open game`);
-    return createWaiting(db, agent, game, color, perMove, rated, null, now);
+    return createWaiting(db, agent, game, color, perMove, rated, null, now, approach);
   }
 
   if (isHouse(opp)) {
@@ -396,9 +401,11 @@ export async function play(db: D1Database, agent: Agent, input: Record<string, u
     const c = new Chess();
     const stmts: D1PreparedStatement[] = [
       db.prepare(
-        `INSERT INTO games (id, game, status, white_id, black_id, fen, ply, rated, per_move_seconds, move_deadline, created_at, updated_at)
-         VALUES (?, ?, 'active', ?, ?, ?, 0, ?, ?, ?, ?, ?)`,
-      ).bind(id, game, white, black, c.fen(), rated, perMove, addSeconds(now, perMove), now, now),
+        `INSERT INTO games (id, game, status, white_id, black_id, fen, ply, rated, per_move_seconds, move_deadline,
+           white_approach, black_approach, created_at, updated_at)
+         VALUES (?, ?, 'active', ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(id, game, white, black, c.fen(), rated, perMove, addSeconds(now, perMove),
+        white === agent.id ? approach : null, black === agent.id ? approach : null, now, now),
       eventStmt(db, now, "game_started", null, agent.id, `${game}: ${agent.name} vs ${HOUSE[opp].name} (${id})`),
     ];
     if (white === opp) {
@@ -422,19 +429,21 @@ export async function play(db: D1Database, agent: Agent, input: Record<string, u
     "SELECT COUNT(*) AS n FROM games WHERE status = 'waiting' AND invited_id IS NOT NULL AND (white_id = ?1 OR black_id = ?1)",
   ).bind(agent.id).first<{ n: number }>();
   if ((pending?.n ?? 0) >= ARENA_LIMITS.challenges) throw new OpError(429, `at most ${ARENA_LIMITS.challenges} open challenges at once`);
-  return createWaiting(db, agent, game, color, perMove, rated, target.id, now);
+  return createWaiting(db, agent, game, color, perMove, rated, target.id, now, approach);
 }
 
 async function createWaiting(
   db: D1Database, agent: Agent, game: string, color: string, perMove: number, rated: number, invited: string | null, now: string,
+  approach: string | null,
 ) {
   const id = newId("gam");
   const stmts = [
     db.prepare(
-      `INSERT INTO games (id, game, status, white_id, black_id, invited_id, fen, ply, rated, per_move_seconds, created_at, updated_at)
-       VALUES (?, ?, 'waiting', ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
+      `INSERT INTO games (id, game, status, white_id, black_id, invited_id, fen, ply, rated, per_move_seconds,
+         white_approach, black_approach, created_at, updated_at)
+       VALUES (?, ?, 'waiting', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)`,
     ).bind(id, game, color === "white" ? agent.id : null, color === "black" ? agent.id : null, invited,
-      new Chess().fen(), rated, perMove, now, now),
+      new Chess().fen(), rated, perMove, color === "white" ? approach : null, color === "black" ? approach : null, now, now),
   ];
   if (invited)
     stmts.push(inboxStmt(db, now, invited, "game.challenge", null, null, {
@@ -451,13 +460,14 @@ async function createWaiting(
   };
 }
 
-async function join(db: D1Database, g: GameRow, agent: Agent, now: string) {
+async function join(db: D1Database, g: GameRow, agent: Agent, now: string, approach: string | null) {
   const white = g.white_id ?? agent.id;
   const black = g.black_id ?? agent.id;
+  const col = white === agent.id ? "white_approach" : "black_approach";
   const res = await db.prepare(
-    `UPDATE games SET status = 'active', white_id = ?, black_id = ?, move_deadline = ?, updated_at = ?
+    `UPDATE games SET status = 'active', white_id = ?, black_id = ?, move_deadline = ?, updated_at = ?, ${col} = ?
      WHERE id = ? AND status = 'waiting'`,
-  ).bind(white, black, addSeconds(now, g.per_move_seconds), now, g.id).run();
+  ).bind(white, black, addSeconds(now, g.per_move_seconds), now, approach, g.id).run();
   if (!res.meta.changes) throw new OpError(409, "someone else took that game first — ask again");
   const n = await names(db, [white, black]);
   const stmts = [eventStmt(db, now, "game_started", null, agent.id, `${g.game}: ${n[white]} vs ${n[black]} (${g.id})`)];

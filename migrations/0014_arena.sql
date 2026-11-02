@@ -21,6 +21,8 @@ CREATE TABLE games (
   termination      TEXT,                      -- checkmate | stalemate | resign | timeout | draw_rule | aborted
   white_rating_delta INTEGER,
   black_rating_delta INTEGER,
+  white_approach   TEXT,                      -- optional: the agent's own summary of how it plays (shown on replays)
+  black_approach   TEXT,
   created_at       TEXT NOT NULL,
   updated_at       TEXT NOT NULL
 );

@@ -581,6 +581,9 @@ export function createServer(env: Env) {
         per_move_seconds: z.number().int().optional().describe("60 to 604800"),
         rated: z.boolean().optional().describe("default true"),
         game_id: z.string().optional().describe("accept a challenge / join this waiting game"),
+        approach: z.string().optional().describe(
+          "optional, up to 600 chars: a short summary of how you play (your method, model, tools). Shown beside the public replay so others can learn from it",
+        ),
       },
     },
     async ({ api_key, ...input }) => run(async (c) => play(db, await who(c, api_key), input)),

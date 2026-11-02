@@ -10,6 +10,7 @@ import {
   houseMove, scoreMoves, eloDelta, START_RATING,
 } from "../.test-build/arena.js";
 import { publicEvents } from "../.test-build/livefeed.js";
+import { gamePage } from "../.test-build/arenapage.js";
 
 async function agent(db, name) {
   const r = await registerAgent(db, name, { contact_email: `${name}@example.com` });
@@ -190,4 +191,39 @@ test("engine: finds mate in one and the house bots get stronger with depth", () 
   // Elo sanity: beating a much stronger player gains more than beating a weaker one.
   assert.ok(eloDelta(1200, 1600, 1, 20) > eloDelta(1200, 800, 1, 20));
   assert.equal(eloDelta(1200, 1200, 0.5, 20), 0);
+});
+
+test("approach: each agent's summary of how it plays is shown with the game, and house bots describe themselves", async () => {
+  const db = makeD1();
+  const a = await agent(db, "explains-itself");
+  const b = await agent(db, "quiet-one");
+  const seek = await play(db, a, { color: "white", approach: "  Two-ply search with a blunder check. ".repeat(40) });
+  const g = await play(db, b, { game_id: seek.id });
+  assert.equal(g.white.approach.length, 600, "trimmed to the limit");
+  assert.match(g.white.approach, /^Two-ply search/);
+  assert.equal(g.black.approach, null);
+  const h = await play(db, b, { opponent: "house_knight", color: "white", approach: "random mover" });
+  assert.equal(h.white.approach, "random mover");
+  assert.match(h.black.approach, /^House bot: /);
+});
+
+test("replay page: every position, reasons and coach flags are embedded, and caller text cannot break out", async () => {
+  const db = makeD1();
+  const w = await agent(db, "replay-white");
+  const bl = await agent(db, "replay-black");
+  const g = await play(db, w, { color: "white", approach: "<img src=x onerror=alert(1)>" });
+  await play(db, bl, { game_id: g.id });
+  await makeMove(db, w, g.id, { move: "f3", reason: "</script><script>alert(1)</script>" });
+  await makeMove(db, bl, g.id, { move: "e5" });
+  await makeMove(db, w, g.id, { move: "g4" });
+  await makeMove(db, bl, g.id, { move: "Qh4#", reason: "mate" });
+  const html = await (await gamePage({ DB: db }, g.id)).text();
+  assert.ok(!html.includes("<img src=x"), "approach is escaped");
+  assert.equal(html.split("</script>").length - 1, 2, "only the page's own two script tags close");
+  const json = JSON.parse(html.match(/<script type="application\/json" id="replay">([\s\S]*?)<\/script>/)[1]);
+  assert.equal(json.plies.length, 5, "start position plus four moves");
+  assert.equal(json.plies[1].reason, "</script><script>alert(1)</script>");
+  assert.equal(json.plies[3].flag.kind, "allowed_mate");
+  assert.equal(json.plies[4].who, "replay-black");
+  assert.match(html, /What the coach told each agent/);
 });
