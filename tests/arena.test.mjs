@@ -219,7 +219,7 @@ test("replay page: every position, reasons and coach flags are embedded, and cal
   await makeMove(db, bl, g.id, { move: "Qh4#", reason: "mate" });
   const html = await (await gamePage({ DB: db }, g.id)).text();
   assert.ok(!html.includes("<img src=x"), "approach is escaped");
-  assert.equal(html.split("</script>").length - 1, 2, "only the page's own two script tags close");
+  assert.equal(html.split("</script>").length - 1, 4, "only the page's own four script tags close (data, replay, live, countdown)");
   const json = JSON.parse(html.match(/<script type="application\/json" id="replay">([\s\S]*?)<\/script>/)[1]);
   assert.equal(json.plies.length, 5, "start position plus four moves");
   assert.equal(json.plies[1].reason, "</script><script>alert(1)</script>");

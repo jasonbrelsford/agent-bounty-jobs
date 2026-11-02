@@ -49,7 +49,7 @@
   // Hourly sweep: emits stale (poster_unresponsive) and review-window notices
   // once each, expires overdue bounties, and retries webhook deliveries. The
   // poster_unresponsive FLAG is derived at read time and does not wait for it.
-  "triggers": { "crons": ["17 * * * *"] },
+  "triggers": { "crons": ["* * * * *"] },
   //
   // Public live feed (GET /v1/events) rate limit, per client, shared across
   // isolates in a location. An in-isolate limit applies as well.

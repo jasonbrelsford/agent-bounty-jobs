@@ -41,7 +41,8 @@ export type GameRow = {
   invited_id: string | null; fen: string; ply: number; rated: number; per_move_seconds: number;
   move_deadline: string | null; result: string | null; termination: string | null;
   white_rating_delta: number | null; black_rating_delta: number | null;
-  white_approach: string | null; black_approach: string | null; created_at: string; updated_at: string;
+  white_approach: string | null; black_approach: string | null;
+  tournament_id?: string | null; round?: number | null; created_at: string; updated_at: string;
 };
 type MoveRow = { ply: number; by_id: string; san: string; uci: string; reason: string | null; at: string };
 
@@ -187,7 +188,7 @@ function outcome(c: Chess): { result: string; termination: string } | null {
 
 const toMoveId = (g: GameRow, c: Chess) => (c.turn() === "w" ? g.white_id : g.black_id);
 
-async function names(db: D1Database, ids: (string | null)[]): Promise<Record<string, string>> {
+export async function names(db: D1Database, ids: (string | null)[]): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
   for (const id of ids) {
     if (!id || out[id]) continue;
@@ -195,6 +196,19 @@ async function names(db: D1Database, ids: (string | null)[]): Promise<Record<str
     else {
       const r = await db.prepare("SELECT name FROM agents WHERE id = ?").bind(id).first<{ name: string }>();
       out[id] = r?.name ?? id;
+    }
+  }
+  return out;
+}
+
+async function kinds(db: D1Database, ids: (string | null)[]): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  for (const id of ids) {
+    if (!id || out[id]) continue;
+    if (isHouse(id)) out[id] = "house";
+    else {
+      const r = await db.prepare("SELECT kind FROM agents WHERE id = ?").bind(id).first<{ kind: string }>();
+      out[id] = r?.kind ?? "agent";
     }
   }
   return out;
@@ -214,7 +228,7 @@ export function eloDelta(rating: number, opp: number, score: number, games: numb
   return Math.round(k * (score - expected));
 }
 
-async function getRow(db: D1Database, id: string): Promise<GameRow> {
+export async function getRow(db: D1Database, id: string): Promise<GameRow> {
   const g = await db.prepare("SELECT * FROM games WHERE id = ?").bind(id).first<GameRow>();
   if (!g) throw new OpError(404, `no game ${id}`);
   return g;
@@ -228,14 +242,14 @@ const movesOf = async (db: D1Database, id: string) =>
  * Statements that finish a game: result, rating changes, a feed event and an
  * inbox note to each agent. Returned, not run, so they join the caller's batch.
  */
-async function finishStmts(
+export async function finishStmts(
   db: D1Database, g: GameRow, at: string, result: string, termination: string, expectPly: number,
 ): Promise<D1PreparedStatement[]> {
   const stmts: D1PreparedStatement[] = [];
   const w = g.white_id!, b = g.black_id!;
   const ws = result === "1-0" ? 1 : result === "0-1" ? 0 : 0.5;
   let dw: number | null = null, db_: number | null = null;
-  const rated = g.rated === 1 && termination !== "aborted";
+  const rated = g.rated === 1 && termination !== "aborted" && termination !== "forfeit";
   if (rated) {
     const [rw, rb] = [await ratingOf(db, w, g.game), await ratingOf(db, b, g.game)];
     if (!isHouse(w)) dw = eloDelta(rw.rating, rb.rating, ws, rw.games);
@@ -272,7 +286,7 @@ async function finishStmts(
  * Lazy clock: a game whose side to move ran out of time is settled on read.
  * Fewer than two moves played = aborted and unrated (nobody really started).
  */
-async function settleClock(db: D1Database, g: GameRow): Promise<GameRow> {
+export async function settleClock(db: D1Database, g: GameRow): Promise<GameRow> {
   const now = nowIso();
   if (g.status === "waiting" && Date.parse(g.created_at) < Date.now() - ARENA_LIMITS.waiting_days * 86_400_000) {
     await db.prepare("UPDATE games SET status = 'aborted', termination = 'no_opponent', updated_at = ? WHERE id = ? AND status = 'waiting'")
@@ -282,7 +296,10 @@ async function settleClock(db: D1Database, g: GameRow): Promise<GameRow> {
   if (g.status !== "active" || !g.move_deadline || g.move_deadline > now) return g;
   const c = new Chess(g.fen);
   const loserIsWhite = c.turn() === "w";
-  const stmts = g.ply < 2
+  // In a tournament a no-show loses the game (unrated); elsewhere it just aborts.
+  const stmts = g.ply < 2 && g.tournament_id
+    ? await finishStmts(db, g, now, loserIsWhite ? "0-1" : "1-0", "forfeit", g.ply)
+    : g.ply < 2
     ? await finishStmts(db, g, now, "1/2-1/2", "aborted", g.ply)
     : await finishStmts(db, g, now, loserIsWhite ? "0-1" : "1-0", "timeout", g.ply);
   await db.batch(stmts);
@@ -306,12 +323,13 @@ export async function gameView(db: D1Database, g: GameRow, viewer?: Agent | null
   const ms = moves ?? await movesOf(db, g.id);
   const c = new Chess(g.fen);
   const n = await names(db, [g.white_id, g.black_id]);
+  const k = await kinds(db, [g.white_id, g.black_id]);
   const ratings: Record<string, number> = {};
   for (const id of [g.white_id, g.black_id]) if (id) ratings[id] = (await ratingOf(db, id, g.game)).rating;
   const approachOf = (id: string) =>
     isHouse(id) ? `House bot: ${HOUSE[id].style}.` : id === g.white_id ? g.white_approach : g.black_approach;
   const side = (id: string | null) =>
-    id ? { id, name: n[id], house: isHouse(id), rating: ratings[id], approach: approachOf(id) ?? null } : null;
+    id ? { id, name: n[id], house: isHouse(id), kind: k[id], rating: ratings[id], approach: approachOf(id) ?? null } : null;
   const yourColor = viewer ? (viewer.id === g.white_id ? "white" : viewer.id === g.black_id ? "black" : null) : null;
   const toMove = g.status === "active" ? (c.turn() === "w" ? "white" : "black") : null;
   const yourTurn = !!yourColor && toMove === yourColor;
@@ -332,6 +350,8 @@ export async function gameView(db: D1Database, g: GameRow, viewer?: Agent | null
     board: c.ascii(),
     in_check: g.status === "active" ? c.inCheck() : false,
     legal_moves: yourTurn ? c.moves() : undefined,
+    legal_uci: yourTurn ? c.moves({ verbose: true }).map(uciOf) : undefined,
+    tournament: g.tournament_id ? { id: g.tournament_id, round: g.round ?? null, page: `/arena/tournaments/${g.tournament_id}` } : null,
     last_move: ms.length ? { san: ms[ms.length - 1].san, uci: ms[ms.length - 1].uci } : null,
     moves: ms.map((m) => ({ ply: m.ply, san: m.san, uci: m.uci, by: m.by_id, reason: m.reason, at: m.at })),
     pgn: pgnMoves.trim() + (g.result ? ` ${g.result}` : ""),
@@ -557,7 +577,7 @@ export async function myGames(db: D1Database, agent: Agent, status?: unknown) {
   const out = [];
   for (const r of rows) out.push(await gameView(db, await settleClock(db, r), agent));
   return {
-    games: out.map(({ moves, board, legal_moves, ...rest }) => ({ ...rest, moves_played: moves.length })),
+    games: out.map(({ moves, board, legal_moves, legal_uci, ...rest }) => ({ ...rest, moves_played: moves.length })),
     your_turn_in: out.filter((g) => g.your_turn).map((g) => g.id),
     challenges_for_you: out.filter((g) => g.status === "waiting" && g.invited_id === agent.id).map((g) => g.id),
   };
@@ -570,7 +590,7 @@ export async function listGames(db: D1Database, status?: unknown, limit = 20) {
     .bind(s, Math.min(Math.max(1, limit), 50)).all<GameRow>()).results;
   const out = [];
   for (const r of rows) {
-    const { moves, legal_moves, ...rest } = await gameView(db, r);
+    const { moves, legal_moves, legal_uci, ...rest } = await gameView(db, r);
     out.push({ ...rest, moves_played: moves.length });
   }
   return { games: out };
@@ -579,9 +599,9 @@ export async function listGames(db: D1Database, status?: unknown, limit = 20) {
 export async function leaderboard(db: D1Database, game = "chess") {
   gameName(game);
   const rows = (await db.prepare(
-    `SELECT r.agent_id, a.name, r.rating, r.games, r.wins, r.losses, r.draws
+    `SELECT r.agent_id, a.name, a.kind, r.rating, r.games, r.wins, r.losses, r.draws
      FROM ratings r JOIN agents a ON a.id = r.agent_id WHERE r.game = ? ORDER BY r.rating DESC LIMIT 50`,
-  ).bind(game).all<{ agent_id: string; name: string; rating: number; games: number; wins: number; losses: number; draws: number }>()).results;
+  ).bind(game).all<{ agent_id: string; name: string; kind: string; rating: number; games: number; wins: number; losses: number; draws: number }>()).results;
   const totals = await db.prepare(
     "SELECT COUNT(*) AS games, SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS live FROM games WHERE game = ?",
   ).bind(game).first<{ games: number; live: number | null }>();

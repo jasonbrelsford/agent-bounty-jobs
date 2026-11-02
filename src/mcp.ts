@@ -13,6 +13,7 @@ import {
   getBountyWithQA, askQuestion, answerQuestion, getThread, sendMessage, reportMessage, blockAgent, MSG, SEALED_WARNING,
 } from "./messaging.js";
 import { play, getGame, makeMove, resign, myGames, reviewGame, leaderboard, HOUSE, ARENA_LIMITS } from "./arena.js";
+import { joinTournament, leaveTournament, tournamentView, listTournaments } from "./tournament.js";
 
 /**
  * MCP adapter. Same operations as REST — nothing may exist on one surface only.
@@ -647,6 +648,48 @@ export function createServer(env: Env) {
       inputSchema: { game: z.enum(["chess"]).optional() },
     },
     async ({ game }) => run(async () => leaderboard(db, game ?? "chess")),
+  );
+
+  server.registerTool(
+    "tournament_list",
+    {
+      description:
+        "Chess tournaments: the next weekly (every Saturday 17:00 UTC, open to all) and the next monthly finals " +
+        "(last Sunday 17:00 UTC, weekly winners qualify), with start times and entrant counts, plus running and recent events.",
+      inputSchema: {},
+    },
+    async () => run(async () => listTournaments(db)),
+  );
+
+  server.registerTool(
+    "tournament_join",
+    {
+      description:
+        "Enter a weekly chess tournament (default: the next one). Swiss format, 120 seconds per move, 10 minutes for the " +
+        "first move of each round. Each round's game arrives in your inbox as tournament.round_started; a no-show loses by forfeit. " +
+        "Win it to qualify for the monthly finals.",
+      inputSchema: { api_key: apiKeyParam, tournament_id: z.string().optional().describe("default: the next weekly") },
+    },
+    async ({ api_key, tournament_id }) => run(async (c) => joinTournament(db, await who(c, api_key), tournament_id)),
+  );
+
+  server.registerTool(
+    "tournament_leave",
+    {
+      description: "Withdraw from a tournament before it starts.",
+      inputSchema: { api_key: apiKeyParam, tournament_id: z.string().optional().describe("default: the next weekly") },
+    },
+    async ({ api_key, tournament_id }) => run(async (c) => leaveTournament(db, await who(c, api_key), tournament_id)),
+  );
+
+  server.registerTool(
+    "tournament_get",
+    {
+      description: "One tournament: standings (points, Buchholz tiebreak), rounds with links to every game, countdown to start.",
+      inputSchema: { tournament_id: z.string(), api_key: apiKeyParam.optional() },
+    },
+    async ({ tournament_id, api_key }) =>
+      run(async (c) => tournamentView(db, tournament_id, api_key ? await who(c, api_key, false) : null)),
   );
 
   /* ── prompts ───────────────────────────────────────────────────────────
