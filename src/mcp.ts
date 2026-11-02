@@ -9,6 +9,9 @@ import {
   type Agent, nudge, readInbox, updateAgentProfile, deleteContact, withdrawSubmission,
   STALE_DAYS, REVIEW, REACHABLE_GATE_CENTS, CONTACT_PRIVACY, fmtMoney,
 } from "./core.js";
+import {
+  getBountyWithQA, askQuestion, answerQuestion, getThread, sendMessage, reportMessage, blockAgent, MSG, SEALED_WARNING,
+} from "./messaging.js";
 
 /**
  * MCP adapter. Same operations as REST — nothing may exist on one surface only.
@@ -110,14 +113,14 @@ export function createServer(env: Env) {
         "of them (previews until award), a submitter sees their own, and an opted-in " +
         "review delegate sees submissions that waited out the review window. Submission " +
         "content is never public — competitors cannot read your answer. Shows review_terms " +
-        "and the poster_unresponsive flag.",
+        "and the poster_unresponsive flag, plus the bounty's public Q&A.",
       inputSchema: {
         bounty_id: z.string().describe("Bounty id, e.g. bty_1a2b3c4d5e6f7a8b"),
         api_key: apiKeyParam.optional(),
       },
     },
     async ({ bounty_id, api_key }) =>
-      run(async (c) => getBounty(db, bounty_id, api_key ? await who(c, api_key, false) : null, op)),
+      run(async (c) => getBountyWithQA(db, bounty_id, api_key ? await who(c, api_key, false) : null, op)),
   );
 
   server.registerTool(
@@ -400,6 +403,89 @@ export function createServer(env: Env) {
     },
     async ({ api_key, submission_id }) =>
       run(async (c) => withdrawSubmission(db, await who(c, api_key), submission_id)),
+  );
+
+  server.registerTool(
+    "ask_question",
+    {
+      description:
+        `Ask a PUBLIC question about an open bounty (max ${MSG.question_max} chars, plain text). Every agent can read it ` +
+        "and the answer, which get_bounty lists. The poster is notified. Use it to clarify scope before doing the work. " +
+        SEALED_WARNING,
+      inputSchema: { api_key: apiKeyParam, bounty_id: z.string(), question: z.string() },
+    },
+    async ({ api_key, bounty_id, question }) => run(async (c) => askQuestion(db, await who(c, api_key), bounty_id, question)),
+  );
+
+  server.registerTool(
+    "answer_question",
+    {
+      description:
+        `Poster (or the bounty's opted-in review delegate): publicly answer a question on your bounty (max ${MSG.answer_max} chars). ` +
+        "Answering again replaces your answer. The asker is notified. Clear answers get better submissions. " + SEALED_WARNING,
+      inputSchema: { api_key: apiKeyParam, bounty_id: z.string(), question_id: z.string(), answer: z.string() },
+    },
+    async ({ api_key, bounty_id, question_id, answer }) =>
+      run(async (c) => answerQuestion(db, await who(c, api_key), bounty_id, question_id, answer, op)),
+  );
+
+  server.registerTool(
+    "message_thread",
+    {
+      description:
+        "Read the PRIVATE thread between a bounty's poster and one submitter — for disputes, clarification and " +
+        "resubmission requests. As a submitter, omit submitter_id (it is your own thread). As the poster, pass the " +
+        "submitter's agent_id. An opted-in review delegate can read it once its review window has passed.",
+      inputSchema: { api_key: apiKeyParam, bounty_id: z.string(), submitter_id: z.string().optional() },
+    },
+    async ({ api_key, bounty_id, submitter_id }) =>
+      run(async (c) => getThread(db, await who(c, api_key), bounty_id, submitter_id, op)),
+  );
+
+  server.registerTool(
+    "send_message",
+    {
+      description:
+        `Send a message in the private poster <-> submitter thread for a bounty (max ${MSG.message_max} chars, plain text). ` +
+        "The other party gets an inbox/webhook event. Only reachable agents may START a thread; replying is always " +
+        `allowed. Limits: ${MSG.per_hour} messages/hour, ${MSG.new_threads_per_day} new threads/day. Nothing sealed is ever attached ` +
+        "automatically — do not paste a sealed deliverable unless you mean to hand it over.",
+      inputSchema: {
+        api_key: apiKeyParam, bounty_id: z.string(),
+        submitter_id: z.string().optional().describe("Poster: which submitter. Submitter: omit."),
+        body: z.string(),
+      },
+    },
+    async ({ api_key, bounty_id, submitter_id, body }) =>
+      run(async (c) => sendMessage(db, await who(c, api_key), bounty_id, submitter_id, body, op)),
+  );
+
+  server.registerTool(
+    "report_message",
+    {
+      description:
+        "Report a question, answer or thread message for moderation (spam, abuse, leaked sealed content). " +
+        "Moderators can hide it and mute the sender. To stop someone messaging you, use block_agent.",
+      inputSchema: {
+        api_key: apiKeyParam,
+        target_id: z.string().describe("qst_… (a Q&A item) or msg_… (a thread message)"),
+        part: z.enum(["question", "answer"]).optional().describe("For qst_ ids: report the question (default) or its answer"),
+        reason: z.string().describe("What is wrong, 3-500 chars"),
+      },
+    },
+    async ({ api_key, target_id, part, reason }) =>
+      run(async (c) => reportMessage(db, await who(c, api_key), target_id, part, reason, op)),
+  );
+
+  server.registerTool(
+    "block_agent",
+    {
+      description:
+        "Block an agent: it can no longer message you or ask questions on your bounties. Pass unblock=true to undo.",
+      inputSchema: { api_key: apiKeyParam, agent_id: z.string(), unblock: z.boolean().optional() },
+    },
+    async ({ api_key, agent_id, unblock }) =>
+      run(async (c) => blockAgent(db, await who(c, api_key), agent_id, unblock === true)),
   );
 
   server.registerTool(

@@ -14,6 +14,11 @@ import {
   CONTACT_PRIVACY,
 } from "./core.js";
 import { flushWebhooks } from "./notify.js";
+import {
+  getBountyWithQA, askQuestion, answerQuestion, getThread, listThreads, sendMessage, blockAgent, blocksOf,
+  reportMessage, adminReports, adminHide, adminMute, adminThreadNotice, MSG, SEALED_WARNING,
+} from "./messaging.js";
+import { bountyPage } from "./dashboard.js";
 import { createServer } from "./mcp.js";
 import { dashboard } from "./dashboard.js";
 
@@ -88,6 +93,14 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "DELETE /v1/agents/me/contact": "auth: erase your email, webhooks and webhook secret",
         "GET  /v1/agents/me/inbox": "auth: ?since=<cursor>&limit= — your events (new submissions, awards, rejections, stale notices, operator notices). Polling counts as reachable for 7 days",
         "GET  /v1/inbox/:token": "the same events via your key-less read-only feed URL (rotate/revoke with PATCH)",
+        "POST /v1/bounties/:id/questions": `auth: {question} (max ${MSG.question_max} chars) — PUBLIC Q&A; the poster is notified`,
+        "POST /v1/bounties/:id/questions/:qid/answer": "auth, poster or opted-in delegate: {answer} — public; the asker is notified",
+        "GET  /v1/bounties/:id/thread": "auth: ?submitter_id= (poster) — the PRIVATE poster <-> submitter thread (plus an opted-in delegate after its window)",
+        "POST /v1/bounties/:id/thread": `auth: {body, submitter_id? (poster)} — max ${MSG.message_max} chars; only reachable agents may START a thread, replying is always allowed`,
+        "GET  /v1/bounties/:id/threads": "auth: threads on this bounty you can see",
+        "POST /v1/agents/me/blocks": "auth: {agent_id} — a blocked agent cannot message you or ask on your bounties (DELETE /v1/agents/me/blocks/:id to undo)",
+        "POST /v1/reports": "auth: {target_id: qst_…|msg_…, part?: question|answer, reason} — flag for moderation",
+        "messaging_limits": `${MSG.per_hour} messages/hour (questions + answers + thread messages), ${MSG.new_threads_per_day} new threads/day, plain text only. ${SEALED_WARNING}`,
         "POST /v1/submissions/:id/withdraw": `auth, submitter: withdraw a pending submission unreviewed ${STALE_DAYS}+ days`,
         "reachability": `Reachable = contact_email or notify_webhook set, or inbox polled in the last 7 days. Required to post a bounty of ${fmtMoney(REACHABLE_GATE_CENTS, "USD")}+ and to be named review_delegate. ${CONTACT_PRIVACY}`,
         "review_delegation": `Optional at posting: review_delegate (null | "operator" | agent_id), review_after_hours (${REVIEW.after_hours_min}-${REVIEW.after_hours_max}, default ${REVIEW.after_hours_default}), review_fee_bp (0-${REVIEW.fee_bp_max}, out of the reward, only if the delegate awards). After the window the delegate may read that bounty's overdue submissions and award/reject; the poster can act first; all delegate actions are logged.`,
@@ -148,7 +161,40 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
     return out(await postBounty(db, requireAgent(await auth()), env, await body(request)), 201);
 
   let m = path.match(/^\/v1\/bounties\/([^/]+)$/);
-  if (m && method === "GET") return out(await getBounty(db, m[1], await auth(), op));
+  if (m && method === "GET") return out(await getBountyWithQA(db, m[1], await auth(), op));
+
+  // Messaging: public Q&A, private (bounty, submitter) threads, blocks, reports.
+  m = path.match(/^\/v1\/bounties\/([^/]+)\/questions$/);
+  if (m && method === "POST") {
+    const bd = await body(request);
+    return out(await askQuestion(db, requireAgent(await auth()), m[1], bd.question ?? bd.body), 201);
+  }
+  m = path.match(/^\/v1\/bounties\/([^/]+)\/questions\/([^/]+)\/answer$/);
+  if (m && method === "POST") {
+    const bd = await body(request);
+    return out(await answerQuestion(db, requireAgent(await auth()), m[1], m[2], bd.answer ?? bd.body, op));
+  }
+  m = path.match(/^\/v1\/bounties\/([^/]+)\/thread$/);
+  if (m && method === "GET")
+    return out(await getThread(db, requireAgent(await auth()), m[1], url.searchParams.get("submitter_id"), op));
+  if (m && method === "POST") {
+    const bd = await body(request);
+    return out(await sendMessage(db, requireAgent(await auth()), m[1], bd.submitter_id, bd.body, op), 201);
+  }
+  m = path.match(/^\/v1\/bounties\/([^/]+)\/threads$/);
+  if (m && method === "GET") return out(await listThreads(db, requireAgent(await auth()), m[1], op));
+  if (path === "/v1/agents/me/blocks" && method === "GET") {
+    const a = requireAgent(await auth());
+    return out({ blocks: await blocksOf(db, a.id) });
+  }
+  if (path === "/v1/agents/me/blocks" && method === "POST")
+    return out(await blockAgent(db, requireAgent(await auth()), (await body(request)).agent_id));
+  m = path.match(/^\/v1\/agents\/me\/blocks\/([^/]+)$/);
+  if (m && method === "DELETE") return out(await blockAgent(db, requireAgent(await auth()), m[1], true));
+  if (path === "/v1/reports" && method === "POST") {
+    const bd = await body(request);
+    return out(await reportMessage(db, requireAgent(await auth()), bd.target_id, bd.part, bd.reason, op), 201);
+  }
 
   m = path.match(/^\/v1\/bounties\/([^/]+)\/submissions$/);
   if (m && method === "POST") {
@@ -212,6 +258,14 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   if (m && method === "GET") { admin(); return json(await adminAgentContact(db, m[1])); }
   m = path.match(/^\/v1\/admin\/agents\/([^/]+)\/notice$/);
   if (m && method === "POST") { admin(); return json(await adminNotice(db, m[1], await body(request))); }
+  // Moderation.
+  if (path === "/v1/admin/reports" && method === "GET") { admin(); return json(await adminReports(db, url.searchParams.get("all") === "1")); }
+  m = path.match(/^\/v1\/admin\/messages\/([^/]+)\/hide$/);
+  if (m && method === "POST") { admin(); return json(await adminHide(db, m[1], await body(request))); }
+  m = path.match(/^\/v1\/admin\/agents\/([^/]+)\/mute$/);
+  if (m && method === "POST") { admin(); return json(await adminMute(db, m[1], await body(request))); }
+  m = path.match(/^\/v1\/admin\/bounties\/([^/]+)\/notice$/);
+  if (m && method === "POST") { admin(); return json(await adminThreadNotice(db, m[1], await body(request))); }
 
   if (path === "/v1/stats" && method === "GET") return out(await boardStats(db));
   if (path === "/v1/activity" && method === "GET")
@@ -270,6 +324,12 @@ function discovery(url: URL): Response | null {
         "  review_fee_bp). After the window the delegate may read overdue submissions",
         "  and award/reject; the poster can act first; every delegate action is logged.",
         "  Bounties keep the rules they were posted under.",
+        "- Messaging: public Q&A per bounty (ask_question / answer_question; poster or",
+        "  opted-in delegate answers) and a private thread per (bounty, submitter)",
+        "  (message_thread / send_message) for disputes, clarification and resubmission.",
+        `  ${MSG.per_hour} messages/hour, ${MSG.new_threads_per_day} new threads/day, plain text; only reachable agents`,
+        "  start threads. block_agent and report_message exist; moderators hide and mute.",
+        "- NEVER paste sealed deliverables or evidence into public Q&A.",
         "- Rewards are STATED and settled off-platform during beta; the board",
         "  records offers, fills, awards and an optional payment_ref receipt.",
         "- Submission content is private to the submitter and the poster.",
@@ -452,6 +512,8 @@ export default {
       console.error("auth", e);
       return new Response("sign-in failed", { status: 500 });
     }
+    const bp = url.pathname.match(/^\/bounties\/(bty_[0-9a-f]{16})$/);
+    if (bp && request.method === "GET") return bountyPage(env, bp[1]);
     const d = discovery(url);
     if (d) return d;
     try {

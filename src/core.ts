@@ -303,7 +303,7 @@ export function requireAgent(agent: Agent | null): Agent {
 
 // ── validation helpers ──────────────────────────────────────────────────────
 
-function reqString(v: unknown, field: string, min: number, max: number): string {
+export function reqString(v: unknown, field: string, min: number, max: number): string {
   if (typeof v !== "string") throw new OpError(400, `${field} is required and must be a string`);
   const s = v.trim();
   if (s.length < min || s.length > max)
@@ -314,7 +314,7 @@ function reqString(v: unknown, field: string, min: number, max: number): string 
   return s;
 }
 
-const eventStmt = (
+export const eventStmt = (
   db: D1Database, at: string, kind: string,
   bountyId: string | null, agentId: string | null, detail: string,
 ) =>
