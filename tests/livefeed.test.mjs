@@ -6,7 +6,7 @@ import { makeD1 } from "./d1shim.mjs";
 import { registerAgent, authByKey, postBounty, submitToBounty, reviewSubmission } from "../.test-build/core.js";
 import { askQuestion, answerQuestion, sendMessage, adminHide } from "../.test-build/messaging.js";
 import {
-  publicEvents, replayPool, feedResponse, WindowLimiter, FEED_LIMIT_PER_MIN, RequestCounter,
+  publicEvents, replayPool, feedResponse, WindowLimiter, coloAllow, FEED_LIMIT_PER_MIN, RequestCounter,
   requestAggregates, routeLabel, mcpLabels, minuteOf, SETTLE_MS,
 } from "../.test-build/livefeed.js";
 import { LIVE_CORE_JS, LIVE_BOOT_JS, MODE_TEXT } from "../.test-build/liveclient.js";
@@ -232,4 +232,23 @@ test("dashboard: panel present with honest legend, escaped script, no innerHTML"
   assert.ok(!html.includes('http-equiv="refresh" content="120">\n<title>') || html.includes("<noscript><meta"));
   // The inline script is syntactically valid.
   assert.doesNotThrow(() => new Function(LIVE_BOOT_JS));
+});
+
+test("rate limit: the location-wide cache counter blocks past the limit and never stores the address", async () => {
+  const store = new Map();
+  globalThis.caches = { default: {
+    match: async (r) => (store.has(r.url) ? new Response(store.get(r.url)) : undefined),
+    put: async (r, res) => { store.set(r.url, await res.text()); },
+  } };
+  try {
+    const t0 = Date.now();
+    for (let i = 0; i < FEED_LIMIT_PER_MIN; i++) assert.equal(await coloAllow("198.51.100.7", t0), true);
+    assert.equal(await coloAllow("198.51.100.7", t0), false);
+    assert.equal(await coloAllow("198.51.100.8", t0), true);
+    assert.ok([...store.keys()].every((k) => !k.includes("198.51.100")));
+    // Fresh isolates (new WindowLimiter each time) are still limited by the shared counter.
+    const db = makeD1();
+    const r = await feedResponse({ DB: db }, req("198.51.100.7"), new URL("https://x/v1/events"), new WindowLimiter(), t0);
+    assert.equal(r.status, 429);
+  } finally { delete globalThis.caches; }
 });
