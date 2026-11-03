@@ -325,7 +325,7 @@ $("signout").onclick=ev=>{ev.preventDefault();save(null);me=null;cur=null;gv=nul
 document.querySelectorAll("[data-opp]").forEach(b=>b.onclick=()=>start({opponent:b.dataset.opp}));
 $("chal").onsubmit=ev=>{ev.preventDefault();const v=$("oppid").value.trim();if(v)start({opponent:v});};
 async function start(o){o.color=$("color").value;try{const g=await api("POST","/v1/arena/chess/play",o);
-msg(g.status==="waiting"?(g.invited_id?"Challenge sent. The game starts when they accept.":"Waiting for an opponent. Keep this page open and the game appears when someone joins."):"Game on.");
+msg(g.status==="waiting"?(g.invited_id?"Challenge sent. The game starts when they accept.":"Waiting for an opponent. Keep this page open and the game appears when someone joins. Want to play now? Cancel this and pick a house bot."):"Game on.");
 await openG(g.id);await games();}catch(e){msg(e.message,true);}}
 const opp=g=>(g.white&&me&&g.white.id===me.id)?g.black:g.white;
 async function games(){if(!me)return;let r;try{r=await api("GET","/v1/arena/chess/games/mine?status=current");}catch(e){return;}
@@ -352,7 +352,7 @@ else if(g.status==="waiting")t=g.invited_id?"Waiting for them to accept.":"Waiti
 else if(g.your_turn)t="Your move ("+g.your_color+")."+(g.move_deadline?" Time left: "+left(g.move_deadline):"");
 else t=(g.to_move||"")+" to move."+(g.move_deadline?" Their time left: "+left(g.move_deadline):"");$("gstatus").textContent=t;}
 function draw(){const g=gv;if(!g)return;$("game").hidden=false;$("gtitle").textContent=(g.white?g.white.name:"?")+" vs "+(g.black?g.black.name:"(open seat)");
-$("replay").href=g.page;$("resign").hidden=!(g.status==="active"&&g.your_color);$("resign").textContent="Resign";armed=false;status();
+$("replay").href=g.page;$("resign").hidden=!((g.status==="active"||g.status==="waiting")&&g.your_color);$("resign").textContent=g.status==="waiting"?"Cancel this game":"Resign";armed=false;status();
 const flip=g.your_color==="black",b=parse(g.fen),legal=g.your_turn?(g.legal_uci||[]):[],lm=g.last_move?[g.last_move.uci.slice(0,2),g.last_move.uci.slice(2,4)]:[];
 const pb=$("pb");pb.replaceChildren();for(let k=0;k<64;k++){const i=flip?63-k:k,sq=sqName(i),btn=document.createElement("button");btn.type="button";
 btn.className=((Math.floor(i/8)+i%8)%2?"d":"l")+(lm.includes(sq)?" lm":"");btn.textContent=G[b[i]]||"";btn.setAttribute("aria-label",sq+(b[i]?" "+b[i]:""));
@@ -363,7 +363,8 @@ if(sel){const opts=legal.filter(u=>u.slice(0,2)===sel&&u.slice(2,4)===sq);if(opt
 sel=legal.some(u=>u.slice(0,2)===sq)?sq:null;draw();}
 async function send(u){const b={move:u};const r=$("reason").value.trim();if(r)b.reason=r;gv.your_turn=false;sel=null;draw();
 try{await api("POST","/v1/arena/chess/games/"+cur+"/move",b);$("reason").value="";msg("");}catch(e){msg(e.message,true);}await reload();draw();games();}
-$("resign").onclick=async()=>{if(!armed){armed=true;$("resign").textContent="Click again to resign";return;}try{await api("POST","/v1/arena/chess/games/"+cur+"/resign");}catch(e){msg(e.message,true);}await reload();games();};
+$("resign").onclick=async()=>{if(gv&&gv.status==="waiting"){try{await api("POST","/v1/arena/chess/games/"+cur+"/resign");msg("Cancelled. Pick a house bot to play right away.");}catch(e){msg(e.message,true);}await reload();games();return;}
+if(!armed){armed=true;$("resign").textContent="Click again to resign";return;}try{await api("POST","/v1/arena/chess/games/"+cur+"/resign");}catch(e){msg(e.message,true);}await reload();games();};
 setInterval(()=>{if(!me)return;tick++;if(gv&&gv.status!=="finished"&&!(gv.your_turn))reload();else status();if(tick%4===0)games();if(tick%24===0)loadT();
 if(tour&&tour.status==="scheduled")$("tcd").textContent=left(tour.starts_at);else $("tcd").textContent=tour&&tour.status==="running"?"Live now":"";},2500);
 setInterval(()=>{if(tour&&tour.status==="scheduled")$("tcd").textContent=left(tour.starts_at);if(gv&&gv.status==="active")status();},1000);
