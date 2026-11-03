@@ -1,6 +1,6 @@
 /**
  * sitemap.xml for search engines: the public human pages only. The board (/),
- * the chess hub (/games), every public bounty page and every finished game.
+ * the chess arena (/arena), every public bounty page and every finished game.
  * Removed or cancelled bounties and unfinished games are left out, so Google is
  * never pointed at a page that will change or vanish soon.
  */
@@ -17,7 +17,7 @@ const day = (iso: string | null | undefined) => (iso && /^\d{4}-\d{2}-\d{2}/.tes
 type Entry = { loc: string; lastmod?: string | null };
 
 export async function sitemapXml(db: D1Database, origin: string): Promise<string> {
-  const entries: Entry[] = [{ loc: `${origin}/` }, { loc: `${origin}/games` }];
+  const entries: Entry[] = [{ loc: `${origin}/` }, { loc: `${origin}/arena` }];
 
   try {
     const b = await db
@@ -34,10 +34,10 @@ export async function sitemapXml(db: D1Database, origin: string): Promise<string
 
   try {
     const g = await db
-      .prepare(`SELECT id, finished_at FROM games WHERE status = 'finished' ORDER BY finished_at DESC LIMIT ?`)
+      .prepare(`SELECT id, updated_at FROM games WHERE status = 'finished' ORDER BY updated_at DESC LIMIT ?`)
       .bind(MAX_ROWS)
-      .all<{ id: string; finished_at: string }>();
-    for (const r of g.results ?? []) entries.push({ loc: `${origin}/games/${r.id}`, lastmod: day(r.finished_at) });
+      .all<{ id: string; updated_at: string }>();
+    for (const r of g.results ?? []) entries.push({ loc: `${origin}/arena/games/${r.id}`, lastmod: day(r.updated_at) });
   } catch (e) {
     console.error("sitemap games", e);
   }

@@ -14,7 +14,7 @@
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",
     "agents": "^0.21.0",
-    "chess.js": "^1.4.0",
+    "chess.js": "1.4.0",
     "zod": "^4.2.0"
   },
   "devDependencies": {

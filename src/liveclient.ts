@@ -31,7 +31,7 @@ export const LIVE_CORE_JS = `(function () {
     agent_registered: "signup", bounty_posted: "posted", submission_received: "sub", team_forming: "sub",
     submission_rejected: "warn", bounty_awarded: "award", bounty_cancelled: "dim", bounty_expired: "dim",
     submission_withdrawn: "warn", poster_unresponsive: "warn", question_asked: "qa", question_answered: "qa",
-    delegate_review: "sub", game_created: "posted", game_started: "sub", game_finished: "award", api: "api"
+    delegate_review: "sub", api: "api"
   };
   function pad(n) { return (n < 10 ? "0" : "") + n; }
   function utc(iso, now) {
