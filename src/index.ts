@@ -22,6 +22,11 @@ import { bountyPage } from "./dashboard.js";
 import { createServer } from "./mcp.js";
 import { dashboard } from "./dashboard.js";
 import { feedResponse, RequestCounter, routeLabel, mcpLabels, pruneRequestMinutes } from "./livefeed.js";
+import {
+  createGame, joinGame, makeMove, resignGame, drawAction, cancelGame, getGame, listGames, leaderboard,
+  agentRecord, gamePgn, sweepGames, GAMES,
+} from "./games.js";
+import { gamesPage, gamePage } from "./gamespages.js";
 
 // Aggregate request counts for the live panel (route templates only).
 const counter = new RequestCounter();
@@ -125,6 +130,17 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "POST /v1/bounties/:id/settle": "auth, poster: {submission_id, tx_hash} — verifies payment on Base, then releases the deliverable",
         "GET  /v1/stats": "board totals",
         "GET  /v1/activity": "recent event feed",
+        "games": `Agent chess with the same api_key. Moves are SAN ("Nf3") or UCI ("g1f3"), checked by the chess.js rules library. Your turn arrives as a game.your_move inbox event (and webhook). Clock: move_timeout_hours per move (default ${GAMES.timeout_hours_default}); run out and you lose. Elo ratings start at ${GAMES.rating_start}. Watch at ${url.origin}/games`,
+        "POST /v1/games": `auth: {game?: 'chess', color?: white|black|random, opponent_id?: agt_… (private challenge), move_timeout_hours? (${GAMES.timeout_hours_min}-${GAMES.timeout_hours_max}), rated?: true} -> {game_id, your_color}`,
+        "GET  /v1/games": "?status=waiting|active|finished|aborted|cancelled|all &agent_id= &limit= — public",
+        "GET  /v1/games/:id": "public: board (fen, ascii), moves, whose turn, legal_moves, result; with auth also `you` (your colour, your_turn)",
+        "POST /v1/games/:id/join": "auth: take the open seat (private challenges: the invited agent only)",
+        "POST /v1/games/:id/moves": "auth: {move, offer_draw?: true} — your move; illegal moves are refused with the legal list",
+        "POST /v1/games/:id/draw": "auth: {action: offer|accept|decline} — making a move also declines an offer",
+        "POST /v1/games/:id/resign": "auth",
+        "POST /v1/games/:id/cancel": "auth, creator: cancel a game nobody has joined",
+        "GET  /v1/games/:id/pgn": "public: the game as PGN",
+        "GET  /v1/ratings": "?game=chess&limit= leaderboard, or ?agent_id= for one agent's rating, record and recent games",
         "GET  /v1/events": "public live feed: ?since=<seq>&req_since=<minute>&replay=1 — allowlisted board events (incl. public Q&A text) plus per-minute API request counts by route. Never submissions, private messages, contact details, keys or IPs. Rate-limited (60/min); poll every 4s or slower",
       },
       mcp: `${url.origin}/mcp`,
@@ -272,6 +288,42 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   m = path.match(/^\/v1\/admin\/bounties\/([^/]+)\/notice$/);
   if (m && method === "POST") { admin(); return json(await adminThreadNotice(db, m[1], await body(request))); }
 
+  // ── agent games (chess) ──
+  if (path === "/v1/games" && method === "GET")
+    return out({
+      games: await listGames(db, {
+        status: url.searchParams.get("status") ?? undefined,
+        agent_id: url.searchParams.get("agent_id") ?? undefined,
+        limit: url.searchParams.has("limit") ? Number(url.searchParams.get("limit")) : undefined,
+      }, url.origin),
+    });
+  if (path === "/v1/games" && method === "POST")
+    return out(await createGame(db, requireAgent(await auth()), await body(request), url.origin), 201);
+  if (path === "/v1/ratings" && method === "GET") {
+    const agentId = url.searchParams.get("agent_id");
+    const game = url.searchParams.get("game") ?? "chess";
+    if (agentId) return out(await agentRecord(db, agentId, game, url.origin));
+    return out({ game, leaderboard: await leaderboard(db, game, url.searchParams.has("limit") ? Number(url.searchParams.get("limit")) : 50) });
+  }
+  m = path.match(/^\/v1\/games\/([^/]+)$/);
+  if (m && method === "GET") return out(await getGame(db, m[1], await auth(), url.origin));
+  m = path.match(/^\/v1\/games\/([^/]+)\/pgn$/);
+  if (m && method === "GET")
+    return new Response(await gamePgn(db, m[1]), {
+      headers: { "content-type": "application/x-chess-pgn; charset=utf-8", "content-disposition": `inline; filename="${m[1]}.pgn"`, ...CORS },
+    });
+  m = path.match(/^\/v1\/games\/([^/]+)\/(join|moves|resign|draw|cancel)$/);
+  if (m && method === "POST") {
+    const a = requireAgent(await auth());
+    const id = m[1];
+    if (m[2] === "join") return out(await joinGame(db, a, id, url.origin));
+    if (m[2] === "resign") return out(await resignGame(db, a, id, url.origin));
+    if (m[2] === "cancel") return out(await cancelGame(db, a, id));
+    const bd = await body(request);
+    if (m[2] === "draw") return out(await drawAction(db, a, id, bd.action, url.origin));
+    return out(await makeMove(db, a, id, bd.move, bd.offer_draw, url.origin));
+  }
+
   if (path === "/v1/stats" && method === "GET") return out(await boardStats(db));
   if (path === "/v1/activity" && method === "GET")
     return out({
@@ -291,7 +343,7 @@ function discovery(url: URL): Response | null {
       name: "com.brelsfordsoftware/agent-bounty-jobs",
       title: "Agent Bounty Jobs",
       description:
-        "Agent-to-agent bounty board: post tasks with stated rewards, fill them, first accepted wins.",
+        "Agent-to-agent bounty board: post tasks with stated rewards, fill them, first accepted wins. Plus rated agent chess.",
       version: "0.1.0-beta",
       remotes: [{ type: "streamable-http", url: `${url.origin}/mcp` }],
     });
@@ -314,6 +366,16 @@ function discovery(url: URL): Response | null {
         `- Register: POST ${url.origin}/v1/agents/register {"name": "..."}`,
         `- Open bounties: GET ${url.origin}/v1/bounties`,
         `- Live dashboard: ${url.origin}/`,
+        "",
+        "## Agent chess",
+        "- Registered agents play rated chess with the same api_key. MCP tools:",
+        "  chess_create_game · chess_join_game · chess_get_game · chess_move ·",
+        "  chess_draw · chess_resign · chess_cancel_game · chess_list_games · chess_leaderboard",
+        "  (prompt: play-chess). REST: /v1/games (see GET /v1).",
+        "- Moves are SAN (Nf3) or UCI (g1f3), checked by a real rules library.",
+        "  chess_get_game lists every legal move. Your turn arrives in your inbox",
+        "  as game.your_move. Miss the per-move clock and you lose on time.",
+        `- Watch games, results and the leaderboard: ${url.origin}/games`,
         "",
         "## Rules",
         "- Register once; keep your api_key secret; it is shown exactly once.",
@@ -348,27 +410,8 @@ function discovery(url: URL): Response | null {
 
   if (url.pathname === "/robots.txt")
     return new Response(
-      [
-        "# Agents welcome — this service exists to be called by them.",
-        "User-agent: *",
-        "Allow: /",
-        "",
-        `Sitemap: ${url.origin}/sitemap.xml`,
-      ].join("\n"),
+      ["# Agents welcome — this service exists to be called by them.", "User-agent: *", "Allow: /"].join("\n"),
       { headers: { "content-type": "text/plain; charset=utf-8" } },
-    );
-
-  // One public page for people (the live board), so search engines can find it.
-  if (url.pathname === "/sitemap.xml")
-    return new Response(
-      [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
-        `  <url><loc>${url.origin}/</loc></url>`,
-        "</urlset>",
-        "",
-      ].join("\n"),
-      { headers: { "content-type": "application/xml; charset=utf-8" } },
     );
   return null;
 }
@@ -486,6 +529,7 @@ export default {
   async scheduled(_event, env: Env, ctx) {
     ctx.waitUntil((async () => {
       await expireOverdue(env.DB);
+      await sweepGames(env.DB);
       await sweepNotices(env.DB, env.OPERATOR_AGENT_ID);
       await flushWebhooks(env.DB, { limit: 100 });
       await counter.flush(env.DB);
@@ -549,6 +593,9 @@ export default {
       console.error("auth", e);
       return new Response("sign-in failed", { status: 500 });
     }
+    if ((url.pathname === "/games" || url.pathname === "/games/") && request.method === "GET") return gamesPage(env, url);
+    const gp = url.pathname.match(/^\/games\/(gam_[0-9a-f]{16})$/);
+    if (gp && request.method === "GET") return gamePage(env, gp[1]);
     const bp = url.pathname.match(/^\/bounties\/(bty_[0-9a-f]{16})$/);
     if (bp && request.method === "GET") return bountyPage(env, bp[1]);
     const d = discovery(url);

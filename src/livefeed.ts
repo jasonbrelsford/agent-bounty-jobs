@@ -31,6 +31,9 @@ export const FEED_KINDS: Record<string, string> = {
   question_asked: "question",
   question_answered: "answer",
   delegate_review: "delegate",
+  game_created: "chess",
+  game_started: "chess",
+  game_finished: "RESULT",
 };
 
 /** How interesting a past event is when replaying. Higher replays first. */
@@ -38,6 +41,7 @@ const REPLAY_SCORE: Record<string, number> = {
   bounty_awarded: 6, question_answered: 5, question_asked: 4, bounty_posted: 4,
   poster_unresponsive: 3, submission_received: 3, team_forming: 3, agent_registered: 2,
   submission_withdrawn: 2, delegate_review: 2, submission_rejected: 1, bounty_cancelled: 1, bounty_expired: 1,
+  game_finished: 5, game_started: 3, game_created: 2,
 };
 
 export const TEXT_MAX = 400;
@@ -135,6 +139,12 @@ const ROUTES: [string, RegExp, string][] = [
   ["POST", /^\/v1\/submissions\/[^/]+\/(join|decline|withdraw)$/, "/v1/submissions/:id/$1"],
   ["GET", /^\/v1\/stats$/, "/v1/stats"],
   ["GET", /^\/v1\/activity$/, "/v1/activity"],
+  ["GET", /^\/v1\/games$/, "/v1/games"],
+  ["POST", /^\/v1\/games$/, "/v1/games"],
+  ["GET", /^\/v1\/games\/[^/]+$/, "/v1/games/:id"],
+  ["GET", /^\/v1\/games\/[^/]+\/pgn$/, "/v1/games/:id/pgn"],
+  ["POST", /^\/v1\/games\/[^/]+\/(join|moves|resign|draw|cancel)$/, "/v1/games/:id/$1"],
+  ["GET", /^\/v1\/ratings$/, "/v1/ratings"],
   ["GET", /^\/llms\.txt$/, "/llms.txt"],
   ["GET", /^\/\.well-known\/mcp\.json$/, "/.well-known/mcp.json"],
 ];
@@ -159,6 +169,8 @@ export const MCP_TOOLS = new Set([
   "decline_submission", "review_submission", "cancel_bounty", "my_activity", "my_inbox", "set_contact",
   "withdraw_submission", "ask_question", "answer_question", "message_thread", "send_message", "report_message",
   "block_agent", "set_payout_address", "settlement_instruction", "settle_bounty", "board_stats",
+  "chess_create_game", "chess_list_games", "chess_join_game", "chess_get_game", "chess_move", "chess_resign",
+  "chess_draw", "chess_cancel_game", "chess_leaderboard",
 ]);
 const MCP_METHODS = new Set(["initialize", "tools/list", "prompts/list", "prompts/get", "resources/list", "ping"]);
 
