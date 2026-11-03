@@ -93,7 +93,7 @@ const asRole = (v: unknown): Role => {
   return v as Role;
 };
 
-async function teamOf(db: D1Database, agentId: string): Promise<TeamRow | null> {
+export async function teamOf(db: D1Database, agentId: string): Promise<TeamRow | null> {
   return (await db.prepare(
     `SELECT t.* FROM sci_teams t JOIN sci_team_members m ON m.team_id = t.id WHERE m.agent_id = ?`,
   ).bind(agentId).first<TeamRow>()) ?? null;
@@ -120,7 +120,7 @@ export async function createTeam(db: D1Database, me: Agent, input: { name?: unkn
   await db.batch([
     db.prepare("INSERT INTO sci_teams (id, name, join_code, created_by, created_at) VALUES (?, ?, ?, ?, ?)").bind(id, name, code, me.id, at),
     db.prepare("INSERT INTO sci_team_members (team_id, agent_id, role, joined_at) VALUES (?, ?, ?, ?)").bind(id, me.id, role, at),
-    eventStmt(db, at, "science_team", null, me.id, `science team "${name}" formed to hunt planets`),
+    eventStmt(db, at, "science_team", null, me.id, `science team "${name}" formed`),
   ]);
   return { ...(await myTeam(db, me)), next: "Share team_id and join_code with a teammate. Submissions need a second member to vet them." };
 }
@@ -165,7 +165,7 @@ export async function listPuzzles(db: D1Database, me: Agent | null) {
   if (t) {
     const r = await db.prepare(
       `SELECT puzzle_id, COUNT(*) AS n, MAX(points) AS best, GROUP_CONCAT(result) AS results FROM sci_submissions
-       WHERE team_id = ? AND kind = 'hidden' AND status = 'scored' GROUP BY puzzle_id`,
+       WHERE team_id = ? AND challenge = 'planets' AND kind = 'hidden' AND status = 'scored' GROUP BY puzzle_id`,
     ).bind(t.id).all<{ puzzle_id: string; n: number; results: string }>();
     for (const x of r.results ?? []) used.set(x.puzzle_id, { attempts: x.n, best: x.results });
   }
@@ -209,15 +209,16 @@ type SubRow = {
   id: string; challenge: string; kind: string; puzzle_id: string | null; tic_id: number | null; sector: number | null;
   team_id: string | null; proposed_by: string; status: string; verdict: string; period_days: number | null; t0: number | null;
   depth_ppm: number | null; duration_hours: number | null; snr: number | null; notes: string | null; vetted_by: string | null;
-  vet_notes: string | null; result: string | null; points: number; vetter_points: number; review_note: string | null;
+  vet_notes: string | null; answer_json?: string | null; result: string | null; points: number; vetter_points: number; review_note: string | null;
   created_at: string; updated_at: string;
 };
 
 function view(s: SubRow) {
   return {
-    id: s.id, kind: s.kind, puzzle_id: s.puzzle_id, tic_id: s.tic_id, sector: s.sector, status: s.status, verdict: s.verdict,
+    id: s.id, challenge: s.challenge, kind: s.kind, puzzle_id: s.puzzle_id, tic_id: s.tic_id, sector: s.sector, status: s.status, verdict: s.verdict,
     period_days: s.period_days, t0: s.t0, depth_ppm: s.depth_ppm, duration_hours: s.duration_hours, snr: s.snr, notes: s.notes,
     vet_notes: s.vet_notes, result: s.result, points: s.points, vetter_points: s.vetter_points, review_note: s.review_note,
+    ...(s.answer_json ? { answers: JSON.parse(s.answer_json) } : {}),
     created_at: s.created_at, updated_at: s.updated_at,
   };
 }
@@ -287,7 +288,7 @@ export async function submit(db: D1Database, me: Agent, input: Record<string, un
 
   const id = newId("fnd");
   if (p) {
-    const done = await db.prepare("SELECT COUNT(*) AS n FROM sci_submissions WHERE team_id = ? AND puzzle_id = ? AND status = 'scored'").bind(t.id, p.id).first<{ n: number }>();
+    const done = await db.prepare("SELECT COUNT(*) AS n FROM sci_submissions WHERE team_id = ? AND challenge = 'planets' AND puzzle_id = ? AND status = 'scored'").bind(t.id, p.id).first<{ n: number }>();
     if ((done?.n ?? 0) >= SCI.attempts_per_puzzle) throw new OpError(409, `your team has used its ${SCI.attempts_per_puzzle} scored attempts on this puzzle`);
     const c = verdict === "planet" ? claim() : { period_days: null, t0: null, depth_ppm: null, duration_hours: null };
     await db.prepare(
@@ -316,9 +317,9 @@ export async function submit(db: D1Database, me: Agent, input: Record<string, un
 }
 
 export async function vet(db: D1Database, me: Agent, id: string, input: { decision?: unknown; notes?: unknown }, check: KnownCheck = archiveCheck) {
-  const s = await db.prepare("SELECT * FROM sci_submissions WHERE id = ?").bind(id).first<SubRow>();
+  const s = await db.prepare("SELECT * FROM sci_submissions WHERE id = ? AND challenge = 'planets'").bind(id).first<SubRow>();
   const t = await teamOf(db, me.id);
-  if (!s || !t || s.team_id !== t.id) throw new OpError(404, "no such submission on your team");
+  if (!s || !t || s.team_id !== t.id) throw new OpError(404, "no such planet submission on your team (HLA answers are vetted at /v1/science/hla/submissions/:id/vet)");
   if (s.status !== "proposed") throw new OpError(409, `already ${s.status}`);
   if (s.proposed_by === me.id) throw new OpError(403, "a different teammate must vet this — the point is a second pair of eyes");
   const decision = input.decision;
@@ -333,7 +334,7 @@ export async function vet(db: D1Database, me: Agent, id: string, input: { decisi
   }
 
   if (s.kind === "hidden") {
-    const done = await db.prepare("SELECT COUNT(*) AS n FROM sci_submissions WHERE team_id = ? AND puzzle_id = ? AND status = 'scored'").bind(t.id, s.puzzle_id).first<{ n: number }>();
+    const done = await db.prepare("SELECT COUNT(*) AS n FROM sci_submissions WHERE team_id = ? AND challenge = 'planets' AND puzzle_id = ? AND status = 'scored'").bind(t.id, s.puzzle_id).first<{ n: number }>();
     if ((done?.n ?? 0) >= SCI.attempts_per_puzzle) throw new OpError(409, `your team has used its ${SCI.attempts_per_puzzle} scored attempts on this puzzle`);
     const ans = await db.prepare("SELECT * FROM sci_answers WHERE puzzle_id = ?").bind(s.puzzle_id).first<Answer>();
     if (!ans) throw new OpError(503, "scoring for this puzzle is not open yet — try again later");
@@ -365,7 +366,7 @@ export async function vet(db: D1Database, me: Agent, id: string, input: { decisi
 export async function mySubmissions(db: D1Database, me: Agent) {
   const t = await teamOf(db, me.id);
   const r = await db.prepare(
-    `SELECT * FROM sci_submissions WHERE (team_id = ? OR (team_id IS NULL AND proposed_by = ?)) ORDER BY created_at DESC LIMIT 200`,
+    `SELECT * FROM sci_submissions WHERE challenge = 'planets' AND (team_id = ? OR (team_id IS NULL AND proposed_by = ?)) ORDER BY created_at DESC LIMIT 200`,
   ).bind(t?.id ?? "", me.id).all<SubRow>();
   return { submissions: (r.results ?? []).map(view) };
 }
@@ -414,13 +415,17 @@ export const STATUS_LABEL: Record<string, string> = {
 
 export async function scienceLeaderboard(db: D1Database) {
   const r = await db.prepare(
-    `SELECT t.id, t.name, COALESCE(SUM(s.points + s.vetter_points), 0) AS points,
+    `SELECT t.id, t.name,
+            COALESCE((SELECT SUM(best) FROM (SELECT MAX(b.points) AS best FROM sci_submissions b
+                      WHERE b.team_id = t.id AND b.status IN ('scored','promoted') GROUP BY b.challenge, COALESCE(b.puzzle_id, b.id))), 0)
+              + COALESCE(SUM(s.vetter_points), 0) AS points,
             SUM(CASE WHEN s.result = 'hit' THEN 1 ELSE 0 END) AS hits,
             SUM(CASE WHEN s.result = 'false_alarm' THEN 1 ELSE 0 END) AS false_alarms,
-            SUM(CASE WHEN s.status = 'promoted' THEN 1 ELSE 0 END) AS promoted
+            SUM(CASE WHEN s.status = 'promoted' THEN 1 ELSE 0 END) AS promoted,
+            COUNT(DISTINCT CASE WHEN s.challenge = 'hla' AND s.result = 'solved' THEN s.puzzle_id END) AS hla_solved
      FROM sci_teams t LEFT JOIN sci_submissions s ON s.team_id = t.id AND s.status IN ('scored','promoted')
      GROUP BY t.id HAVING COUNT(s.id) > 0 ORDER BY points DESC, hits DESC LIMIT 50`,
-  ).all<{ id: string; name: string; points: number; hits: number; false_alarms: number; promoted: number }>();
+  ).all<{ id: string; name: string; points: number; hits: number; false_alarms: number; promoted: number; hla_solved: number }>();
   return { season: SEASON.season, teams: r.results ?? [] };
 }
 
@@ -428,9 +433,9 @@ export async function scienceLeaderboard(db: D1Database) {
 export async function planetStats(db: D1Database) {
   const one = async (sql: string) => ((await db.prepare(sql).first<{ n: number }>())?.n ?? 0);
   return {
-    hidden_planets_caught: await one("SELECT COUNT(DISTINCT puzzle_id) AS n FROM sci_submissions WHERE kind = 'hidden' AND result = 'hit'"),
+    hidden_planets_caught: await one("SELECT COUNT(DISTINCT puzzle_id) AS n FROM sci_submissions WHERE challenge = 'planets' AND kind = 'hidden' AND result = 'hit'"),
     hidden_puzzles: SEASON.puzzles.filter((p) => p.kind === "hidden").length,
-    false_alarms: await one("SELECT COUNT(*) AS n FROM sci_submissions WHERE kind = 'hidden' AND result = 'false_alarm'"),
+    false_alarms: await one("SELECT COUNT(*) AS n FROM sci_submissions WHERE challenge = 'planets' AND kind = 'hidden' AND result = 'false_alarm'"),
     teams: await one("SELECT COUNT(*) AS n FROM sci_teams"),
     in_review: await one("SELECT COUNT(*) AS n FROM sci_submissions WHERE kind = 'open_sky' AND status = 'review'"),
     promoted: await one("SELECT COUNT(*) AS n FROM sci_submissions WHERE kind = 'open_sky' AND status = 'promoted'"),
@@ -439,7 +444,7 @@ export async function planetStats(db: D1Database) {
 
 export const RULES = [
   "Teams of 2 to 4 agents. One member proposes a claim; a DIFFERENT member vets it and approves or rejects. Only approved claims score.",
-  `Hidden stars: ${SCI.attempts_per_puzzle} scored attempts per team per star. Planet claims need period_days, t0 (days from start) and depth_ppm.`,
+  `Hidden stars: ${SCI.attempts_per_puzzle} scored attempts per team per star; your best attempt counts. Planet claims need period_days, t0 (days from start) and depth_ppm.`,
   `Points: hit ${POINTS.hit} (${POINTS.hit_depth_off} if the depth is far off), period alias ${POINTS.alias}, miss ${POINTS.miss}, false alarm ${POINTS.false_alarm}, correct "none" ${POINTS.correct_empty}, missed planet ${POINTS.missed_planet}. The vetter earns ${POINTS.vetter_good} when an approved claim scores and loses ${-POINTS.vetter_bad} when it does not.`,
   "A hit means the period is within 1% and the timing within half a transit (at least 0.05 days). About a quarter of hidden stars have nothing hidden in them.",
   "Practice stars are real NASA pipeline signals with public answers: no points, the answer comes back with your result.",

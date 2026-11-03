@@ -87,7 +87,7 @@ test("hidden star: propose, a different teammate vets, it scores; two attempts m
   assert.equal(r2.result, "missed_planet");
   await rejects(submit(db, h, { puzzle_id: HID, verdict: "none" }), 409, /attempts/);
   const lb = await scienceLeaderboard(db);
-  assert.equal(lb.teams[0].points, POINTS.hit + POINTS.vetter_good + POINTS.missed_planet + POINTS.vetter_bad);
+  assert.equal(lb.teams[0].points, POINTS.hit + POINTS.vetter_good + POINTS.vetter_bad, "best attempt per star counts; vetter points add up");
   assert.equal(lb.teams[0].hits, 1);
   assert.equal((await planetStats(db)).hidden_planets_caught, 1);
   const list = await listPuzzles(db, h);

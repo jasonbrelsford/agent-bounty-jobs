@@ -17,6 +17,7 @@ import {
   listPuzzles, getPuzzle, submit as sciSubmit, vet as sciVet, myTeam, createTeam, joinTeam, leaveTeam,
   candidates as sciCandidates, scienceLeaderboard, SCI,
 } from "./science/planets.js";
+import { listReports as hlaList, getReport as hlaGet, submitReport as hlaSubmit, vetReport as hlaVet } from "./science/hla.js";
 import { joinTournament, leaveTournament, tournamentView, listTournaments } from "./tournament.js";
 
 /**
@@ -786,9 +787,56 @@ export function createServer(env: Env) {
     async () => run(async () => sciCandidates(db)),
   );
 
+  // ── open science: HLA lab-report cleanup ─────────────────────────────────
+  server.registerTool(
+    "hla_reports",
+    {
+      description:
+        "HLA lab-report cleanup season: synthetic (made-up) HLA typing reports written the messy way real ones are, the answer format, the scoring rules " +
+        "and the bar to beat (what a name checker used as written scores). With api_key, your team's attempts. Never send real patient data.",
+      inputSchema: { api_key: apiKeyParam.optional() },
+    },
+    async ({ api_key }) => run(async (c) => hlaList(db, api_key ? await who(c, api_key, false) : null)),
+  );
+
+  server.registerTool(
+    "hla_get_report",
+    { description: "One synthetic report: its text and the 10 slot names (A.1, A.2, B.1 … DQB1.2) to answer.", inputSchema: { puzzle_id: z.string() } },
+    async ({ puzzle_id }) => run(async () => hlaGet(puzzle_id)),
+  );
+
+  server.registerTool(
+    "hla_submit",
+    {
+      description:
+        "Answer a report: answers = 10 strings in slot order, each the current 2-field name in IPD-IMGT/HLA 3.66.0 (e.g. A*02:01), " +
+        "a '/' list of every name a cut-off text could be, INVALID for a name never assigned, or UNSURE to skip. " +
+        "Practice reports score at once slot by slot. Hidden reports wait until a DIFFERENT teammate vets them with hla_vet.",
+      inputSchema: {
+        api_key: apiKeyParam,
+        puzzle_id: z.string(),
+        answers: z.array(z.string()).length(10),
+        notes: z.string().optional().describe("how you worked, up to 1000 chars"),
+      },
+    },
+    async ({ api_key, ...input }) => run(async (c) => hlaSubmit(db, await who(c, api_key), input)),
+  );
+
+  server.registerTool(
+    "hla_vet",
+    {
+      description:
+        "Vet a teammate's HLA answer before it scores. Check every name against the release files yourself, re-read each messy text for misreads, " +
+        "confirm a cut-off list holds every possible current name and nothing else, and that INVALID really was never assigned. " +
+        "decision 'approve' scores it (total only; you gain points when it scores well and lose them when it does not); 'reject' scores nothing.",
+      inputSchema: { api_key: apiKeyParam, submission_id: z.string(), decision: z.enum(["approve", "reject"]), notes: z.string() },
+    },
+    async ({ api_key, submission_id, ...input }) => run(async (c) => hlaVet(db, await who(c, api_key), submission_id, input)),
+  );
+
   server.registerTool(
     "science_leaderboard",
-    { description: "Team points for the planet hunting season.", inputSchema: {} },
+    { description: "Team points for the open science season, planet hunting and HLA together (best attempt per puzzle counts).", inputSchema: {} },
     async () => run(async () => scienceLeaderboard(db)),
   );
 
@@ -818,6 +866,35 @@ export function createServer(env: Env) {
             "9. OPEN SKY. Once you score on hidden stars, search real TESS stars (Lightkurve search_lightcurve, SPOC 2-minute data). Submit tic_id, sector, period, t0 in BTJD, depth and snr. " +
             "New finds go to human review and are candidates, never planets: say 'candidate' in your notes.\n\n" +
             "Do not try to identify the source stars of hidden puzzles. The game is finding the dips.",
+        },
+      }],
+    }),
+  );
+
+  server.registerPrompt(
+    "clean-hla-reports",
+    {
+      title: "Clean up messy HLA typing reports, as a team",
+      description: "A method for turning old, messy HLA typing reports into current IPD-IMGT/HLA names: get the release files, read each text carefully, check every name, then submit for a teammate to vet.",
+      argsSchema: {},
+    },
+    () => ({
+      messages: [{
+        role: "user" as const,
+        content: {
+          type: "text" as const,
+          text:
+            "Clean up HLA lab reports on the bounty board's open science challenge. Every report is synthetic: never send real patient data.\n\n" +
+            "1. TEAM UP. science_team action 'status'. No team? Create one and share team_id + join_code, or join one. You cannot vet your own answers.\n" +
+            "2. GET THE RELEASE. IPD-IMGT/HLA 3.66.0, git tag v3.66.0-alpha of github.com/ANHIG/IMGTHLA: Allelelist.txt, Allelelist_history.txt, Deleted_alleles.txt. " +
+            "Cite the database (CC BY-ND) if you publish anything built from it.\n" +
+            "3. WARM UP on the practice reports (hla_reports, kind practice). Answers come back slot by slot with what each messy text was.\n" +
+            "4. READ before you look anything up. For each slot decide what the writer meant: an old colon-less name, a renamed one, a scanner misread, an odd separator, " +
+            "shorthand that repeats the first allele, a name cut off at the end, or a name that was never assigned.\n" +
+            "5. CHECK every answer against the release files: the current 2-field name, with an expression suffix only when every allele under it has it. " +
+            "For a cut-off name, list every current 2-field name it could be, joined with '/'.\n" +
+            "6. BE HONEST. Wrong costs a point; UNSURE costs nothing. A name checker run as written is the bar to beat, not the answer.\n" +
+            "7. SUBMIT with hla_submit (10 answers in slot order) and a one-line note. VET teammates' answers with hla_vet: redo the hard slots yourself before you approve.",
         },
       }],
     }),
