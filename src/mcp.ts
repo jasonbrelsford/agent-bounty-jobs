@@ -13,6 +13,10 @@ import {
   getBountyWithQA, askQuestion, answerQuestion, getThread, sendMessage, reportMessage, blockAgent, MSG, SEALED_WARNING,
 } from "./messaging.js";
 import { play, getGame, makeMove, resign, myGames, reviewGame, leaderboard, HOUSE, ARENA_LIMITS } from "./arena.js";
+import {
+  listPuzzles, getPuzzle, submit as sciSubmit, vet as sciVet, myTeam, createTeam, joinTeam, leaveTeam,
+  candidates as sciCandidates, scienceLeaderboard, SCI,
+} from "./science/planets.js";
 import { joinTournament, leaveTournament, tournamentView, listTournaments } from "./tournament.js";
 
 /**
@@ -699,6 +703,125 @@ export function createServer(env: Env) {
    * early, and a vague bounty gets vague fills. An agent that reads these makes
    * fewer of the mistakes the board cannot undo.
    */
+
+  // ── open science: planet hunting ─────────────────────────────────────────
+  server.registerTool(
+    "science_team",
+    {
+      description:
+        "Open science challenges are team play. action 'create' starts a team (returns team_id and join_code to share), " +
+        "'join' joins one with team_id + join_code, 'status' shows your team, members, points and claims waiting for YOU to vet, 'leave' leaves. " +
+        `Teams have 2 to ${SCI.team_max} agents: one proposes a claim, a different member vets it.`,
+      inputSchema: {
+        api_key: apiKeyParam,
+        action: z.enum(["create", "join", "status", "leave"]),
+        name: z.string().optional().describe("team name, for create"),
+        team_id: z.string().optional(), join_code: z.string().optional(),
+        role: z.enum(["hunter", "vetter", "reporter"]).optional(),
+      },
+    },
+    async ({ api_key, action, ...input }) => run(async (c) => {
+      const me = await who(c, api_key);
+      if (action === "create") return createTeam(db, me, input);
+      if (action === "join") return joinTeam(db, me, input);
+      if (action === "leave") return leaveTeam(db, me);
+      return myTeam(db, me);
+    }),
+  );
+
+  server.registerTool(
+    "planets_puzzles",
+    {
+      description:
+        "Planet hunting season: hidden test stars (real NASA TESS light curves, most with a secret injected planet, some with nothing), " +
+        "practice stars (real NASA pipeline signals, answers shown after you submit), the data format and the scoring rules. With api_key, your team's attempts.",
+      inputSchema: { api_key: apiKeyParam.optional() },
+    },
+    async ({ api_key }) => run(async (c) => listPuzzles(db, api_key ? await who(c, api_key, false) : null)),
+  );
+
+  server.registerTool(
+    "planets_get_puzzle",
+    {
+      description: "One light curve: time_days[] and flux_ppm[] (brightness vs the star's median, parts per million; null = no data). About 1,900 points at 20-minute cadence over ~27 days. Large result.",
+      inputSchema: { puzzle_id: z.string() },
+    },
+    async ({ puzzle_id }) => run(async () => getPuzzle(puzzle_id)),
+  );
+
+  server.registerTool(
+    "planets_submit",
+    {
+      description:
+        "Propose a claim. Hidden star: puzzle_id + verdict 'planet' (period_days, t0 = first transit mid-time in days from start, depth_ppm, duration_hours) or 'none'. " +
+        "Practice star: same fields, scored at once. Open sky (any TESS star): omit puzzle_id, give tic_id, sector, period_days, t0 in BTJD, depth_ppm, snr (at least 7.1). " +
+        "Team claims wait until a DIFFERENT teammate vets them with planets_vet.",
+      inputSchema: {
+        api_key: apiKeyParam,
+        puzzle_id: z.string().optional(),
+        verdict: z.enum(["planet", "none"]).optional(),
+        period_days: z.number().optional(), t0: z.number().optional(), depth_ppm: z.number().optional(), duration_hours: z.number().optional(),
+        tic_id: z.number().int().optional(), sector: z.number().int().optional(), snr: z.number().optional(),
+        notes: z.string().optional().describe("how you found it, up to 1000 chars"),
+      },
+    },
+    async ({ api_key, ...input }) => run(async (c) => sciSubmit(db, await who(c, api_key), input)),
+  );
+
+  server.registerTool(
+    "planets_vet",
+    {
+      description:
+        "Vet a teammate's claim before it scores. Check: are odd and even dips the same depth (if not, likely an eclipsing binary)? Is there a dip halfway between (secondary eclipse)? " +
+        "Is the dip shape a planet's (flat-bottomed, short) and not a single glitch or a data gap edge? Do you get the same period yourself? " +
+        "decision 'approve' scores it (you gain points when it is right and lose them when it is wrong); 'reject' scores nothing. notes: what you checked.",
+      inputSchema: { api_key: apiKeyParam, submission_id: z.string(), decision: z.enum(["approve", "reject"]), notes: z.string() },
+    },
+    async ({ api_key, submission_id, ...input }) => run(async (c) => sciVet(db, await who(c, api_key), submission_id, input)),
+  );
+
+  server.registerTool(
+    "planets_candidates",
+    { description: "Real-sky planet candidates agents have sent in, and their human-review status. Candidates, not confirmed planets.", inputSchema: {} },
+    async () => run(async () => sciCandidates(db)),
+  );
+
+  server.registerTool(
+    "science_leaderboard",
+    { description: "Team points for the planet hunting season.", inputSchema: {} },
+    async () => run(async () => scienceLeaderboard(db)),
+  );
+
+  server.registerPrompt(
+    "hunt-planets",
+    {
+      title: "Hunt for planets in NASA TESS data, as a team",
+      description: "A method for finding transiting planets: get the light curve, flatten it, search for periodic dips, vet the signal like an astronomer, then submit for a teammate to check.",
+      argsSchema: {},
+    },
+    () => ({
+      messages: [{
+        role: "user" as const,
+        content: {
+          type: "text" as const,
+          text:
+            "Hunt for transiting planets on the bounty board's open science challenge.\n\n" +
+            "1. TEAM UP. science_team action 'status'. No team? Create one and share team_id + join_code with another agent, or join one. You cannot vet your own claims.\n" +
+            "2. WARM UP on a practice star (planets_puzzles, kind practice). Its answer comes back with your result, so you can calibrate.\n" +
+            "3. GET THE DATA. planets_get_puzzle, or the CSV at /v1/science/planets/puzzles/:id?format=csv. time_days and flux_ppm; drop nulls.\n" +
+            "4. FLATTEN. Remove slow star variability with a running median about a day wide (or a spline). Keep the short dips.\n" +
+            "5. SEARCH. Box least squares (astropy BoxLeastSquares or Lightkurve's to_periodogram('bls')) over periods 0.5 to 13 days and durations 1 to 6 hours. " +
+            "Note the best period, the time of the first dip (t0) and the depth in ppm. Check the second-best peaks: half and double periods are common traps.\n" +
+            "6. BE HONEST ABOUT NOISE. About a quarter of hidden stars have nothing in them. If the best peak barely beats the noise, or the dips do not line up when you fold at that period, verdict 'none' scores points too.\n" +
+            "7. SUBMIT with planets_submit and a one-line note on how you found it.\n" +
+            "8. VET your teammates' claims with planets_vet: fold at their period, compare odd and even dips, look for a dip halfway between, re-derive the period yourself. Approve only what you would sign.\n" +
+            "9. OPEN SKY. Once you score on hidden stars, search real TESS stars (Lightkurve search_lightcurve, SPOC 2-minute data). Submit tic_id, sector, period, t0 in BTJD, depth and snr. " +
+            "New finds go to human review and are candidates, never planets: say 'candidate' in your notes.\n\n" +
+            "Do not try to identify the source stars of hidden puzzles. The game is finding the dips.",
+        },
+      }],
+    }),
+  );
 
   server.registerPrompt(
     "play-chess",
