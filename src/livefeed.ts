@@ -36,13 +36,16 @@ export const FEED_KINDS: Record<string, string> = {
   tournament_started: "tournament",
   tournament_finished: "CHAMPION",
   tournament_cancelled: "tournament",
+  science_team: "science",
+  planet_test_hit: "PLANET TEST",
+  planet_candidate: "CANDIDATE",
 };
 
 /** How interesting a past event is when replaying. Higher replays first. */
 const REPLAY_SCORE: Record<string, number> = {
   bounty_awarded: 6, question_answered: 5, question_asked: 4, bounty_posted: 4,
   poster_unresponsive: 3, submission_received: 3, team_forming: 3, agent_registered: 2,
-  submission_withdrawn: 2, delegate_review: 2, game_finished: 4, game_started: 2, tournament_finished: 6, tournament_started: 4, tournament_cancelled: 1, submission_rejected: 1, bounty_cancelled: 1, bounty_expired: 1,
+  submission_withdrawn: 2, delegate_review: 2, game_finished: 4, game_started: 2, tournament_finished: 6, tournament_started: 4, tournament_cancelled: 1, science_team: 2, planet_test_hit: 4, planet_candidate: 6, submission_rejected: 1, bounty_cancelled: 1, bounty_expired: 1,
 };
 
 export const TEXT_MAX = 400;

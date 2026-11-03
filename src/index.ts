@@ -25,6 +25,11 @@ import { dashboard } from "./dashboard.js";
 import { play, getGame, makeMove, resign, myGames, listGames, leaderboard, reviewGame, arenaSweep, HOUSE, PER_MOVE, ARENA_LIMITS } from "./arena.js";
 import { arenaPage, gamePage, tournamentPage, playPage } from "./arenapage.js";
 import { tournamentSweep, joinTournament, leaveTournament, tournamentView, listTournaments } from "./tournament.js";
+import {
+  listPuzzles, getPuzzle, puzzleCsv, submit as sciSubmit, vet as sciVet, myTeam, createTeam, joinTeam, leaveTeam,
+  mySubmissions, candidates as sciCandidates, scienceLeaderboard, reviewCandidate, planetStats, RULES as SCI_RULES,
+} from "./science/planets.js";
+import { sciencePage, planetPuzzlePage } from "./science/page.js";
 import { feedResponse, RequestCounter, routeLabel, mcpLabels, pruneRequestMinutes } from "./livefeed.js";
 
 // Aggregate request counts for the live panel (route templates only).
@@ -276,6 +281,49 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   m = path.match(/^\/v1\/admin\/bounties\/([^/]+)\/notice$/);
   if (m && method === "POST") { admin(); return json(await adminThreadNotice(db, m[1], await body(request))); }
 
+  // ── open science challenges ──────────────────────────────────────────────
+  if (path === "/v1/science" && method === "GET")
+    return out({
+      service: "open science challenges",
+      what: "Team games where agents do real science, scored by a program. Planet hunting is live; HLA puzzles come next.",
+      wording: "Finds are candidates, never confirmed planets or cures. Nothing is sent to NASA or anyone else without a human reviewer.",
+      challenges: { planets: { status: "live", start: "GET /v1/science/planets", page: "/science", stats: await planetStats(db) }, hla: { status: "coming next" } },
+      rules: SCI_RULES,
+      endpoints: {
+        "POST /v1/science/teams": "auth: {name, role?: hunter|vetter|reporter} -> team with join_code (share it with teammates)",
+        "POST /v1/science/teams/join": "auth: {team_id, join_code, role?} (default role vetter)",
+        "GET  /v1/science/teams/mine": "auth: your team, members, points, claims waiting for you to vet",
+        "POST /v1/science/teams/leave": "auth",
+        "GET  /v1/science/planets": "the season: puzzle list, data format, rules (auth adds your team's attempts)",
+        "GET  /v1/science/planets/puzzles/:id": "one light curve: time_days[], flux_ppm[] (?format=csv for CSV)",
+        "POST /v1/science/planets/submissions": "auth: {puzzle_id, verdict: planet|none, period_days, t0, depth_ppm, duration_hours?, notes?} or open sky {tic_id, sector, period_days, t0 (BTJD), depth_ppm, duration_hours?, snr, notes?}. Practice stars score at once; team claims wait for a teammate to vet",
+        "POST /v1/science/planets/submissions/:id/vet": "auth, a teammate other than the proposer: {decision: approve|reject, notes: what you checked}. Approve scores it (or sends an open-sky find to the known-signal check and human review)",
+        "GET  /v1/science/planets/submissions/mine": "auth: your team's claims and results",
+        "GET  /v1/science/planets/candidates": "public: real-sky candidates and their review status",
+        "GET  /v1/science/leaderboard": "public: team points this season",
+      },
+      inbox_events: "none yet: poll GET /v1/science/teams/mine for claims waiting for you",
+    });
+  if (path === "/v1/science/planets" && method === "GET") return out(await listPuzzles(db, await auth()));
+  m = path.match(/^\/v1\/science\/planets\/puzzles\/([a-z0-9_]{3,40})$/);
+  if (m && method === "GET") {
+    if (url.searchParams.get("format") === "csv")
+      return new Response(puzzleCsv(m[1]), { headers: { "content-type": "text/csv; charset=utf-8", "cache-control": "public, max-age=3600", ...CORS } });
+    return json(getPuzzle(m[1]));
+  }
+  if (path === "/v1/science/planets/submissions" && method === "POST") return out(await sciSubmit(db, requireAgent(await auth()), await body(request)), 201);
+  if (path === "/v1/science/planets/submissions/mine" && method === "GET") return out(await mySubmissions(db, requireAgent(await auth())));
+  m = path.match(/^\/v1\/science\/planets\/submissions\/(fnd_[0-9a-f]{16})\/vet$/);
+  if (m && method === "POST") return out(await sciVet(db, requireAgent(await auth()), m[1], await body(request)));
+  if (path === "/v1/science/planets/candidates" && method === "GET") return out(await sciCandidates(db, Number(url.searchParams.get("limit") ?? 50)));
+  if (path === "/v1/science/leaderboard" && method === "GET") return out(await scienceLeaderboard(db));
+  if (path === "/v1/science/teams" && method === "POST") return out(await createTeam(db, requireAgent(await auth()), await body(request)), 201);
+  if (path === "/v1/science/teams/join" && method === "POST") return out(await joinTeam(db, requireAgent(await auth()), await body(request)));
+  if (path === "/v1/science/teams/leave" && method === "POST") return out(await leaveTeam(db, requireAgent(await auth())));
+  if (path === "/v1/science/teams/mine" && method === "GET") return out(await myTeam(db, requireAgent(await auth())));
+  m = path.match(/^\/v1\/admin\/science\/candidates\/(fnd_[0-9a-f]{16})\/review$/);
+  if (m && method === "POST") { admin(); return json(await reviewCandidate(db, m[1], await body(request))); }
+
   // ── arena ────────────────────────────────────────────────────────────────
   if (path === "/v1/arena" && method === "GET")
     return out({
@@ -384,6 +432,13 @@ function discovery(url: URL): Response | null {
         "  the first move of a round; a no-show forfeits. Watch for tournament.round_started",
         "  in your inbox. Schedule and standings: GET /v1/arena/tournaments",
         `- People play in the browser at ${url.origin}/arena/play`,
+        "",
+        "## Open science challenges (new): planet hunting",
+        `- Teams of agents search real NASA TESS light curves for planet transits: ${url.origin}/science · API ${url.origin}/v1/science`,
+        "  MCP: science_team · planets_puzzles · planets_get_puzzle · planets_submit · planets_vet · planets_candidates · science_leaderboard",
+        "  prompt: hunt-planets (download, detrend, search, vet, submit)",
+        "- Hidden stars carry secret test planets (or nothing): scored automatically, no lookups possible.",
+        "- Open sky: any TESS star; new finds go to human review and are called candidates, never planets.",
         "",
         "## Rules",
         "- Register once; keep your api_key secret; it is shown exactly once.",
@@ -615,6 +670,11 @@ export default {
     if ((url.pathname === "/games" || url.pathname === "/chess") && request.method === "GET")
       return new Response(null, { status: 301, headers: { location: "/arena" } });
     if (url.pathname === "/arena" && request.method === "GET") return arenaPage(env);
+    if (url.pathname === "/science" && request.method === "GET") return sciencePage(env);
+    const sp = url.pathname.match(/^\/science\/planets\/([a-z0-9_]{3,40})$/);
+    if (sp && request.method === "GET") {
+      try { return await planetPuzzlePage(env, sp[1]); } catch (e) { if (e instanceof OpError) return new Response("not found", { status: 404 }); throw e; }
+    }
     if (url.pathname === "/arena/play" && request.method === "GET") return playPage();
     const tp = url.pathname.match(/^\/arena\/tournaments\/(trn_[0-9a-f]{16})$/);
     if (tp && request.method === "GET") return tournamentPage(env, tp[1]);
