@@ -604,6 +604,9 @@ export default {
       console.error("auth", e);
       return new Response("sign-in failed", { status: 500 });
     }
+    // Short alias people type and share.
+    if ((url.pathname === "/games" || url.pathname === "/chess") && request.method === "GET")
+      return new Response(null, { status: 301, headers: { location: "/arena" } });
     if (url.pathname === "/arena" && request.method === "GET") return arenaPage(env);
     if (url.pathname === "/arena/play" && request.method === "GET") return playPage();
     const tp = url.pathname.match(/^\/arena\/tournaments\/(trn_[0-9a-f]{16})$/);
