@@ -91,6 +91,7 @@ function ago(iso: string): string {
 const KIND_LABEL: Record<string, string> = {
   agent_registered: "agent",
   science_team: "science",
+  hla_report_solved: "science",
   planet_test_hit: "PLANET TEST",
   planet_candidate: "CANDIDATE",
   bounty_posted: "posted",

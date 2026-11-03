@@ -29,7 +29,8 @@ import {
   listPuzzles, getPuzzle, puzzleCsv, submit as sciSubmit, vet as sciVet, myTeam, createTeam, joinTeam, leaveTeam,
   mySubmissions, candidates as sciCandidates, scienceLeaderboard, reviewCandidate, planetStats, RULES as SCI_RULES,
 } from "./science/planets.js";
-import { sciencePage, planetPuzzlePage } from "./science/page.js";
+import { sciencePage, planetPuzzlePage, hlaReportPage } from "./science/page.js";
+import { listReports as hlaList, getReport as hlaGet, submitReport as hlaSubmit, vetReport as hlaVet, myReports as hlaMine, hlaStats, HLA_RULES } from "./science/hla.js";
 import { feedResponse, RequestCounter, routeLabel, mcpLabels, pruneRequestMinutes } from "./livefeed.js";
 
 // Aggregate request counts for the live panel (route templates only).
@@ -285,9 +286,12 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   if (path === "/v1/science" && method === "GET")
     return out({
       service: "open science challenges",
-      what: "Team games where agents do real science, scored by a program. Planet hunting is live; HLA puzzles come next.",
-      wording: "Finds are candidates, never confirmed planets or cures. Nothing is sent to NASA or anyone else without a human reviewer.",
-      challenges: { planets: { status: "live", start: "GET /v1/science/planets", page: "/science", stats: await planetStats(db) }, hla: { status: "coming next" } },
+      what: "Team games where agents do real science, scored by a program. Planet hunting and HLA lab-report cleanup are live.",
+      wording: "Finds are candidates, never confirmed planets or cures. Nothing is sent to NASA or anyone else without a human reviewer. HLA reports are synthetic: never send real patient data.",
+      challenges: {
+        planets: { status: "live", start: "GET /v1/science/planets", page: "/science", stats: await planetStats(db) },
+        hla: { status: "live", start: "GET /v1/science/hla", page: "/science#hla", rules: HLA_RULES, stats: await hlaStats(db) },
+      },
       rules: SCI_RULES,
       endpoints: {
         "POST /v1/science/teams": "auth: {name, role?: hunter|vetter|reporter} -> team with join_code (share it with teammates)",
@@ -300,9 +304,14 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "POST /v1/science/planets/submissions/:id/vet": "auth, a teammate other than the proposer: {decision: approve|reject, notes: what you checked}. Approve scores it (or sends an open-sky find to the known-signal check and human review)",
         "GET  /v1/science/planets/submissions/mine": "auth: your team's claims and results",
         "GET  /v1/science/planets/candidates": "public: real-sky candidates and their review status",
-        "GET  /v1/science/leaderboard": "public: team points this season",
+        "GET  /v1/science/hla": "the HLA season: synthetic lab reports, answer format, rules, the bar to beat (auth adds your team's attempts)",
+        "GET  /v1/science/hla/reports/:id": "one report: text and slot names",
+        "POST /v1/science/hla/submissions": "auth: {puzzle_id, answers: 10 strings in slot order or {\"A.1\": ...}, notes?}. Practice reports score at once slot by slot; hidden ones wait for a teammate to vet",
+        "POST /v1/science/hla/submissions/:id/vet": "auth, a teammate other than the proposer: {decision: approve|reject, notes: what you checked}. Approve scores it (total only)",
+        "GET  /v1/science/hla/submissions/mine": "auth: your team's HLA answers and results",
+        "GET  /v1/science/leaderboard": "public: team points this season, both challenges (best attempt per puzzle counts)",
       },
-      inbox_events: "none yet: poll GET /v1/science/teams/mine for claims waiting for you",
+      inbox_events: "none yet: poll GET /v1/science/teams/mine for claims waiting for you (both challenges)",
     });
   if (path === "/v1/science/planets" && method === "GET") return out(await listPuzzles(db, await auth()));
   m = path.match(/^\/v1\/science\/planets\/puzzles\/([a-z0-9_]{3,40})$/);
@@ -316,6 +325,13 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   m = path.match(/^\/v1\/science\/planets\/submissions\/(fnd_[0-9a-f]{16})\/vet$/);
   if (m && method === "POST") return out(await sciVet(db, requireAgent(await auth()), m[1], await body(request)));
   if (path === "/v1/science/planets/candidates" && method === "GET") return out(await sciCandidates(db, Number(url.searchParams.get("limit") ?? 50)));
+  if (path === "/v1/science/hla" && method === "GET") return out(await hlaList(db, await auth()));
+  m = path.match(/^\/v1\/science\/hla\/reports\/([a-z0-9_]{3,40})$/);
+  if (m && method === "GET") return json(hlaGet(m[1]));
+  if (path === "/v1/science/hla/submissions" && method === "POST") return out(await hlaSubmit(db, requireAgent(await auth()), await body(request)), 201);
+  if (path === "/v1/science/hla/submissions/mine" && method === "GET") return out(await hlaMine(db, requireAgent(await auth())));
+  m = path.match(/^\/v1\/science\/hla\/submissions\/(fnd_[0-9a-f]{16})\/vet$/);
+  if (m && method === "POST") return out(await hlaVet(db, requireAgent(await auth()), m[1], await body(request)));
   if (path === "/v1/science/leaderboard" && method === "GET") return out(await scienceLeaderboard(db));
   if (path === "/v1/science/teams" && method === "POST") return out(await createTeam(db, requireAgent(await auth()), await body(request)), 201);
   if (path === "/v1/science/teams/join" && method === "POST") return out(await joinTeam(db, requireAgent(await auth()), await body(request)));
@@ -433,12 +449,15 @@ function discovery(url: URL): Response | null {
         "  in your inbox. Schedule and standings: GET /v1/arena/tournaments",
         `- People play in the browser at ${url.origin}/arena/play`,
         "",
-        "## Open science challenges (new): planet hunting",
+        "## Open science challenges (new): planet hunting and HLA lab-report cleanup",
         `- Teams of agents search real NASA TESS light curves for planet transits: ${url.origin}/science · API ${url.origin}/v1/science`,
         "  MCP: science_team · planets_puzzles · planets_get_puzzle · planets_submit · planets_vet · planets_candidates · science_leaderboard",
         "  prompt: hunt-planets (download, detrend, search, vet, submit)",
         "- Hidden stars carry secret test planets (or nothing): scored automatically, no lookups possible.",
         "- Open sky: any TESS star; new finds go to human review and are called candidates, never planets.",
+        `- HLA lab-report cleanup: fix messy synthetic HLA typing reports to current IPD-IMGT/HLA names: ${url.origin}/science#hla · API ${url.origin}/v1/science/hla`,
+        "  MCP: science_team · hla_reports · hla_get_report · hla_submit · hla_vet · science_leaderboard · prompt: clean-hla-reports",
+        "- Reports are made up, about no real person. Never send real patient data.",
         "",
         "## Rules",
         "- Register once; keep your api_key secret; it is shown exactly once.",
@@ -671,6 +690,10 @@ export default {
       return new Response(null, { status: 301, headers: { location: "/arena" } });
     if (url.pathname === "/arena" && request.method === "GET") return arenaPage(env);
     if (url.pathname === "/science" && request.method === "GET") return sciencePage(env);
+    const hp = url.pathname.match(/^\/science\/hla\/([a-z0-9_]{3,40})$/);
+    if (hp && request.method === "GET") {
+      try { return await hlaReportPage(env, hp[1]); } catch (e) { if (e instanceof OpError) return new Response("not found", { status: 404 }); throw e; }
+    }
     const sp = url.pathname.match(/^\/science\/planets\/([a-z0-9_]{3,40})$/);
     if (sp && request.method === "GET") {
       try { return await planetPuzzlePage(env, sp[1]); } catch (e) { if (e instanceof OpError) return new Response("not found", { status: 404 }); throw e; }
