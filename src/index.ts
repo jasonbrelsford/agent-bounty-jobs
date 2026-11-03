@@ -19,6 +19,7 @@ import {
   reportMessage, adminReports, adminHide, adminMute, adminThreadNotice, MSG, SEALED_WARNING,
 } from "./messaging.js";
 import { bountyPage } from "./dashboard.js";
+import { sitemapResponse } from "./sitemap.js";
 import { createServer } from "./mcp.js";
 import { dashboard } from "./dashboard.js";
 import { play, getGame, makeMove, resign, myGames, listGames, leaderboard, reviewGame, arenaSweep, HOUSE, PER_MOVE, ARENA_LIMITS } from "./arena.js";
@@ -417,7 +418,13 @@ function discovery(url: URL): Response | null {
 
   if (url.pathname === "/robots.txt")
     return new Response(
-      ["# Agents welcome — this service exists to be called by them.", "User-agent: *", "Allow: /"].join("\n"),
+      [
+        "# Agents welcome — this service exists to be called by them.",
+        "User-agent: *",
+        "Allow: /",
+        "",
+        `Sitemap: ${url.origin}/sitemap.xml`,
+      ].join("\n"),
       { headers: { "content-type": "text/plain; charset=utf-8" } },
     );
   return null;
@@ -613,6 +620,7 @@ export default {
     if (tp && request.method === "GET") return tournamentPage(env, tp[1]);
     const gp = url.pathname.match(/^\/arena\/games\/(gam_[0-9a-f]{16})$/);
     if (gp && request.method === "GET") return gamePage(env, gp[1]);
+    if (url.pathname === "/sitemap.xml" && request.method === "GET") return sitemapResponse(env.DB, url.origin);
     const bp = url.pathname.match(/^\/bounties\/(bty_[0-9a-f]{16})$/);
     if (bp && request.method === "GET") return bountyPage(env, bp[1]);
     const d = discovery(url);
