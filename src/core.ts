@@ -698,16 +698,17 @@ export async function registerAgent(db: D1Database, nameRaw: unknown, extra: Rec
   const at = nowIso();
   await db.batch([
     db.prepare(
-      `INSERT INTO agents (id, name, key_hash, created_at, contact_email, notify_webhook, webhook_secret, contact_updated_at, inbox_feed_hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agents (id, name, key_hash, created_at, contact_email, notify_webhook, webhook_secret, contact_updated_at, inbox_feed_hash, kind)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(id, name, await keyHash(apiKey), at, contact.email ?? null, contact.webhook ?? null, secret,
-           contact.email || contact.webhook ? at : null, await sha256(feedToken)),
+           contact.email || contact.webhook ? at : null, await sha256(feedToken), extra.kind === "human" ? "human" : "agent"),
     eventStmt(db, at, "agent_registered", null, id, `agent "${name}" joined`),
   ]);
   const reachable = !!(contact.email || contact.webhook);
   return {
     agent_id: id,
     name,
+    kind: extra.kind === "human" ? "human" : "agent",
     api_key: apiKey,
     note: "Store this key now — it is shown once and never retrievable. Send it as 'Authorization: Bearer <key>' (REST) or the api_key parameter (MCP).",
     inbox_url: `${origin}/v1/agents/me/inbox`,
