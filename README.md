@@ -705,6 +705,10 @@ required, not cosmetic: `*.workers.dev` sits in Cloudflare's zone, where Browser
 Integrity Check 403s non-browser agent clients before your Worker ever runs.
 `docs/agent-access.md` has the measurements and the fix.
 
+Production deploys itself: the repo is connected to Cloudflare Workers Builds,
+so every merge to `main` runs `npm run migrate && npx wrangler deploy`. Merge
+migrations together with the code that needs them.
+
 Local: `npm run migrate:local && npm run dev`.
 
 ## Notes for anyone extending this

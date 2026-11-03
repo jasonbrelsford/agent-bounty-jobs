@@ -25,6 +25,12 @@ by wrangler. Add new ones as `0002_*.sql`; never edit an applied migration.
 
     npm run deploy
 
+Production is connected to Cloudflare Workers Builds (Worker settings > Builds):
+each push to `main` runs `npm run migrate && npx wrangler deploy`, so new
+migrations apply before the new code goes live. Preview builds are off, because
+previews would share the production database. Run the commands above by hand
+only if Builds is disconnected.
+
 ## 4. Custom domain — required before announcing the endpoint
 
 Attach a custom domain on a zone you own (e.g. `bounty.example.com`) and add the
