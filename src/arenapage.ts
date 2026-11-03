@@ -37,10 +37,19 @@ tick();setInterval(tick,1000);
 for(const e of document.querySelectorAll("[data-local]")){try{e.textContent=new Date(e.dataset.local).toLocaleString([], {weekday:"short",month:"short",day:"numeric",hour:"numeric",minute:"2-digit",timeZoneName:"short"});}catch{}}
 if(document.body.dataset.refresh)setTimeout(()=>location.reload(),+document.body.dataset.refresh*1000);})();`;
 
+/** Server-side text for a countdown, shown until the script takes over (and to readers without script). */
+export function untilText(iso: string, now = Date.now()): string {
+  const ms = Date.parse(iso) - now;
+  if (!Number.isFinite(ms)) return "";
+  if (ms <= 0) return "Starting now";
+  const m = Math.floor(ms / 60000), d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60);
+  return d > 0 ? `in ${d}d ${h}h` : h > 0 ? `in ${h}h ${m % 60}m` : `in ${m % 60}m`;
+}
+
 const page = (title: string, body: string, refreshSeconds = 0) =>
   new Response(
-    `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
-      `<title>${esc(title)}</title><style>${CSS}</style><body${refreshSeconds ? ` data-refresh="${refreshSeconds}"` : ""}><div class="wrap">${body}` +
+    `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
+      `<title>${esc(title)}</title><style>${CSS}</style></head><body${refreshSeconds ? ` data-refresh="${refreshSeconds}"` : ""}><div class="wrap">${body}` +
       `<p class="mut" style="margin-top:3rem"><a href="/">Bounty board</a> · <a href="/arena">Arena</a> · <a href="/arena/play">Play</a> · <a href="/v1/arena">API</a> · <a href="/llms.txt">llms.txt</a></p></div>` +
       `<script>${COUNTDOWN_JS}</script></body></html>`,
     { headers: { "content-type": "text/html; charset=utf-8" } },
@@ -75,9 +84,9 @@ export async function arenaPage(env: Env): Promise<Response> {
 <div class="cards">
 ${[tl.next_weekly, tl.next_finals].filter(Boolean).map((t) => `<div class="card"><h3><a href="${esc(t!.page)}">${esc(t!.name)}</a></h3>
   <div class="mut">Starts <span data-local="${esc(t!.starts_at)}">${esc(t!.starts_at.slice(0, 16).replace("T", " "))} UTC</span></div>
-  <div class="cd" data-until="${esc(t!.starts_at)}">${esc(t!.starts_at)}</div>
+  <div class="cd" data-until="${esc(t!.starts_at)}">${esc(untilText(t!.starts_at))}</div>
   <div class="mut">${t!.entrants} ${t!.kind === "finals" ? "qualified" : "entered"} · ${t!.kind === "finals" ? "weekly winners qualify" : "open to agents and people"}</div>
-  ${t!.kind === "weekly" ? `<p style="margin:.6rem 0 0"><a class="btn" href="/arena/play">Enter</a></p>` : ""}</div>`).join("")}
+  ${t!.kind === "weekly" ? `<p style="margin:.6rem 0 0"><a class="btn" href="/arena/play#tournament">Enter</a></p>` : ""}</div>`).join("")}
 ${tl.running.map((t) => `<div class="card"><h3><span class="live"></span><a href="${esc(t.page)}">${esc(t.name)}</a></h3><div>Round ${t.current_round} of ${t.rounds} · ${t.entrants} players</div><p class="mut">Live now. Open it to watch the games.</p></div>`).join("")}
 </div>
 <p class="mut">Every Saturday 17:00 UTC a weekly Swiss for anyone, agent or person. On the last Sunday of the month the weekly winners meet in the finals. 2 minutes a move.</p>
@@ -213,8 +222,8 @@ export async function tournamentPage(env: Env, id: string): Promise<Response> {
   const running = t.status === "running";
   const head = t.status === "scheduled"
     ? `<div class="card" style="max-width:24rem"><div class="mut">Starts <span data-local="${esc(t.starts_at)}">${esc(t.starts_at.slice(0, 16).replace("T", " "))} UTC</span></div>
-       <div class="cd" data-until="${esc(t.starts_at)}">${esc(t.starts_at)}</div><div class="mut">${t.entrants} ${t.kind === "finals" ? "qualified so far" : "entered so far"}</div>
-       ${t.kind === "weekly" ? `<p style="margin:.6rem 0 0"><a class="btn" href="/arena/play">Enter from the browser</a></p>` : ""}</div>`
+       <div class="cd" data-until="${esc(t.starts_at)}">${esc(untilText(t.starts_at))}</div><div class="mut">${t.entrants} ${t.kind === "finals" ? "qualified so far" : "entered so far"}</div>
+       ${t.kind === "weekly" ? `<p style="margin:.6rem 0 0"><a class="btn" href="/arena/play#tournament">Enter from the browser</a></p>` : ""}</div>`
     : running
       ? `<p><span class="live"></span><b>Live now:</b> round ${t.current_round} of ${t.rounds_total ?? "?"}. This page refreshes every 30 seconds.</p>`
       : t.status === "finished"
@@ -224,7 +233,7 @@ export async function tournamentPage(env: Env, id: string): Promise<Response> {
     ? `<div class="scroll-x"><table><tr><th>#</th><th>Player</th><th>Points</th><th>Tiebreak</th><th>Rating</th><th>Games</th></tr>
        ${t.standings.map((s) => `<tr><td>${s.place}</td><td>${esc(s.name)}${s.qualified_from ? ` <span class="mut">(qualified)</span>` : ""}</td><td>${s.points}</td><td>${s.buchholz}</td><td>${s.rating}</td><td>${s.games}${s.byes ? ` <span class="mut">+${s.byes} bye</span>` : ""}</td></tr>`).join("")}
        </table></div>`
-    : `<p class="mut">Nobody has entered yet.${t.kind === "weekly" ? ` Agents join with <code>tournament_join</code> over MCP or <code>POST /v1/arena/tournaments/next/join</code>; people press Enter at <a href="/arena/play">/arena/play</a>.` : ""}</p>`;
+    : `<p class="mut">Nobody has entered yet.${t.kind === "weekly" ? ` Agents join with <code>tournament_join</code> over MCP or <code>POST /v1/arena/tournaments/next/join</code>; people press Enter at <a href="/arena/play#tournament">/arena/play</a>.` : ""}</p>`;
   const rounds = t.rounds.length
     ? [...t.rounds].reverse().map((r) => `<h3 style="font-size:1rem;margin:1.25rem 0 .25rem">Round ${r.round}</h3><div class="scroll-x"><table>
         ${r.games.map((g) => `<tr><td><a href="${esc(g.page)}">${esc(g.white)} vs ${esc(g.black)}</a></td><td>${g.status === "active" ? `<span class="live"></span>playing` : esc(g.result ?? g.status)}</td></tr>`).join("")}</table></div>`).join("")
@@ -258,6 +267,7 @@ export function playPage(): Response {
 
 <section id="signedout" hidden>
   <h2>Get a player key</h2>
+  <p class="mut">You need a key to play or to enter the weekly tournament.</p>
   <form id="signup" class="row"><input id="name" required minlength="3" maxlength="60" placeholder="Display name" aria-label="Display name">
     <input id="email" type="email" maxlength="200" placeholder="Email (optional)" aria-label="Email (optional)"><button class="btn">Get a key</button></form>
   <p class="mut">Your name shows on the public ladder. The key stays in this browser; save a copy to play from another one.</p>
@@ -278,7 +288,7 @@ export function playPage(): Response {
   <p style="margin:.5rem 0"><button type="button" class="b2" data-opp="open">Find an open opponent</button> <span class="mut">pairs you with the next agent or person who asks</span></p>
   <form id="chal" class="row"><input id="oppid" placeholder="agt_… id from the ladder" aria-label="Opponent id"><button class="btn">Challenge</button></form>
 
-  <h2>Weekly tournament</h2>
+  <h2 id="tournament">Weekly tournament</h2>
   <div class="card" style="max-width:26rem"><h3><a id="tlink" href="/arena"><span id="tname">Loading…</span></a></h3>
     <div class="cd" id="tcd"></div><div class="mut" id="tcount"></div><p id="tin" class="mut"></p>
     <button type="button" class="btn" id="tjoin" hidden>Enter</button></div>
@@ -306,6 +316,7 @@ function msg(t,bad){const e=$("msg");e.textContent=t||"";e.className=bad?"bad":"
 function save(k){key=k;try{k?localStorage.setItem(K,k):localStorage.removeItem(K);}catch(e){}}
 function show(){$("signedout").hidden=!!me;$("signedin").hidden=!me;$("lobby").hidden=!me;if(!me)$("game").hidden=true;if(me)$("who").textContent=me.name;}
 async function loadMe(){if(!key){me=null;show();return;}try{const r=await api("GET","/v1/agents/me");me=r.agent;show();await games();await loadT();
+if(location.hash==="#tournament")$("tournament").scrollIntoView();
 const q=new URLSearchParams(location.search).get("game");if(q&&!cur)openG(q);}catch(e){msg("That key didn't work: "+e.message,true);save(null);me=null;show();}}
 $("signup").onsubmit=async ev=>{ev.preventDefault();const b={name:$("name").value.trim(),kind:"human"};const em=$("email").value.trim();if(em)b.contact_email=em;
 try{save(null);const r=await api("POST","/v1/agents/register",b);save(r.api_key);$("newkey").textContent=r.api_key;$("keybox").hidden=false;msg("");await loadMe();}catch(e){msg(e.message,true);}};
@@ -314,7 +325,7 @@ $("signout").onclick=ev=>{ev.preventDefault();save(null);me=null;cur=null;gv=nul
 document.querySelectorAll("[data-opp]").forEach(b=>b.onclick=()=>start({opponent:b.dataset.opp}));
 $("chal").onsubmit=ev=>{ev.preventDefault();const v=$("oppid").value.trim();if(v)start({opponent:v});};
 async function start(o){o.color=$("color").value;try{const g=await api("POST","/v1/arena/chess/play",o);
-msg(g.status==="waiting"?(g.invited_id?"Challenge sent. The game starts when they accept.":"Waiting for an opponent. Keep this page open and the game appears when someone joins."):"Game on.");
+msg(g.status==="waiting"?(g.invited_id?"Challenge sent. The game starts when they accept.":"Waiting for an opponent. Keep this page open and the game appears when someone joins. Want to play now? Cancel this and pick a house bot."):"Game on.");
 await openG(g.id);await games();}catch(e){msg(e.message,true);}}
 const opp=g=>(g.white&&me&&g.white.id===me.id)?g.black:g.white;
 async function games(){if(!me)return;let r;try{r=await api("GET","/v1/arena/chess/games/mine?status=current");}catch(e){return;}
@@ -341,7 +352,7 @@ else if(g.status==="waiting")t=g.invited_id?"Waiting for them to accept.":"Waiti
 else if(g.your_turn)t="Your move ("+g.your_color+")."+(g.move_deadline?" Time left: "+left(g.move_deadline):"");
 else t=(g.to_move||"")+" to move."+(g.move_deadline?" Their time left: "+left(g.move_deadline):"");$("gstatus").textContent=t;}
 function draw(){const g=gv;if(!g)return;$("game").hidden=false;$("gtitle").textContent=(g.white?g.white.name:"?")+" vs "+(g.black?g.black.name:"(open seat)");
-$("replay").href=g.page;$("resign").hidden=!(g.status==="active"&&g.your_color);$("resign").textContent="Resign";armed=false;status();
+$("replay").href=g.page;$("resign").hidden=!((g.status==="active"||g.status==="waiting")&&g.your_color);$("resign").textContent=g.status==="waiting"?"Cancel this game":"Resign";armed=false;status();
 const flip=g.your_color==="black",b=parse(g.fen),legal=g.your_turn?(g.legal_uci||[]):[],lm=g.last_move?[g.last_move.uci.slice(0,2),g.last_move.uci.slice(2,4)]:[];
 const pb=$("pb");pb.replaceChildren();for(let k=0;k<64;k++){const i=flip?63-k:k,sq=sqName(i),btn=document.createElement("button");btn.type="button";
 btn.className=((Math.floor(i/8)+i%8)%2?"d":"l")+(lm.includes(sq)?" lm":"");btn.textContent=G[b[i]]||"";btn.setAttribute("aria-label",sq+(b[i]?" "+b[i]:""));
@@ -352,7 +363,8 @@ if(sel){const opts=legal.filter(u=>u.slice(0,2)===sel&&u.slice(2,4)===sq);if(opt
 sel=legal.some(u=>u.slice(0,2)===sq)?sq:null;draw();}
 async function send(u){const b={move:u};const r=$("reason").value.trim();if(r)b.reason=r;gv.your_turn=false;sel=null;draw();
 try{await api("POST","/v1/arena/chess/games/"+cur+"/move",b);$("reason").value="";msg("");}catch(e){msg(e.message,true);}await reload();draw();games();}
-$("resign").onclick=async()=>{if(!armed){armed=true;$("resign").textContent="Click again to resign";return;}try{await api("POST","/v1/arena/chess/games/"+cur+"/resign");}catch(e){msg(e.message,true);}await reload();games();};
+$("resign").onclick=async()=>{if(gv&&gv.status==="waiting"){try{await api("POST","/v1/arena/chess/games/"+cur+"/resign");msg("Cancelled. Pick a house bot to play right away.");}catch(e){msg(e.message,true);}await reload();games();return;}
+if(!armed){armed=true;$("resign").textContent="Click again to resign";return;}try{await api("POST","/v1/arena/chess/games/"+cur+"/resign");}catch(e){msg(e.message,true);}await reload();games();};
 setInterval(()=>{if(!me)return;tick++;if(gv&&gv.status!=="finished"&&!(gv.your_turn))reload();else status();if(tick%4===0)games();if(tick%24===0)loadT();
 if(tour&&tour.status==="scheduled")$("tcd").textContent=left(tour.starts_at);else $("tcd").textContent=tour&&tour.status==="running"?"Live now":"";},2500);
 setInterval(()=>{if(tour&&tour.status==="scheduled")$("tcd").textContent=left(tour.starts_at);if(gv&&gv.status==="active")status();},1000);

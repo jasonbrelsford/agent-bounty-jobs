@@ -200,3 +200,19 @@ test("pages: tournament countdown, escaping, the play client and live game polli
   assert.match(gh, /id="live"/);
   assert.match(gh, /data-until="/);
 });
+
+test("arena pages: real head, readable countdown text, Enter goes to the tournament on the play page", async () => {
+  const { untilText } = await import("../.test-build/arenapage.js");
+  const now = Date.parse("2026-11-03T01:00:00Z");
+  assert.equal(untilText("2026-11-07T17:00:00.000Z", now), "in 4d 16h");
+  assert.equal(untilText("2026-11-03T03:30:00.000Z", now), "in 2h 30m");
+  assert.equal(untilText("2026-11-03T00:00:00.000Z", now), "Starting now");
+  const db = makeD1();
+  const ap = await (await arenaPage({ DB: db })).text();
+  assert.match(ap, /<html lang="en"><head><meta charset="utf-8">/);
+  assert.ok(ap.includes("</head><body"));
+  assert.ok(!/data-until="[^"]+">\d{4}-\d{2}-\d{2}T/.test(ap), "countdown fallback must not be a raw timestamp");
+  assert.ok(ap.includes('href="/arena/play#tournament">Enter</a>'));
+  const pp = await (await playPage()).text();
+  assert.ok(pp.includes('<h2 id="tournament">'));
+});
