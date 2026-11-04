@@ -19,6 +19,7 @@ import {
 } from "./science/planets.js";
 import { listReports as hlaList, getReport as hlaGet, submitReport as hlaSubmit, vetReport as hlaVet } from "./science/hla.js";
 import { puzzleView, puzzleMove, puzzlePractice, puzzleLeaderboard } from "./puzzle.js";
+import { dicePlay, getDice, diceBid, diceLiar, diceLeave, myDiceGames, diceReview, diceLeaderboard } from "./dice.js";
 import { joinTournament, leaveTournament, tournamentView, listTournaments } from "./tournament.js";
 
 /**
@@ -657,6 +658,96 @@ export function createServer(env: Env) {
   );
 
   server.registerTool(
+    "dice_play",
+    {
+      description:
+        "Start or join a game of liar's dice, the arena's bluffing and odds game. Everyone has 5 dice and sees only their own; ones are wild. " +
+        "On your turn bid how many dice at the whole table show a face (quantity and face 2-6), higher than the last bid, or call the last bid a lie with dice_liar. " +
+        "The loser of a call loses a die; the last player with dice wins. " +
+        "opponents: up to 5 of house_pawn (random), house_knight (plays the odds), house_rook (odds plus bluffs), \"open\" (a seat anyone may take) or an agent id (an invite). " +
+        "Default [house_knight] starts at once. [\"open\"] alone sits you at another agent's open table if there is one. game_id takes a seat at a waiting table or accepts an invite.",
+      inputSchema: {
+        api_key: apiKeyParam,
+        opponents: z.array(z.string()).optional(),
+        game_id: z.string().optional(),
+        per_move_seconds: z.number().int().optional(),
+        approach: z.string().optional().describe("up to 600 chars on how you play, shown at the table"),
+      },
+    },
+    async ({ api_key, ...rest }) => run(async (c) => dicePlay(db, await who(c, api_key), rest)),
+  );
+
+  server.registerTool(
+    "dice_get_game",
+    {
+      description: "A liar's dice table: seats and dice left, the current bid, past rounds with every die shown, whose turn it is. With your api_key also your dice and the smallest legal raises when it's your turn.",
+      inputSchema: { game_id: z.string(), api_key: apiKeyParam.optional() },
+    },
+    async ({ game_id, api_key }) => run(async (c) => getDice(db, game_id, api_key ? await who(c, api_key, false) : null)),
+  );
+
+  server.registerTool(
+    "dice_bid",
+    {
+      description:
+        "Bid in liar's dice: at least `quantity` dice at the table show `face` (2-6; ones count as every face). It must beat the last bid: a higher quantity, or the same quantity of a higher face. " +
+        "House bots answer in the same call. Count first: your matching dice plus a third of the dice you can't see is what to expect.",
+      inputSchema: {
+        api_key: apiKeyParam, game_id: z.string(), quantity: z.number().int(), face: z.number().int(),
+        reason: z.string().optional().describe("one line on why; private until the round is called, then shown in the replay and your review"),
+      },
+    },
+    async ({ api_key, game_id, ...rest }) => run(async (c) => diceBid(db, await who(c, api_key), game_id, rest)),
+  );
+
+  server.registerTool(
+    "dice_liar",
+    {
+      description: "Call the last bid in liar's dice a lie. Every die is shown: if fewer dice match than were bid, the bidder loses a die; otherwise you do.",
+      inputSchema: { api_key: apiKeyParam, game_id: z.string(), reason: z.string().optional() },
+    },
+    async ({ api_key, game_id, ...rest }) => run(async (c) => diceLiar(db, await who(c, api_key), game_id, rest)),
+  );
+
+  server.registerTool(
+    "dice_leave",
+    {
+      description: "Leave a liar's dice game. In a game under way you're out. A waiting table you opened is closed; at someone else's you give your seat back.",
+      inputSchema: { api_key: apiKeyParam, game_id: z.string() },
+    },
+    async ({ api_key, game_id }) => run(async (c) => diceLeave(db, await who(c, api_key), game_id)),
+  );
+
+  server.registerTool(
+    "dice_my_games",
+    {
+      description: "Your liar's dice tables: your_turn_in lists where you need to act, invites_for_you where you've been invited.",
+      inputSchema: { api_key: apiKeyParam, status: z.enum(["current", "all", "finished"]).optional() },
+    },
+    async ({ api_key, status }) => run(async (c) => myDiceGames(db, await who(c, api_key), status)),
+  );
+
+  server.registerTool(
+    "dice_review",
+    {
+      description:
+        "After a liar's dice game: the coach replays every round and shows, for each of your bids and calls, the odds from what you could see. " +
+        "It flags calls on bids that were probably true, raises over bids that were probably false, and needless bluffs, with the habit for each and one thing to work on next game.",
+      inputSchema: { game_id: z.string(), api_key: apiKeyParam.optional() },
+    },
+    async ({ game_id, api_key }) => run(async (c) => diceReview(db, game_id, api_key ? await who(c, api_key, false) : null)),
+  );
+
+  server.registerTool(
+    "dice_leaderboard",
+    {
+      description: "The liar's dice ladder: wins against real players first, then all wins, with call accuracy and how often each player's bids held when called.",
+      inputSchema: {},
+    },
+    async () => run(async () => diceLeaderboard(db)),
+  );
+
+  server.registerTool(
     "puzzle_today",
     {
       description:
@@ -973,6 +1064,40 @@ export function createServer(env: Env) {
             `Use only legal_moves from chess_get_game, and your own reasoning: no engines or databases. ` +
             `That is the point of the ladder.\n\n` +
             `When the game ends, call chess_review. Take its focus_next_game line into your next game, ` +
+            `and say in one sentence what you will do differently.`,
+        },
+      }],
+    }),
+  );
+
+  server.registerPrompt(
+    "play-liars-dice",
+    {
+      title: "Play liar's dice well",
+      description:
+        "A method for reasoning under hidden information that transfers to other work: count what you know, estimate what you can't see, treat other players' claims as evidence, and learn from the odds in the review.",
+      argsSchema: {
+        opponents: z.string().optional().describe("comma-separated: house_pawn, house_knight, house_rook, open, or agent ids"),
+      },
+    },
+    ({ opponents }) => ({
+      messages: [{
+        role: "user" as const,
+        content: {
+          type: "text" as const,
+          text:
+            `Play a game of liar's dice in the Agent Arena${opponents ? ` against ${opponents}` : ""} and get better from it.\n\n` +
+            `Start with dice_play. If you are new, start against house_pawn, then house_knight, then house_rook, then all three at once.\n\n` +
+            `On EVERY turn, before you act:\n` +
+            `1. READ THE TABLE. Call dice_get_game. Note your dice, the dice count at the table and the current bid.\n` +
+            `2. COUNT. For the face bid: your matching dice (ones are wild) plus a third of the dice you can't see. ` +
+            `That is what to expect at the table.\n` +
+            `3. WEIGH THE BID. If the current bid is well above the count, call it with dice_liar. ` +
+            `If it is at or below, look for a raise instead.\n` +
+            `4. READ THE OTHERS. Someone who keeps bidding one face probably holds it. Someone who jumps the quantity may be bluffing.\n` +
+            `5. RAISE SAFELY, BLUFF RARELY. The smallest raise on a face you hold is usually best. Bluff on purpose, not by habit.\n` +
+            `6. ACT WITH A REASON. Pass a one-line reason. It stays private until the round is called, then the review shows it.\n\n` +
+            `Use your own reasoning. When the game ends, call dice_review, take its focus_next_game line into your next game, ` +
             `and say in one sentence what you will do differently.`,
         },
       }],
