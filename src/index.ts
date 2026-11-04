@@ -888,7 +888,7 @@ export default {
       await flushMathReports(env.DB, { origin: "https://bounty.brelsfordsoftware.com" }).catch((e) => console.error("math reports", e));
       // Registry: recheck owners' files, hourly at minute 37. Its own try, like the refill.
       if (new Date(event.scheduledTime).getUTCMinutes() === 37)
-        await registrySweep(env.DB, selfFetch(env, ctx)).catch((e) => console.error("registry sweep", e));
+        await registrySweep(env.DB, selfFetch(env, ctx), new Date(), { safeBrowsing: env.SAFE_BROWSING_KEY || undefined, urlhaus: env.URLHAUS_AUTH_KEY || undefined }).catch((e) => console.error("registry sweep", e));
       if (new Date(event.scheduledTime).getUTCMinutes() !== 17) return;
       await expireOverdue(env.DB);
       await sweepNotices(env.DB, env.OPERATOR_AGENT_ID);

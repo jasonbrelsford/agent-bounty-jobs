@@ -50,7 +50,7 @@ export class RegistryError extends Error {
   }
 }
 
-import { scanServer, type Scan } from "./scan.js";
+import { scanServer, type Scan, type ScanKeys } from "./scan.js";
 
 type Fetcher = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -388,7 +388,7 @@ export async function checkRemote(fetcher: Fetcher, remote: { type?: unknown; ur
   }
 }
 
-export type PublishCtx = { ip: string; fetcher: Fetcher; now?: Date };
+export type PublishCtx = { ip: string; fetcher: Fetcher; now?: Date; keys?: ScanKeys };
 
 /** POST /v0.1/publish: list a server or a new version of it, free, after the automatic checks. */
 export async function publish(db: D1Database, raw: string, ctx: PublishCtx) {
@@ -429,7 +429,7 @@ export async function publish(db: D1Database, raw: string, ctx: PublishCtx) {
     throw new RegistryError(422, "a remote URL is not reachable", down.map((r) => `${r.url}: ${r.http ? `HTTP ${r.http}` : ""}${r.note ? ` ${r.note}` : ""}`.trim()));
 
   const cur = await db.prepare("SELECT version, tools_hash FROM registry_servers WHERE name = ? AND is_latest = 1").bind(server.name).first<{ version: string; tools_hash: string | null }>();
-  const scan = await scanServer(ctx.fetcher, server as never, domain!, cur?.tools_hash ?? null, now);
+  const scan = await scanServer(ctx.fetcher, server as never, domain!, cur?.tools_hash ?? null, now, ctx.keys);
   if (scan.verdict === "flagged")
     throw new RegistryError(422, "the server did not pass the safety scan", scan.findings.filter((f) => f.severity === "high").map((f) => `${f.where}: ${f.what}${f.snippet ? ` (near: ${f.snippet})` : ""}`));
   const cmp = cur ? compareVersions(server.version, cur.version) : 1;
@@ -473,7 +473,7 @@ export function validate(raw: string) {
  * lists the server (a clean 200 without the name, or 404/410) takes it off the list.
  * Network trouble changes nothing. Anyone may ask for a recheck; only the owner's file decides.
  */
-export async function recheck(db: D1Database, name: string, fetcher: Fetcher, now = new Date(), force = false) {
+export async function recheck(db: D1Database, name: string, fetcher: Fetcher, now = new Date(), force = false, keys: ScanKeys = {}) {
   const row = await db.prepare(`SELECT version, source, domain, status, last_checked_at, server_json, scan_verdict, tools_hash
       FROM registry_servers WHERE name = ? AND is_latest = 1`).bind(name)
     .first<{ version: string; source: string; domain: string; status: string; last_checked_at: string | null; server_json: string; scan_verdict: string | null; tools_hash: string | null }>();
@@ -497,7 +497,7 @@ export async function recheck(db: D1Database, name: string, fetcher: Fetcher, no
   // Safety scan of the latest version. A scan that could not read the tools never clears a flag.
   let safety = row.scan_verdict;
   if (statusNow !== "deleted") {
-    const scan = await scanServer(fetcher, JSON.parse(row.server_json), row.domain, row.tools_hash, now);
+    const scan = await scanServer(fetcher, JSON.parse(row.server_json), row.domain, row.tools_hash, now, keys);
     if (row.scan_verdict === "flagged" && scan.verdict === "partial") {
       await db.prepare("UPDATE registry_servers SET scanned_at = ? WHERE name = ? AND version = ?").bind(at, name, row.version).run();
     } else {
@@ -527,12 +527,12 @@ export async function adminStatus(db: D1Database, b: Record<string, unknown>, no
 }
 
 /** Cron: recheck ownership and rescan the servers checked longest ago (the operator's own included), and drop submission logs older than two days. */
-export async function registrySweep(db: D1Database, fetcher: Fetcher, now = new Date()) {
+export async function registrySweep(db: D1Database, fetcher: Fetcher, now = new Date(), keys: ScanKeys = {}) {
   const due = (await db
     .prepare(`SELECT name FROM registry_servers WHERE is_latest = 1 AND status != 'deleted'
               ORDER BY COALESCE(last_checked_at, '') LIMIT ?`)
     .bind(LIMITS.sweep_batch).all<{ name: string }>()).results ?? [];
-  for (const d of due) await recheck(db, d.name, fetcher, now, true).catch((e) => console.error("registry recheck", d.name, e));
+  for (const d of due) await recheck(db, d.name, fetcher, now, true, keys).catch((e) => console.error("registry recheck", d.name, e));
   await db.prepare("DELETE FROM registry_publish_log WHERE created_at < ?").bind(new Date(now.getTime() - 2 * 86_400_000).toISOString()).run();
   return { rechecked: due.length };
 }

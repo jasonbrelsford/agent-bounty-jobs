@@ -25,7 +25,7 @@ const med = (f) => f.filter((x) => x.severity === "medium");
  * A pretend internet with a working MCP server at MCP, the ownership file,
  * Cloudflare's security resolver and OSV.dev. Options change each part.
  */
-function world({ tools = CLEAN, prompts = [], sse = false, auth = false, blocked = [], osv = {}, proof = "com.acme/*", session = "s-1" } = {}) {
+function world({ tools = CLEAN, prompts = [], sse = false, auth = false, blocked = [], osv = {}, proof = "com.acme/*", session = "s-1", sb = [], urlhaus = {} } = {}) {
   const calls = [];
   const f = async (url, init = {}) => {
     calls.push({ url, init });
@@ -34,6 +34,18 @@ function world({ tools = CLEAN, prompts = [], sse = false, auth = false, blocked
     if (u.origin + u.pathname === SCAN.dns) {
       const name = u.searchParams.get("name");
       return Response.json({ Status: 0, Answer: [{ type: 1, data: blocked.includes(name) ? "0.0.0.0" : "93.184.216.34" }] });
+    }
+    if (u.origin + u.pathname === SCAN.safe_browsing) {
+      if (u.searchParams.get("key") !== "sb-key") return new Response("bad key", { status: 400 });
+      const q = JSON.parse(init.body);
+      const matches = q.threatInfo.threatEntries.filter((e) => sb.includes(e.url)).map((e) => ({ threatType: "SOCIAL_ENGINEERING", threat: { url: e.url } }));
+      return Response.json(matches.length ? { matches } : {});
+    }
+    if (url === SCAN.urlhaus) {
+      if (init.headers["auth-key"] !== "uh-key") return new Response("unauthorized", { status: 401 });
+      const h = new URLSearchParams(init.body).get("host");
+      const st = urlhaus[h];
+      return Response.json(st ? { query_status: "ok", urls: [{ url_status: st }] } : { query_status: "no_results" });
     }
     if (url === SCAN.osv) {
       const q = JSON.parse(init.body);
@@ -206,4 +218,23 @@ test("the browse page shows the scan badge", async () => {
   const detail = await (await registryRoutes(new Request(`${O}/registry/servers/com.acme/weather`), new URL(`${O}/registry/servers/com.acme/weather`), { DB: db })).text();
   assert.match(detail, /Safety scan/);
   assert.match(detail, /cannot see the code behind a remote server/);
+});
+
+test("optional keys: Safe Browsing and URLhaus add checks, and say so when unset", async () => {
+  const keys = { safeBrowsing: "sb-key", urlhaus: "uh-key" };
+  const none = await scanServer(world(), srv(), "acme.com", null);
+  assert.ok(none.notChecked.some((x) => /Safe Browsing: no key/.test(x)) && none.notChecked.some((x) => /URLhaus: no key/.test(x)));
+  const clean = await scanServer(world(), srv(), "acme.com", null, new Date(), keys);
+  assert.equal(clean.verdict, "passed");
+  assert.ok(clean.checked.some((x) => /Google Safe Browsing/.test(x)) && clean.checked.some((x) => /hosts on URLhaus/.test(x)));
+  const phish = await scanServer(world({ sb: ["https://mcp.acme.com/mcp"] }), srv(), "acme.com", null, new Date(), keys);
+  assert.equal(phish.verdict, "flagged");
+  assert.match(phish.findings[0].what, /Safe Browsing lists this as social engineering/);
+  const live = await scanServer(world({ urlhaus: { "mcp.acme.com": "online" } }), srv(), "acme.com", null, new Date(), keys);
+  assert.equal(live.verdict, "flagged");
+  const past = await scanServer(world({ urlhaus: { "acme.com": "offline" } }), srv(), "acme.com", null, new Date(), keys);
+  assert.equal(past.verdict, "warning");
+  const badKey = await scanServer(world(), srv(), "acme.com", null, new Date(), { safeBrowsing: "wrong", urlhaus: "wrong" });
+  assert.equal(badKey.verdict, "passed");
+  assert.ok(badKey.notChecked.some((x) => /Safe Browsing did not answer/.test(x)) && badKey.notChecked.some((x) => /URLhaus did not answer/.test(x)));
 });

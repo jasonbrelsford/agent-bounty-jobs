@@ -1,5 +1,5 @@
 /**
- * Safety scan for registry listings. Free sources only, no keys:
+ * Safety scan for registry listings. Free sources; two optional free keys add more:
  *
  *   1. Tool poisoning: connect as an MCP client, read tools/list and prompts/list,
  *      and look for what poisoned tools use to steer an agent: hidden tags such as
@@ -15,6 +15,10 @@
  *   4. Packages: npm, PyPI and NuGet packages are looked up on OSV.dev, which
  *      carries the OpenSSF malicious-package reports (MAL- ids) and known
  *      vulnerabilities.
+ *
+ *   5. With a free key: Google Safe Browsing (SAFE_BROWSING_KEY) checks each remote
+ *      and website URL, and URLhaus (URLHAUS_AUTH_KEY) checks each host for
+ *      malware URLs. Without the keys these two are listed as not checked.
  *
  * What it cannot see: the code behind a remote server. A server can pass every
  * check here and still misbehave when a tool is actually called.
@@ -46,7 +50,12 @@ export const SCAN = {
   long_description: 4_000,
   dns: "https://security.cloudflare-dns.com/dns-query",
   osv: "https://api.osv.dev/v1/query",
+  safe_browsing: "https://safebrowsing.googleapis.com/v4/threatMatches:find",
+  urlhaus: "https://urlhaus-api.abuse.ch/v1/host/",
 } as const;
+
+/** Optional free keys, from Worker secrets. Each one adds a check; none is required. */
+export type ScanKeys = { safeBrowsing?: string; urlhaus?: string };
 
 const UA = "bounty-mcp-registry-scan/1 (+https://bounty.brelsfordsoftware.com/registry)";
 
@@ -229,6 +238,42 @@ export async function checkHost(fetcher: Fetcher, host: string): Promise<"clean"
   } catch { return "unknown"; }
 }
 
+/** Google Safe Browsing v4 Lookup: the URLs Google lists as malware, phishing or unwanted software. */
+export async function checkSafeBrowsing(fetcher: Fetcher, key: string, urls: string[]): Promise<{ status: "checked"; matches: { url: string; type: string }[] } | { status: "unknown" }> {
+  try {
+    const res = await fetcher(`${SCAN.safe_browsing}?key=${encodeURIComponent(key)}`, {
+      method: "POST", headers: { "content-type": "application/json", "user-agent": UA }, signal: AbortSignal.timeout(SCAN.timeout_ms),
+      body: JSON.stringify({
+        client: { clientId: "bounty-mcp-registry", clientVersion: "1" },
+        threatInfo: {
+          threatTypes: ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"],
+          platformTypes: ["ANY_PLATFORM"], threatEntryTypes: ["URL"],
+          threatEntries: urls.map((url) => ({ url })),
+        },
+      }),
+    });
+    if (!res.ok) { await res.body?.cancel(); return { status: "unknown" }; }
+    const j = (await res.json()) as { matches?: { threatType?: string; threat?: { url?: string } }[] };
+    return { status: "checked", matches: (j.matches ?? []).map((m) => ({ url: String(m.threat?.url ?? ""), type: String(m.threatType ?? "") })) };
+  } catch { return { status: "unknown" }; }
+}
+
+/** URLhaus host lookup: malware download URLs abuse.ch has seen on this host, live now or in the past. */
+export async function checkUrlhaus(fetcher: Fetcher, key: string, h: string): Promise<{ status: "clean" | "online" | "past"; count: number } | { status: "unknown" }> {
+  try {
+    const res = await fetcher(SCAN.urlhaus, {
+      method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", "auth-key": key, "user-agent": UA },
+      signal: AbortSignal.timeout(SCAN.timeout_ms), body: `host=${encodeURIComponent(h)}`,
+    });
+    if (!res.ok) { await res.body?.cancel(); return { status: "unknown" }; }
+    const j = (await res.json()) as { query_status?: string; urls?: { url_status?: string }[] };
+    if (j.query_status === "no_results" || j.query_status === "invalid_host") return { status: "clean", count: 0 };
+    if (j.query_status !== "ok") return { status: "unknown" };
+    const u = j.urls ?? [];
+    return { status: u.some((x) => x.url_status === "online") ? "online" : "past", count: u.length };
+  } catch { return { status: "unknown" }; }
+}
+
 const OSV_ECOSYSTEM: Record<string, string> = { npm: "npm", pypi: "PyPI", nuget: "NuGet" };
 
 /** OSV.dev: MAL- ids are reported malicious packages; others are known vulnerabilities. */
@@ -262,7 +307,7 @@ type ServerLike = {
 
 const host = (u: unknown) => { try { return new URL(String(u).replace(/\{[A-Za-z0-9_]+\}/g, "x")).hostname.toLowerCase(); } catch { return null; } };
 
-export async function scanServer(fetcher: Fetcher, server: ServerLike, domain: string, prevHash: string | null, now = new Date()): Promise<Scan> {
+export async function scanServer(fetcher: Fetcher, server: ServerLike, domain: string, prevHash: string | null, now = new Date(), keys: ScanKeys = {}): Promise<Scan> {
   const findings: Finding[] = [];
   const checked: string[] = [];
   const notChecked: string[] = [];
@@ -301,6 +346,31 @@ export async function scanServer(fetcher: Fetcher, server: ServerLike, domain: s
   }
   if (hosts.size - unknownHosts.length > 0) checked.push(`${hosts.size - unknownHosts.length} hosts against Cloudflare's malware block list`);
   if (unknownHosts.length) notChecked.push(`block-list lookup did not answer for ${unknownHosts.join(", ")}`);
+
+  // 5: optional keyed lists.
+  const hostList = [...hosts].slice(0, 6);
+  if (keys.safeBrowsing) {
+    const urls = new Set<string>(hostList.map((h) => `https://${h}/`));
+    for (const r of server.remotes ?? []) if (typeof r.url === "string" && !r.url.includes("{")) urls.add(r.url);
+    if (typeof server.websiteUrl === "string") urls.add(server.websiteUrl);
+    const sb = await checkSafeBrowsing(fetcher, keys.safeBrowsing, [...urls].slice(0, 20));
+    if (sb.status === "unknown") notChecked.push("Google Safe Browsing did not answer");
+    else {
+      checked.push(`${urls.size} URLs on Google Safe Browsing`);
+      for (const m of sb.matches.slice(0, 5)) findings.push({ severity: "high", where: m.url, what: `Google Safe Browsing lists this as ${m.type.toLowerCase().replace(/_/g, " ")}` });
+    }
+  } else notChecked.push("Google Safe Browsing: no key set");
+  if (keys.urlhaus) {
+    let n = 0;
+    for (const h of hostList) {
+      const u = await checkUrlhaus(fetcher, keys.urlhaus, h);
+      if (u.status === "unknown") { notChecked.push(`URLhaus did not answer for ${h}`); continue; }
+      n++;
+      if (u.status === "online") findings.push({ severity: "high", where: h, what: `URLhaus lists live malware downloads on this host (${u.count} URL${u.count === 1 ? "" : "s"} seen)` });
+      else if (u.status === "past") findings.push({ severity: "medium", where: h, what: `URLhaus saw malware downloads on this host before, none live now (${u.count} URL${u.count === 1 ? "" : "s"})` });
+    }
+    if (n) checked.push(`${n} hosts on URLhaus`);
+  } else notChecked.push("URLhaus: no key set");
 
   // 4: packages.
   for (const p of (server.packages ?? []).slice(0, 10)) {

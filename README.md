@@ -755,6 +755,10 @@ date: passed, worth a look, partly scanned (tools behind a sign-in), or flagged.
 submission with a serious finding is refused with 422; a listed server that turns
 serious is hidden (410) until a clean rescan, and a partial scan never clears a flag.
 It cannot see the code behind a remote server, so a clean scan is not a guarantee.
+Two optional free keys add more, read from Worker secrets: `SAFE_BROWSING_KEY`
+(Google Safe Browsing checks each URL) and `URLHAUS_AUTH_KEY` (abuse.ch URLhaus checks
+each host for malware downloads; live ones flag, past ones warn). Without them the scan
+lists those two as not checked.
 
 Limits: 10 submissions an hour and 30 a day per sender, 30 a day per domain, 500 a day
 in total, 16 KB per server.json. Senders are stored only as a hash that changes daily,
