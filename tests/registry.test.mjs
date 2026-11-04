@@ -196,11 +196,11 @@ test("the owner's file decides removal: deprecated, deleted, or no longer listed
   assert.equal((await listServers(db, { include_deleted: "true" })).metadata.count, 2);
   await rejects(serverVersion(db, "com.acme/weather", "latest"), 404);
   // The board's own entry is never rechecked away.
-  assert.equal((await recheck(db, BOUNTY, net({}))).note, "kept by the registry operator");
+  assert.equal((await recheck(db, BOUNTY, net({}))).note, "ownership kept by the registry operator");
   // The hourly sweep rechecks owner entries and clears old logs.
   await publish(db, JSON.stringify(srv({ name: "com.acme/radar" })), { ip: "e", fetcher: owned("com.acme/*"), now: t0 });
   const s = await registrySweep(db, owned(""), new Date(t0.getTime() + 3 * 86_400_000));
-  assert.equal(s.rechecked, 1);
+  assert.equal(s.rechecked, 2, "the owner entry and the board's own entry");
   assert.equal(db.raw.prepare("SELECT COUNT(*) AS n FROM registry_publish_log").get().n, 0);
   assert.equal((await adminStatus(db, { name: "com.acme/radar", status: "active" })).status, "active");
 });

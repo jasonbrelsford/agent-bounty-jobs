@@ -50,6 +50,8 @@ export class RegistryError extends Error {
   }
 }
 
+import { scanServer, type Scan } from "./scan.js";
+
 type Fetcher = (input: string, init?: RequestInit) => Promise<Response>;
 
 // ── validation ──────────────────────────────────────────────────────────────
@@ -180,7 +182,11 @@ type Row = {
   name: string; version: string; server_json: string; status: string; status_message: string | null;
   status_changed_at: string; published_at: string; updated_at: string; is_latest: number;
   featured: number; source: string; domain: string; checks_json: string | null; last_checked_at: string | null;
+  scan_verdict?: string | null; scan_json?: string | null; scanned_at?: string | null; tools_hash?: string | null; tools_changed_at?: string | null;
 };
+
+/** Rows a reader sees: not deleted and not flagged by the safety scan. */
+const VISIBLE = "status != 'deleted' AND COALESCE(scan_verdict, '') != 'flagged'";
 
 export function entry(r: Row) {
   const official: Record<string, unknown> = {
@@ -189,6 +195,7 @@ export function entry(r: Row) {
   };
   if (r.status_message) official.statusMessage = r.status_message;
   const checks = r.checks_json ? JSON.parse(r.checks_json) : {};
+  const scan: Partial<Scan> = r.scan_json ? JSON.parse(r.scan_json) : {};
   return {
     server: JSON.parse(r.server_json),
     _meta: {
@@ -199,6 +206,15 @@ export function entry(r: Row) {
         domain: r.domain,
         ...checks,
         lastCheckedAt: r.last_checked_at,
+        safety: {
+          verdict: r.scan_verdict ?? "not_scanned",
+          scannedAt: r.scanned_at ?? null,
+          toolCount: scan.toolCount ?? null,
+          toolsChangedAt: r.tools_changed_at ?? null,
+          checked: scan.checked ?? [],
+          notChecked: scan.notChecked ?? [],
+          findings: scan.findings ?? [],
+        },
       },
     },
   };
@@ -223,7 +239,7 @@ export async function listServers(db: D1Database, o: ListOpts = {}) {
     if (Number.isNaN(Date.parse(since))) throw new RegistryError(400, "updated_since must be an RFC3339 timestamp");
     where.push("updated_at >= ?"); args.push(new Date(since).toISOString());
   }
-  if (!truthy(o.include_deleted) && !since) where.push("status != 'deleted'");
+  if (!truthy(o.include_deleted) && !since) where.push(VISIBLE);
   const q = o.search?.trim();
   if (q) {
     if (q.length < 3) throw new RegistryError(400, "search needs at least 3 characters");
@@ -251,7 +267,7 @@ export async function listServers(db: D1Database, o: ListOpts = {}) {
 /** GET /v0.1/servers/{name}/versions */
 export async function serverVersions(db: D1Database, name: string, includeDeleted = false) {
   const rows = (await db
-    .prepare(`SELECT * FROM registry_servers WHERE name = ? ${includeDeleted ? "" : "AND status != 'deleted'"} ORDER BY published_at`)
+    .prepare(`SELECT * FROM registry_servers WHERE name = ? ${includeDeleted ? "" : `AND ${VISIBLE}`} ORDER BY published_at`)
     .bind(name).all<Row>()).results ?? [];
   if (!rows.length) throw new RegistryError(404, `server ${name} not found`);
   return { servers: rows.map(entry), metadata: { count: rows.length } };
@@ -260,7 +276,7 @@ export async function serverVersions(db: D1Database, name: string, includeDelete
 /** GET /v0.1/servers/{name}/versions/{version} ('latest' allowed) */
 export async function serverVersion(db: D1Database, name: string, version: string, includeDeleted = false) {
   const r = await db
-    .prepare(`SELECT * FROM registry_servers WHERE name = ? AND ${version === "latest" ? "is_latest = 1" : "version = ?"} ${includeDeleted ? "" : "AND status != 'deleted'"}`)
+    .prepare(`SELECT * FROM registry_servers WHERE name = ? AND ${version === "latest" ? "is_latest = 1" : "version = ?"} ${includeDeleted ? "" : `AND ${VISIBLE}`}`)
     .bind(...(version === "latest" ? [name] : [name, version])).first<Row>();
   if (!r) throw new RegistryError(404, `server ${name} version ${version} not found`);
   return entry(r);
@@ -277,10 +293,10 @@ export async function browse(db: D1Database, q?: string | null, page = 0, size =
     args.push(p, p, p);
   }
   const rows = (await db
-    .prepare(`SELECT * FROM registry_servers WHERE is_latest = 1 AND status != 'deleted' ${filter}
+    .prepare(`SELECT * FROM registry_servers WHERE is_latest = 1 AND ${VISIBLE} ${filter}
               ORDER BY featured DESC, updated_at DESC, name LIMIT ? OFFSET ?`)
     .bind(...args, size + 1, page * size).all<Row>()).results ?? [];
-  const total = await db.prepare("SELECT COUNT(*) AS n FROM registry_servers WHERE is_latest = 1 AND status != 'deleted'").first<{ n: number }>();
+  const total = await db.prepare(`SELECT COUNT(*) AS n FROM registry_servers WHERE is_latest = 1 AND ${VISIBLE}`).first<{ n: number }>();
   return { rows: rows.slice(0, size).map(entry), more: rows.length > size, total: total?.n ?? 0 };
 }
 
@@ -412,7 +428,10 @@ export async function publish(db: D1Database, raw: string, ctx: PublishCtx) {
   if (down.length)
     throw new RegistryError(422, "a remote URL is not reachable", down.map((r) => `${r.url}: ${r.http ? `HTTP ${r.http}` : ""}${r.note ? ` ${r.note}` : ""}`.trim()));
 
-  const cur = await db.prepare("SELECT version FROM registry_servers WHERE name = ? AND is_latest = 1").bind(server.name).first<{ version: string }>();
+  const cur = await db.prepare("SELECT version, tools_hash FROM registry_servers WHERE name = ? AND is_latest = 1").bind(server.name).first<{ version: string; tools_hash: string | null }>();
+  const scan = await scanServer(ctx.fetcher, server as never, domain!, cur?.tools_hash ?? null, now);
+  if (scan.verdict === "flagged")
+    throw new RegistryError(422, "the server did not pass the safety scan", scan.findings.filter((f) => f.severity === "high").map((f) => `${f.where}: ${f.what}${f.snippet ? ` (near: ${f.snippet})` : ""}`));
   const cmp = cur ? compareVersions(server.version, cur.version) : 1;
   const latest = !cur || cmp === null || cmp >= 0;
   const at = now.toISOString();
@@ -423,10 +442,11 @@ export async function publish(db: D1Database, raw: string, ctx: PublishCtx) {
   stmts.push(
     db.prepare(`INSERT INTO registry_servers
         (name, version, server_json, title, description, status, status_message, status_changed_at, published_at, updated_at,
-         is_latest, featured, source, domain, checks_json, last_checked_at)
-        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 0, 'owner', ?, ?, ?)`)
+         is_latest, featured, source, domain, checks_json, last_checked_at, scan_verdict, scan_json, scanned_at, tools_hash, tools_changed_at)
+        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 0, 'owner', ?, ?, ?, ?, ?, ?, ?, ?)`)
       .bind(server.name, server.version, JSON.stringify(server), String(server.title ?? ""), String(server.description),
-        status, at, at, at, latest ? 1 : 0, domain, checks, at),
+        status, at, at, at, latest ? 1 : 0, domain, checks, at,
+        scan.verdict, JSON.stringify(scan), scan.scannedAt, scan.toolsHash, scan.toolsChanged ? at : null),
   );
   await db.batch(stmts);
   await db.prepare("UPDATE registry_publish_log SET ok = 1 WHERE id = (SELECT MAX(id) FROM registry_publish_log WHERE ip_hash = ?)").bind(ipHash).run();
@@ -454,24 +474,44 @@ export function validate(raw: string) {
  * Network trouble changes nothing. Anyone may ask for a recheck; only the owner's file decides.
  */
 export async function recheck(db: D1Database, name: string, fetcher: Fetcher, now = new Date(), force = false) {
-  const row = await db.prepare("SELECT source, domain, status, last_checked_at FROM registry_servers WHERE name = ? AND is_latest = 1")
-    .bind(name).first<{ source: string; domain: string; status: string; last_checked_at: string | null }>();
+  const row = await db.prepare(`SELECT version, source, domain, status, last_checked_at, server_json, scan_verdict, tools_hash
+      FROM registry_servers WHERE name = ? AND is_latest = 1`).bind(name)
+    .first<{ version: string; source: string; domain: string; status: string; last_checked_at: string | null; server_json: string; scan_verdict: string | null; tools_hash: string | null }>();
   if (!row) throw new RegistryError(404, `server ${name} not found`);
-  if (row.source === "operator") return { name, status: row.status, changed: false, note: "kept by the registry operator" };
   if (!force && row.last_checked_at && now.getTime() - Date.parse(row.last_checked_at) < 300_000)
-    return { name, status: row.status, changed: false, note: "checked in the last 5 minutes; try again shortly" };
-  const proof = await readProof(fetcher, row.domain, name);
+    return { name, status: row.status, safety: row.scan_verdict, changed: false, note: "checked in the last 5 minutes; try again shortly" };
   const at = now.toISOString();
   let next: string | null = null;
   let message: string | null = null;
-  if (proof.listed) next = proof.status ?? "active";
-  else if (proof.ok || proof.http === 404 || proof.http === 410) { next = "deleted"; message = "the owner's file no longer lists this server"; }
+  let note: string | undefined;
+  if (row.source === "operator") note = "ownership kept by the registry operator";
+  else {
+    const proof = await readProof(fetcher, row.domain, name);
+    if (proof.listed) next = proof.status ?? "active";
+    else if (proof.ok || proof.http === 404 || proof.http === 410) { next = "deleted"; message = "the owner's file no longer lists this server"; }
+    if (proof.error && !proof.listed) note = proof.error;
+  }
   const changed = next !== null && next !== row.status;
+  const statusNow = changed ? next! : row.status;
+
+  // Safety scan of the latest version. A scan that could not read the tools never clears a flag.
+  let safety = row.scan_verdict;
+  if (statusNow !== "deleted") {
+    const scan = await scanServer(fetcher, JSON.parse(row.server_json), row.domain, row.tools_hash, now);
+    if (row.scan_verdict === "flagged" && scan.verdict === "partial") {
+      await db.prepare("UPDATE registry_servers SET scanned_at = ? WHERE name = ? AND version = ?").bind(at, name, row.version).run();
+    } else {
+      safety = scan.verdict;
+      await db.prepare(`UPDATE registry_servers SET scan_verdict = ?, scan_json = ?, scanned_at = ?, tools_hash = COALESCE(?, tools_hash),
+          tools_changed_at = CASE WHEN ? = 1 THEN ? ELSE tools_changed_at END WHERE name = ? AND version = ?`)
+        .bind(scan.verdict, JSON.stringify(scan), at, scan.toolsHash, scan.toolsChanged ? 1 : 0, at, name, row.version).run();
+    }
+  }
   if (changed)
     await db.prepare("UPDATE registry_servers SET status = ?, status_message = ?, status_changed_at = ?, updated_at = ?, last_checked_at = ? WHERE name = ?")
       .bind(next, message, at, at, at, name).run();
   else await db.prepare("UPDATE registry_servers SET last_checked_at = ? WHERE name = ?").bind(at, name).run();
-  return { name, status: changed ? next : row.status, changed, ...(proof.error && !proof.listed ? { note: proof.error } : {}) };
+  return { name, status: statusNow, safety, changed, ...(note ? { note } : {}) };
 }
 
 /** Admin takedown or restore (x-admin-key). */
@@ -486,10 +526,10 @@ export async function adminStatus(db: D1Database, b: Record<string, unknown>, no
   return { name, status, versions: r.meta.changes };
 }
 
-/** Cron: recheck the servers checked longest ago, and drop submission logs older than two days. */
+/** Cron: recheck ownership and rescan the servers checked longest ago (the operator's own included), and drop submission logs older than two days. */
 export async function registrySweep(db: D1Database, fetcher: Fetcher, now = new Date()) {
   const due = (await db
-    .prepare(`SELECT name FROM registry_servers WHERE is_latest = 1 AND source = 'owner' AND status != 'deleted'
+    .prepare(`SELECT name FROM registry_servers WHERE is_latest = 1 AND status != 'deleted'
               ORDER BY COALESCE(last_checked_at, '') LIMIT ?`)
     .bind(LIMITS.sweep_batch).all<{ name: string }>()).results ?? [];
   for (const d of due) await recheck(db, d.name, fetcher, now, true).catch((e) => console.error("registry recheck", d.name, e));
@@ -500,6 +540,6 @@ export async function registrySweep(db: D1Database, fetcher: Fetcher, now = new 
 /** Names of listed servers, for the sitemap. */
 export async function listedNames(db: D1Database, max = 5000) {
   return (await db
-    .prepare("SELECT name, updated_at FROM registry_servers WHERE is_latest = 1 AND status != 'deleted' ORDER BY featured DESC, name LIMIT ?")
+    .prepare(`SELECT name, updated_at FROM registry_servers WHERE is_latest = 1 AND ${VISIBLE} ORDER BY featured DESC, name LIMIT ?`)
     .bind(max).all<{ name: string; updated_at: string }>()).results ?? [];
 }

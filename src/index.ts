@@ -688,6 +688,8 @@ function discovery(url: URL): Response | null {
         "  (com.example/x for example.com), put /.well-known/bounty-mcp-registry.txt on that domain",
         `  with the name in it, then POST your server.json to ${url.origin}/registry/v0.1/publish.`,
         "  Remote URLs must be public https and answer MCP. Rate-limited per sender.",
+        "  Every listing is safety-scanned on submit and hourly: tool descriptions for poisoning and hidden",
+        "  instructions, hosts against a malware block list, packages against OSV. Failures are hidden.",
         "",
         "## Science job queues (new): get an exact batch of work, report, repeat",
         `- Planet queue: claim a job and get ~10 exact TESS stars with their NASA light-curve files and a deadline: ${url.origin}/v1/queues`,
@@ -743,6 +745,21 @@ function discovery(url: URL): Response | null {
       { headers: { "content-type": "text/plain; charset=utf-8" } },
     );
   return null;
+}
+
+// The registry's safety scan connects to every listed server as an MCP client,
+// this board's own included. A Worker calling its own hostname would loop back
+// through the edge, so calls to our own /mcp are answered in-process instead.
+const SELF_HOST = "bounty.brelsfordsoftware.com";
+function selfFetch(env: Env, ctx: ExecutionContext) {
+  return (input: string, init?: RequestInit): Promise<Response> => {
+    const u = new URL(input);
+    if (u.hostname === SELF_HOST && u.pathname === "/mcp") {
+      mcpHandler ??= createMcpHandler(() => createServer(env));
+      return Promise.resolve(mcpHandler(new Request(input, init), env, ctx));
+    }
+    return fetch(input, init);
+  };
 }
 
 // createMcpHandler takes a FACTORY, not an instance. Built once per isolate and
@@ -871,7 +888,7 @@ export default {
       await flushMathReports(env.DB, { origin: "https://bounty.brelsfordsoftware.com" }).catch((e) => console.error("math reports", e));
       // Registry: recheck owners' files, hourly at minute 37. Its own try, like the refill.
       if (new Date(event.scheduledTime).getUTCMinutes() === 37)
-        await registrySweep(env.DB, fetch).catch((e) => console.error("registry sweep", e));
+        await registrySweep(env.DB, selfFetch(env, ctx)).catch((e) => console.error("registry sweep", e));
       if (new Date(event.scheduledTime).getUTCMinutes() !== 17) return;
       await expireOverdue(env.DB);
       await sweepNotices(env.DB, env.OPERATOR_AGENT_ID);
@@ -971,7 +988,7 @@ export default {
     const gp = url.pathname.match(/^\/arena\/games\/(gam_[0-9a-f]{16})$/);
     if (gp && request.method === "GET") return gamePage(env, gp[1]);
     // Open MCP server registry: its own module and tables (src/registry).
-    const reg = await registryRoutes(request, url, env);
+    const reg = await registryRoutes(request, url, env, selfFetch(env, ctx));
     if (reg) return reg;
     if (url.pathname === "/sitemap.xml" && request.method === "GET") return sitemapResponse(env.DB, url.origin);
     const bp = url.pathname.match(/^\/bounties\/(bty_[0-9a-f]{16})$/);
