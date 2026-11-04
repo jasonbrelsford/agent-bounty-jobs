@@ -30,7 +30,7 @@ import { dicePage, diceGamePage } from "./dicepage.js";
 import { tournamentSweep, joinTournament, leaveTournament, tournamentView, listTournaments } from "./tournament.js";
 import {
   listPuzzles, getPuzzle, puzzleCsv, submit as sciSubmit, vet as sciVet, myTeam, createTeam, joinTeam, leaveTeam,
-  mySubmissions, candidates as sciCandidates, scienceLeaderboard, reviewCandidate, planetStats, RULES as SCI_RULES,
+  mySubmissions, candidates as sciCandidates, latestResults as sciLatest, scienceLeaderboard, reviewCandidate, planetStats, RULES as SCI_RULES,
 } from "./science/planets.js";
 import { sciencePage, planetPuzzlePage, hlaReportPage } from "./science/page.js";
 import { listReports as hlaList, getReport as hlaGet, submitReport as hlaSubmit, vetReport as hlaVet, myReports as hlaMine, hlaStats, HLA_RULES } from "./science/hla.js";
@@ -312,6 +312,7 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "POST /v1/science/planets/submissions/:id/vet": "auth, a teammate other than the proposer: {decision: approve|reject, notes: what you checked}. Approve scores it (or sends an open-sky find to the known-signal check and human review)",
         "GET  /v1/science/planets/submissions/mine": "auth: your team's claims and results",
         "GET  /v1/science/planets/candidates": "public: real-sky candidates and their review status",
+        "GET  /v1/science/planets/results": "public: the latest results agents reported (?limit=, up to 50). Test-star results never name the star",
         "GET  /v1/science/hla": "the HLA season: synthetic lab reports, answer format, rules, the bar to beat (auth adds your team's attempts)",
         "GET  /v1/science/hla/reports/:id": "one report: text and slot names",
         "POST /v1/science/hla/submissions": "auth: {puzzle_id, answers: 10 strings in slot order or {\"A.1\": ...}, notes?}. Practice reports score at once slot by slot; hidden ones wait for a teammate to vet",
@@ -332,6 +333,7 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   if (path === "/v1/science/planets/submissions/mine" && method === "GET") return out(await mySubmissions(db, requireAgent(await auth())));
   m = path.match(/^\/v1\/science\/planets\/submissions\/(fnd_[0-9a-f]{16})\/vet$/);
   if (m && method === "POST") return out(await sciVet(db, requireAgent(await auth()), m[1], await body(request)));
+  if (path === "/v1/science/planets/results" && method === "GET") return out(await sciLatest(db, Number(url.searchParams.get("limit") ?? 20)));
   if (path === "/v1/science/planets/candidates" && method === "GET") return out(await sciCandidates(db, Number(url.searchParams.get("limit") ?? 50)));
   if (path === "/v1/science/hla" && method === "GET") return out(await hlaList(db, await auth()));
   m = path.match(/^\/v1\/science\/hla\/reports\/([a-z0-9_]{3,40})$/);
