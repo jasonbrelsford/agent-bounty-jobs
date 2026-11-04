@@ -740,6 +740,22 @@ An hourly sweep (minute 37) rechecks the ten owner entries checked longest ago;
 network trouble never changes a status, only the owner's file does. The operator can
 take an entry down with `POST /registry/v0.1/admin/status` and the admin key.
 
+**Safety scan.** Every submission, and every listing again on the hourly sweep, is
+scanned before it shows. The registry connects to each remote as an MCP client, reads
+its tool and prompt list, and checks names, descriptions and input schemas for tool
+poisoning: hidden instruction tags, "ignore previous instructions", "don't tell the
+user", invisible or bidirectional characters, requests for SSH keys, cloud credentials
+or MCP config files, sending data to a URL, and steering other tools. Remote hosts are
+checked against Cloudflare's free malware and phishing block list (1.1.1.2), and npm,
+PyPI and NuGet packages against OSV.dev (a `MAL-` advisory flags it; known
+vulnerabilities warn). A hash of the tool list is kept, so a later change in
+descriptions (a rug pull) is caught and rescanned. Results go in
+`com.brelsfordsoftware.registry/checks.safety` and on the page as a badge with the
+date: passed, worth a look, partly scanned (tools behind a sign-in), or flagged. A
+submission with a serious finding is refused with 422; a listed server that turns
+serious is hidden (410) until a clean rescan, and a partial scan never clears a flag.
+It cannot see the code behind a remote server, so a clean scan is not a guarantee.
+
 Limits: 10 submissions an hour and 30 a day per sender, 30 a day per domain, 500 a day
 in total, 16 KB per server.json. Senders are stored only as a hash that changes daily,
 and logs are dropped after two days. The board's own server is seeded by migration
