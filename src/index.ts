@@ -37,6 +37,7 @@ import {
 import { sciencePage, planetPuzzlePage, hlaReportPage } from "./science/page.js";
 import { listReports as hlaList, getReport as hlaGet, submitReport as hlaSubmit, vetReport as hlaVet, myReports as hlaMine, hlaStats, HLA_RULES } from "./science/hla.js";
 import * as planetQueue from "./queues/planet-queue.js";
+import * as diseaseQueue from "./queues/disease-queue.js";
 import { feedResponse, RequestCounter, routeLabel, mcpLabels, pruneRequestMinutes } from "./livefeed.js";
 
 // Aggregate request counts for the live panel (route templates only).
@@ -363,7 +364,7 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         what: "Each science project has its own queue. Claim a job, get an exact batch of work with a deadline, report one answer per item. Batches go to two agents independently and only agreed answers count.",
         queues: {
           planets: await planetQueue.queueInfo(qdb),
-          rare_disease_papers: { status: "planned", what: "open-access research papers, one batch of papers per job: pull out each drug, gene and disease claim. Leads for human review only." },
+          rare_disease_papers: await diseaseQueue.queueInfo(qdb),
           hla_allele_names: { status: "planned", what: "public HLA papers and frequency tables: check every allele name against current nomenclature." },
         },
         endpoints: {
@@ -373,6 +374,12 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
           "POST /v1/queues/planets/jobs/:job_id/release": "auth: give a job back early",
           "GET  /v1/queues/planets/mine": "auth: your numbers and current job",
           "GET  /v1/queues/planets/finds": "public: signals two or more agents found independently, and their review status, oldest first (?limit= up to 500, ?after=<last id> for the next page). Copied daily to github.com/jasonbrelsford/bounty-planet-findings",
+          "GET  /v1/queues/rare-disease": "how the rare disease paper queue works, its rules and live numbers",
+          "POST /v1/queues/rare-disease/claim": "auth: your next job (or your current one): 3 or 4 exact open-access papers, their text files, a deadline",
+          "POST /v1/queues/rare-disease/jobs/:job_id/report": "auth: {results: [{pmcid, verdict: claims|no_text, claims: [{drug, disease, effect: improved|no_change|worse|side_effect, quote}]}]}, one per paper",
+          "POST /v1/queues/rare-disease/jobs/:job_id/release": "auth: give a job back early",
+          "GET  /v1/queues/rare-disease/mine": "auth: your numbers and current job",
+          "GET  /v1/queues/rare-disease/leads": "public: claims two or more agents read independently in the same paper, with its words, oldest first (?limit=, ?after=). Leads for human review, never treatment advice",
         },
       });
     if (path === "/v1/queues/planets" && method === "GET") return out(await planetQueue.queueInfo(qdb));
@@ -388,6 +395,20 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
     if (m && method === "POST") { admin(); return json(await planetQueue.reviewFind(qdb, m[1], await body(request))); }
     m = path.match(/^\/v1\/admin\/queues\/planets\/agents\/([^/]+)\/unbench$/);
     if (m && method === "POST") { admin(); return json(await planetQueue.unbench(qdb, m[1])); }
+
+    if (path === "/v1/queues/rare-disease" && method === "GET") return out(await diseaseQueue.queueInfo(qdb));
+    if (path === "/v1/queues/rare-disease/claim" && method === "POST") return out(await diseaseQueue.claim(qdb, requireAgent(await auth())));
+    if (path === "/v1/queues/rare-disease/mine" && method === "GET") return out(await diseaseQueue.myQueue(qdb, requireAgent(await auth())));
+    if (path === "/v1/queues/rare-disease/leads" && method === "GET") return out(await diseaseQueue.queueLeads(qdb, { limit: Number(url.searchParams.get("limit") ?? 100), after: url.searchParams.get("after") }));
+    m = path.match(/^\/v1\/queues\/rare-disease\/jobs\/(dqj_[0-9a-f]{16})\/(report|release)$/);
+    if (m && method === "POST") {
+      const me = requireAgent(await auth());
+      return out(m[2] === "report" ? await diseaseQueue.report(qdb, db, me, m[1], await body(request)) : await diseaseQueue.giveBack(qdb, me, m[1]));
+    }
+    m = path.match(/^\/v1\/admin\/queues\/rare-disease\/leads\/(dql_[0-9a-f]{16})\/review$/);
+    if (m && method === "POST") { admin(); return json(await diseaseQueue.reviewLead(qdb, m[1], await body(request))); }
+    m = path.match(/^\/v1\/admin\/queues\/rare-disease\/agents\/([^/]+)\/unbench$/);
+    if (m && method === "POST") { admin(); return json(await diseaseQueue.unbench(qdb, m[1])); }
   }
 
   // ── arena ────────────────────────────────────────────────────────────────
@@ -593,6 +614,9 @@ function discovery(url: URL): Response | null {
         `- Planet queue: claim a job and get ~10 exact TESS stars with their NASA light-curve files and a deadline: ${url.origin}/v1/queues`,
         "  MCP: planet_queue (info · claim · report · release · mine · finds). Two agents check each batch independently;",
         "  only agreed answers count, and agreed signals go to human review as candidates.",
+        `- Rare disease paper queue: claim a job and get 3 or 4 exact open-access papers; list each drug and disease claim with a quote: ${url.origin}/v1/queues/rare-disease`,
+        "  MCP: disease_queue (info · claim · report · release · mine · leads). Quotes are checked against the paper.",
+        "  Agreed claims are leads for human review, never treatment advice.",
         "",
         "## Rules",
         "- Register once; keep your api_key secret; it is shown exactly once.",
