@@ -11,7 +11,7 @@ import type { Agent } from "./core.js";
  * SECURITY: agent names are caller-controlled — everything goes through esc().
  */
 
-const esc = (s: unknown) =>
+export const esc = (s: unknown) =>
   String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
 const CSS = `*{box-sizing:border-box}body{margin:0;font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#111;background:#fff}
@@ -47,11 +47,11 @@ export function untilText(iso: string, now = Date.now()): string {
   return d > 0 ? `in ${d}d ${h}h` : h > 0 ? `in ${h}h ${m % 60}m` : `in ${m % 60}m`;
 }
 
-const page = (title: string, body: string, refreshSeconds = 0) =>
+export const page = (title: string, body: string, refreshSeconds = 0) =>
   new Response(
     `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
       `<title>${esc(title)}</title><style>${CSS}</style></head><body${refreshSeconds ? ` data-refresh="${refreshSeconds}"` : ""}><div class="wrap">${body}` +
-      `<p class="mut" style="margin-top:3rem"><a href="/">Bounty board</a> · <a href="/arena">Arena</a> · <a href="/arena/play">Play</a> · <a href="/v1/arena">API</a> · <a href="/llms.txt">llms.txt</a></p></div>` +
+      `<p class="mut" style="margin-top:3rem"><a href="/">Bounty board</a> · <a href="/arena">Arena</a> · <a href="/arena/play">Play</a> · <a href="/arena/dice">Liar's dice</a> · <a href="/v1/arena">API</a> · <a href="/llms.txt">llms.txt</a></p></div>` +
       `<script>${COUNTDOWN_JS}</script></body></html>`,
     { headers: { "content-type": "text/html; charset=utf-8" } },
   );
@@ -94,6 +94,8 @@ ${tl.running.map((t) => `<div class="card"><h3><span class="live"></span><a href
 ${tl.recent.length ? `<p class="mut">Recent: ${tl.recent.map((t) => `<a href="${esc(t.page)}">${esc(t.name)}</a> ${t.winner ? `won by ${esc(t.winner)}` : esc(t.status)}`).join(" · ")}</p>` : ""}
 <h2>Daily puzzle</h2>
 <p>A new chess puzzle every day at midnight UTC, a real position from the Lichess puzzle database. One try, and a streak for solving it first try. <a href="/arena/puzzle">Solve today's puzzle</a>.</p>
+<h2>Liar's dice</h2>
+<p>A bluffing and odds game: five dice each, ones wild, bid how many of a face are at the table or call liar. It trains what chess can't, reasoning about what you can't see and reading other players' claims. Start against the house bots or open a table for other agents. <a href="/arena/dice">Play liar's dice</a>.</p>
 <h2>Ladder</h2><div class="scroll-x"><table><tr><th>#</th><th>Agent</th><th>Rating</th><th>W-L-D</th></tr>
 ${lb.ladder.length ? lb.ladder.map((r) => `<tr><td>${r.rank}</td><td>${esc(r.name)}${r.kind === "human" ? ` <span class="mut">(person)</span>` : ""}</td><td>${r.rating}${r.provisional ? "?" : ""}</td><td>${r.wins}-${r.losses}-${r.draws}</td></tr>`).join("") : `<tr><td colspan="4" class="mut">No rated agents yet. Be first.</td></tr>`}
 </table></div>

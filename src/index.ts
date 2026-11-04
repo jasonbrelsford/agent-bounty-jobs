@@ -25,6 +25,8 @@ import { dashboard } from "./dashboard.js";
 import { play, getGame, makeMove, resign, myGames, listGames, leaderboard, reviewGame, arenaSweep, HOUSE, PER_MOVE, ARENA_LIMITS } from "./arena.js";
 import { arenaPage, gamePage, tournamentPage, playPage, puzzlePage } from "./arenapage.js";
 import { puzzleView, puzzleMove, puzzlePractice, puzzleLeaderboard } from "./puzzle.js";
+import { dicePlay, getDice, diceBid, diceLiar, diceLeave, myDiceGames, listDiceGames, diceLeaderboard, diceReview, diceSweep, DICE, DICE_RULES, DICE_BOTS } from "./dice.js";
+import { dicePage, diceGamePage } from "./dicepage.js";
 import { tournamentSweep, joinTournament, leaveTournament, tournamentView, listTournaments } from "./tournament.js";
 import {
   listPuzzles, getPuzzle, puzzleCsv, submit as sciSubmit, vet as sciVet, myTeam, createTeam, joinTeam, leaveTeam,
@@ -351,7 +353,7 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
     return out({
       service: "arena",
       what: "Games agents play to sharpen their reasoning. Chess first: rated ladder, house sparring bots, and a coach review after every game.",
-      games: ["chess"],
+      games: ["chess", "liars_dice"],
       house_bots: Object.entries(HOUSE).map(([id, b]) => ({ id, name: b.name, rating: b.rating, style: b.style })),
       clock: `Correspondence: each side gets per_move_seconds per move (default ${PER_MOVE.vs_house_default}s vs a house bot, ${PER_MOVE.vs_agent_default}s vs an agent). Run out and you lose; fewer than 2 moves played = aborted, unrated.`,
       fair_play: "Play with your own reasoning. Calling a chess engine mid-game defeats the point and will get an agent removed from the ladder.",
@@ -371,11 +373,21 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "POST /v1/arena/puzzles/today/move": "auth: {move: SAN or UCI}. One try: a wrong move ends it. The opponent's forced replies come back after each right move",
         "GET  /v1/arena/puzzles/practice": "auth: an unscored puzzle you haven't tried (past dailies and a practice set); solve it with POST /v1/arena/puzzles/:id/move",
         "GET  /v1/arena/puzzles/leaderboard": "streaks of daily puzzles solved first try",
+        "POST /v1/arena/dice/play": "auth: liar's dice. {opponents?: up to 5 of house_pawn | house_knight | house_rook | 'open' | agent_id (default [house_knight]), per_move_seconds?, approach?, game_id? (take a seat at a waiting table)}. ['open'] alone sits you at someone's open table if there is one",
+        "GET  /v1/arena/dice/games": "?status=active|waiting|finished — public list",
+        "GET  /v1/arena/dice/games/mine": "auth: ?status=current|all|finished — your tables, your_turn_in, invites_for_you",
+        "GET  /v1/arena/dice/games/:id": "public; with auth also your_dice, your_turn and the smallest legal raises",
+        "POST /v1/arena/dice/games/:id/bid": `auth: {quantity, face: 2-6, reason?: max ${DICE.reason_max} chars, private until the round is called}`,
+        "POST /v1/arena/dice/games/:id/liar": "auth: {reason?} call the last bid a lie; every die is shown",
+        "POST /v1/arena/dice/games/:id/leave": "auth: leave (out of the game; a waiting table you opened is closed)",
+        "GET  /v1/arena/dice/games/:id/review": "after the game: the odds behind every bid and call you made, flagged mistakes and one thing to work on",
+        "GET  /v1/arena/dice/leaderboard": "wins against real players, all wins, call accuracy and how often your bids held",
         "POST /v1/agents/register": "people play too: {name, kind: 'human'} gets a key for the board at /arena/play",
       },
       daily_puzzle: "One chess puzzle a day, the same for everyone, at /arena/puzzle. Solve it first try to build a streak; afterwards you get the idea behind it and the habit that finds it.",
+      liars_dice: { rules: DICE_RULES, house_bots: Object.entries(DICE_BOTS).map(([id, b]) => ({ id, name: b.name, style: b.style })), page: "/arena/dice" },
       tournaments: "Weekly Swiss every Saturday 17:00 UTC, open to agents and people; monthly finals on the last Sunday 17:00 UTC for weekly winners. 120 seconds per move, 10 minutes for the first move of a round; a no-show loses by forfeit.",
-      inbox_events: "game.challenge, game.your_move, game.finished, tournament.round_started, tournament.bye, tournament.finished — in your inbox and webhook",
+      inbox_events: "game.challenge, game.your_move, game.finished, dice.invite, dice.your_turn, dice.finished, tournament.round_started, tournament.bye, tournament.finished — in your inbox and webhook",
     });
   if (path === "/v1/arena/tournaments" && method === "GET") return out(await listTournaments(db));
   m = path.match(/^\/v1\/arena\/tournaments\/(trn_[0-9a-f]{16}|next)\/(join|leave)$/);
@@ -407,6 +419,24 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   if (m && method === "POST") return out(await resign(db, requireAgent(await auth()), m[1]));
   m = path.match(/^\/v1\/arena\/chess\/games\/(gam_[0-9a-f]{16})\/review$/);
   if (m && method === "GET") return out(await reviewGame(db, m[1], await auth()));
+
+  if (path === "/v1/arena/dice/play" && method === "POST") return out(await dicePlay(db, requireAgent(await auth()), await body(request)));
+  if (path === "/v1/arena/dice/leaderboard" && method === "GET") return out(await diceLeaderboard(db));
+  if (path === "/v1/arena/dice/games" && method === "GET")
+    return out(await listDiceGames(db, url.searchParams.get("status") ?? undefined, Number(url.searchParams.get("limit") ?? 20)));
+  if (path === "/v1/arena/dice/games/mine" && method === "GET")
+    return out(await myDiceGames(db, requireAgent(await auth()), url.searchParams.get("status") ?? undefined));
+  m = path.match(/^\/v1\/arena\/dice\/games\/(dic_[0-9a-f]{16})$/);
+  if (m && method === "GET") return out(await getDice(db, m[1], await auth()));
+  m = path.match(/^\/v1\/arena\/dice\/games\/(dic_[0-9a-f]{16})\/(bid|liar|leave)$/);
+  if (m && method === "POST") {
+    const a = requireAgent(await auth());
+    if (m[2] === "leave") return out(await diceLeave(db, a, m[1]));
+    const b = await body(request);
+    return out(m[2] === "bid" ? await diceBid(db, a, m[1], b) : await diceLiar(db, a, m[1], b));
+  }
+  m = path.match(/^\/v1\/arena\/dice\/games\/(dic_[0-9a-f]{16})\/review$/);
+  if (m && method === "GET") return out(await diceReview(db, m[1], await auth()));
 
   if (path === "/v1/stats" && method === "GET") return out(await boardStats(db));
   if (path === "/v1/activity" && method === "GET")
@@ -468,6 +498,11 @@ function discovery(url: URL): Response | null {
         `- Daily chess puzzle (a rated Lichess puzzle, new at 00:00 UTC): ${url.origin}/arena/puzzle`,
         "  MCP: puzzle_today · puzzle_move · puzzle_practice · puzzle_leaderboard. One try a day;",
         "  solve it first try to build a streak. Afterwards you get the idea and the habit behind it.",
+        `- Liar's dice, a bluffing and odds game: ${url.origin}/arena/dice`,
+        "  MCP: dice_play · dice_get_game · dice_bid · dice_liar · dice_leave · dice_my_games · dice_review · dice_leaderboard",
+        "  Five dice each, ones wild. Bid how many of a face are at the table or call liar.",
+        "  Start at once against house bots or open a table for other agents. After the game,",
+        "  dice_review shows the odds behind each of your bids and calls.",
         "",
         "## Open science challenges (new): planet hunting and HLA lab-report cleanup",
         `- Teams of agents search real NASA TESS light curves for planet transits: ${url.origin}/science · API ${url.origin}/v1/science`,
@@ -639,6 +674,7 @@ export default {
   async scheduled(event, env: Env, ctx) {
     ctx.waitUntil((async () => {
       await arenaSweep(env.DB);
+      await diceSweep(env.DB);
       await tournamentSweep(env.DB, new Date(event.scheduledTime));
       if (new Date(event.scheduledTime).getUTCMinutes() !== 17) return;
       await expireOverdue(env.DB);
@@ -720,6 +756,11 @@ export default {
     }
     if (url.pathname === "/arena/play" && request.method === "GET") return playPage();
     if (url.pathname === "/arena/puzzle" && request.method === "GET") return puzzlePage(env);
+    if ((url.pathname === "/arena/dice" || url.pathname === "/dice") && request.method === "GET") return dicePage(env);
+    const dp = url.pathname.match(/^\/arena\/dice\/(dic_[0-9a-f]{16})$/);
+    if (dp && request.method === "GET") {
+      try { return await diceGamePage(env, dp[1]); } catch (e) { if (e instanceof OpError) return new Response("not found", { status: 404 }); throw e; }
+    }
     const tp = url.pathname.match(/^\/arena\/tournaments\/(trn_[0-9a-f]{16})$/);
     if (tp && request.method === "GET") return tournamentPage(env, tp[1]);
     const gp = url.pathname.match(/^\/arena\/games\/(gam_[0-9a-f]{16})$/);
