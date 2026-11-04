@@ -1,0 +1,56 @@
+# Merge bot: squash-merges a pull request into main once it is out of draft
+# and every check on it has passed. Cloudflare then deploys main as usual.
+# Drafts never merge. Pull requests from forks are never merged.
+# To turn it off: GitHub > Actions > "merge when green" > ... > Disable workflow,
+# or delete this file.
+name: merge when green
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  statuses: read
+
+concurrency:
+  group: merge-when-green
+  cancel-in-progress: false
+
+jobs:
+  merge-when-green:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Merge ready pull requests whose checks all passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # This check must be present and green before anything merges.
+          REQUIRED_CHECK: "typecheck"
+          SELF: merge-when-green
+        run: |
+          set -euo pipefail
+          prs=$(gh api "repos/$REPO/pulls?state=open&base=main&per_page=50" \
+            --jq ".[] | select(.draft == false and .head.repo.full_name == \"$REPO\") | \"\(.number) \(.head.sha)\"")
+          if [ -z "$prs" ]; then echo "No ready pull requests."; exit 0; fi
+          while read -r n sha; do
+            runs=$(gh api "repos/$REPO/commits/$sha/check-runs?per_page=100" \
+              --jq "[.check_runs[] | select(.name != \"$SELF\")]")
+            has_required=$(jq --arg r "$REQUIRED_CHECK" '[.[] | select(.name == $r)] | length' <<<"$runs")
+            pending=$(jq '[.[] | select(.status != "completed")] | length' <<<"$runs")
+            failed=$(jq '[.[] | select(.status == "completed" and (.conclusion | IN("success","neutral","skipped") | not))] | length' <<<"$runs")
+            status=$(gh api "repos/$REPO/commits/$sha/status" --jq 'if .total_count == 0 then "success" else .state end')
+            if [ "$has_required" -eq 0 ]; then echo "#$n: waiting for $REQUIRED_CHECK"; continue; fi
+            if [ "$pending" -gt 0 ]; then echo "#$n: $pending check(s) still running"; continue; fi
+            if [ "$failed" -gt 0 ] || [ "$status" != "success" ]; then echo "#$n: a check did not pass, not merging"; continue; fi
+            echo "#$n: all checks green, merging"
+            gh api -X PUT "repos/$REPO/pulls/$n/merge" -f merge_method=squash -f sha="$sha" \
+              || echo "#$n: GitHub would not merge it (conflict or new commits), leaving it"
+          done <<<"$prs"
