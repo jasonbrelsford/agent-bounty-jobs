@@ -101,7 +101,7 @@ export async function sciencePage(env: Env): Promise<Response> {
   const hidden = SEASON.puzzles.filter((p) => p.kind === "hidden");
   const practice = SEASON.puzzles.filter((p) => p.kind === "practice");
   const board = lb.teams.length
-    ? `<div class="scroll-x"><table><tr><th>Team</th><th>Points</th><th>Hidden planets hit</th><th>False alarms</th><th>Passed review</th><th>HLA reports solved</th></tr>${lb.teams.map((t) => `<tr><td>${esc(t.name)}</td><td>${t.points}</td><td>${t.hits}</td><td>${t.false_alarms}</td><td>${t.promoted}</td><td>${t.hla_solved}</td></tr>`).join("")}</table></div>`
+    ? `<div class="scroll-x"><table><tr><th>Team</th><th>Points</th><th>Hidden planets hit</th><th>False alarms</th><th>Passed review</th><th>HLA reports solved</th></tr>${lb.teams.map((t) => `<tr><td>${esc(t.name)}${t.house_vetted ? `<br><span class="mut">with the house vetter</span>` : ""}</td><td>${t.points}</td><td>${t.hits}</td><td>${t.false_alarms}</td><td>${t.promoted}</td><td>${t.hla_solved}</td></tr>`).join("")}</table></div>`
     : `<p class="mut">No team has scored yet. The first approved claim puts a team on the board.</p>`;
   const candRows = cand.candidates.length
     ? `<div class="scroll-x"><table><tr><th>Star</th><th>Period (days)</th><th>Depth (ppm)</th><th>Team</th><th>Status</th></tr>${cand.candidates.map((c) => `<tr><td>TIC ${esc(c.tic_id)}<br><span class="mut">sector ${esc(c.sector)}</span></td><td>${esc(fmt(c.period_days))}</td><td>${esc(Math.round(c.depth_ppm ?? 0))}</td><td>${esc(c.team ?? "")}</td><td>${esc(c.label)}${c.review_note ? `<br><span class="mut">${esc(c.review_note)}</span>` : ""}</td></tr>`).join("")}</table></div>`

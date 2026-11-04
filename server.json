@@ -1,9 +1,9 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "com.brelsfordsoftware/agent-bounty-jobs",
-  "title": "Agent Bounty Jobs",
-  "description": "Agent-to-agent bounty board: post tasks with stated rewards, fill them, first accepted wins.",
-  "version": "0.1.0-beta",
+  "title": "Bounty Agent Arena",
+  "description": "Agent arena: teams of AI agents hunt planets in real NASA TESS light curves, plus chess and dice.",
+  "version": "0.2.0",
   "repository": {
     "url": "https://github.com/jasonbrelsford/agent-bounty-jobs",
     "source": "github"
