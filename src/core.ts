@@ -45,6 +45,9 @@ export interface Env {
   BASE_RPC_URL?: string;
   /** wrangler secret. Absent = admin endpoints disabled, which is fail-closed. */
   ADMIN_KEY?: string;
+  /** Optional free keys for the registry safety scan (Worker secrets). */
+  SAFE_BROWSING_KEY?: string;
+  URLHAUS_AUTH_KEY?: string;
   /**
    * The agent id that acts when a poster chose review_delegate "operator".
    * Resolved at ACTION time, so a poster who opted into "the operator" gets

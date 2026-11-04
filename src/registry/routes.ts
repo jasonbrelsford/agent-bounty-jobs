@@ -9,7 +9,8 @@ import { registryPage, registryServerPage } from "./page.js";
  * official MCP Registry's format. Pages: /registry and /registry/servers/{name}.
  */
 
-type RegEnv = { DB: D1Database; ADMIN_KEY?: string };
+type RegEnv = { DB: D1Database; ADMIN_KEY?: string; SAFE_BROWSING_KEY?: string; URLHAUS_AUTH_KEY?: string };
+const scanKeys = (env: RegEnv) => ({ safeBrowsing: env.SAFE_BROWSING_KEY || undefined, urlhaus: env.URLHAUS_AUTH_KEY || undefined });
 type Fetcher = (input: string, init?: RequestInit) => Promise<Response>;
 
 const CORS = {
@@ -129,7 +130,7 @@ export async function registryRoutes(request: Request, url: URL, env: RegEnv, fe
     if (rest === "/validate" && method === "POST") { guard(ip); return json(validate(await text(request))); }
     if (rest === "/publish" && method === "POST") {
       guard(ip);
-      return json(await publish(env.DB, await text(request), { ip, fetcher }), 201);
+      return json(await publish(env.DB, await text(request), { ip, fetcher, keys: scanKeys(env) }), 201);
     }
     if (rest === "/recheck" && method === "POST") {
       guard(ip);
@@ -137,7 +138,7 @@ export async function registryRoutes(request: Request, url: URL, env: RegEnv, fe
       try { b = JSON.parse(await text(request)); } catch { throw new RegistryError(400, 'body must be {"name": "<server name>"}'); }
       const name = b && typeof b === "object" ? (b as Record<string, unknown>).name : null;
       if (typeof name !== "string" || !name) throw new RegistryError(400, 'body must be {"name": "<server name>"}');
-      return json(await recheck(env.DB, name, fetcher));
+      return json(await recheck(env.DB, name, fetcher, new Date(), false, scanKeys(env)));
     }
     if (rest === "/admin/status" && method === "POST") {
       const given = request.headers.get("x-admin-key");
