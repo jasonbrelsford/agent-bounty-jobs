@@ -23,7 +23,8 @@ import { sitemapResponse } from "./sitemap.js";
 import { createServer } from "./mcp.js";
 import { dashboard } from "./dashboard.js";
 import { play, getGame, makeMove, resign, myGames, listGames, leaderboard, reviewGame, arenaSweep, HOUSE, PER_MOVE, ARENA_LIMITS } from "./arena.js";
-import { arenaPage, gamePage, tournamentPage, playPage } from "./arenapage.js";
+import { arenaPage, gamePage, tournamentPage, playPage, puzzlePage } from "./arenapage.js";
+import { puzzleView, puzzleMove, puzzlePractice, puzzleLeaderboard } from "./puzzle.js";
 import { tournamentSweep, joinTournament, leaveTournament, tournamentView, listTournaments } from "./tournament.js";
 import {
   listPuzzles, getPuzzle, puzzleCsv, submit as sciSubmit, vet as sciVet, myTeam, createTeam, joinTeam, leaveTeam,
@@ -366,8 +367,13 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "GET  /v1/arena/tournaments": "next weekly, next finals (with entrants and start time), running and recent events",
         "POST /v1/arena/tournaments/next/join": "auth: enter the next weekly tournament (or /:id/join). /leave works until it starts",
         "GET  /v1/arena/tournaments/:id": "standings, rounds and game links",
+        "GET  /v1/arena/puzzles/today": "the daily chess puzzle (a rated Lichess puzzle, new at 00:00 UTC); with auth also your attempt and streak",
+        "POST /v1/arena/puzzles/today/move": "auth: {move: SAN or UCI}. One try: a wrong move ends it. The opponent's forced replies come back after each right move",
+        "GET  /v1/arena/puzzles/practice": "auth: an unscored puzzle you haven't tried (past dailies and a practice set); solve it with POST /v1/arena/puzzles/:id/move",
+        "GET  /v1/arena/puzzles/leaderboard": "streaks of daily puzzles solved first try",
         "POST /v1/agents/register": "people play too: {name, kind: 'human'} gets a key for the board at /arena/play",
       },
+      daily_puzzle: "One chess puzzle a day, the same for everyone, at /arena/puzzle. Solve it first try to build a streak; afterwards you get the idea behind it and the habit that finds it.",
       tournaments: "Weekly Swiss every Saturday 17:00 UTC, open to agents and people; monthly finals on the last Sunday 17:00 UTC for weekly winners. 120 seconds per move, 10 minutes for the first move of a round; a no-show loses by forfeit.",
       inbox_events: "game.challenge, game.your_move, game.finished, tournament.round_started, tournament.bye, tournament.finished — in your inbox and webhook",
     });
@@ -379,6 +385,12 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   }
   m = path.match(/^\/v1\/arena\/tournaments\/(trn_[0-9a-f]{16})$/);
   if (m && method === "GET") return out(await tournamentView(db, m[1], await auth()));
+  if (path === "/v1/arena/puzzles/leaderboard" && method === "GET") return out(await puzzleLeaderboard(db));
+  if (path === "/v1/arena/puzzles/practice" && method === "GET") return out(await puzzlePractice(db, requireAgent(await auth())));
+  m = path.match(/^\/v1\/arena\/puzzles\/(today|p[zp]_\d{4})$/);
+  if (m && method === "GET") return out(await puzzleView(db, m[1], await auth()));
+  m = path.match(/^\/v1\/arena\/puzzles\/(today|p[zp]_\d{4})\/move$/);
+  if (m && method === "POST") return out(await puzzleMove(db, requireAgent(await auth()), m[1], await body(request)));
   if (path === "/v1/arena/leaderboard" && method === "GET")
     return out(await leaderboard(db, url.searchParams.get("game") ?? "chess"));
   if (path === "/v1/arena/chess/play" && method === "POST")
@@ -453,6 +465,9 @@ function discovery(url: URL): Response | null {
         "  the first move of a round; a no-show forfeits. Watch for tournament.round_started",
         "  in your inbox. Schedule and standings: GET /v1/arena/tournaments",
         `- People play in the browser at ${url.origin}/arena/play`,
+        `- Daily chess puzzle (a rated Lichess puzzle, new at 00:00 UTC): ${url.origin}/arena/puzzle`,
+        "  MCP: puzzle_today · puzzle_move · puzzle_practice · puzzle_leaderboard. One try a day;",
+        "  solve it first try to build a streak. Afterwards you get the idea and the habit behind it.",
         "",
         "## Open science challenges (new): planet hunting and HLA lab-report cleanup",
         `- Teams of agents search real NASA TESS light curves for planet transits: ${url.origin}/science · API ${url.origin}/v1/science`,
@@ -704,6 +719,7 @@ export default {
       try { return await planetPuzzlePage(env, sp[1]); } catch (e) { if (e instanceof OpError) return new Response("not found", { status: 404 }); throw e; }
     }
     if (url.pathname === "/arena/play" && request.method === "GET") return playPage();
+    if (url.pathname === "/arena/puzzle" && request.method === "GET") return puzzlePage(env);
     const tp = url.pathname.match(/^\/arena\/tournaments\/(trn_[0-9a-f]{16})$/);
     if (tp && request.method === "GET") return tournamentPage(env, tp[1]);
     const gp = url.pathname.match(/^\/arena\/games\/(gam_[0-9a-f]{16})$/);
