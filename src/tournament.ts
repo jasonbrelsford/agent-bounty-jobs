@@ -1,7 +1,7 @@
 import { Chess } from "chess.js";
 import { type Agent, OpError, newId, nowIso, eventStmt } from "./core.js";
 import { inboxStmt } from "./notify.js";
-import { ratingOf, names, isHouse, houseMove, uciOf, HOUSE } from "./arena.js";
+import { ratingOf, names, isHouse, houseMove, uciOf } from "./arena.js";
 
 /**
  * Weekly tournaments and monthly finals.
@@ -23,9 +23,10 @@ export const TOURNEY = {
   first_move_seconds: 600, // time to notice the round started
   max_rounds: 5,
   finals_min: 4, // top up the finals to this many from the month's weekly standings
-  // With an odd field this house bot takes the spare seat, so nobody sits out and a
-  // lone entrant still gets games. It is never the winner and never qualifies.
-  house_seat: "house_rook",
+  // House bots fill a small or odd field so every entrant gets games and nobody sits
+  // out. They never win, and the title counts only games between real players.
+  house_seats: ["house_rook", "house_knight", "house_pawn"],
+  min_field: 4,
 } as const;
 
 type Tourney = {
@@ -120,7 +121,12 @@ export async function leaveTournament(db: D1Database, agent: Agent, idRaw?: unkn
 
 // ── standings and pairing ───────────────────────────────────────────────────
 
-type Standing = { agent_id: string; name: string; points: number; buchholz: number; rating: number; byes: number; qualified_from: string | null; games: number };
+type Standing = {
+  agent_id: string; name: string; points: number; buchholz: number; rating: number; byes: number; qualified_from: string | null; games: number;
+  house: boolean;
+  /** Points from games between two real players only; this decides the title. */
+  title_points: number;
+};
 
 async function standings(db: D1Database, t: Tourney): Promise<Standing[]> {
   const ps = await playersOf(db, t.id);
@@ -128,11 +134,16 @@ async function standings(db: D1Database, t: Tourney): Promise<Standing[]> {
   const pts = new Map<string, number>(ps.map((p) => [p.agent_id, p.byes * 2]));
   const opps = new Map<string, string[]>(ps.map((p) => [p.agent_id, []]));
   const played = new Map<string, number>();
+  const title = new Map<string, number>();
   for (const g of gs) {
     if (g.status !== "finished" || !g.result) continue;
     const w = g.result === "1-0" ? 2 : g.result === "0-1" ? 0 : 1;
     pts.set(g.white_id, (pts.get(g.white_id) ?? 0) + w);
     pts.set(g.black_id, (pts.get(g.black_id) ?? 0) + 2 - w);
+    if (!isHouse(g.white_id) && !isHouse(g.black_id)) {
+      title.set(g.white_id, (title.get(g.white_id) ?? 0) + w);
+      title.set(g.black_id, (title.get(g.black_id) ?? 0) + 2 - w);
+    }
   }
   for (const g of gs) {
     opps.get(g.white_id)?.push(g.black_id);
@@ -147,6 +158,7 @@ async function standings(db: D1Database, t: Tourney): Promise<Standing[]> {
       buchholz: (opps.get(p.agent_id) ?? []).reduce((s, o) => s + (pts.get(o) ?? 0) / 2, 0),
       rating: (await ratingOf(db, p.agent_id, t.game)).rating, byes: p.byes, qualified_from: p.qualified_from,
       games: played.get(p.agent_id) ?? 0,
+      house: isHouse(p.agent_id), title_points: (title.get(p.agent_id) ?? 0) / 2,
     });
   }
   return out.sort((a, b) => b.points - a.points || b.buchholz - a.buchholz || b.rating - a.rating || a.name.localeCompare(b.name));
@@ -199,6 +211,7 @@ async function pairRound(db: D1Database, t: Tourney, round: number): Promise<voi
   const deadline = new Date(Date.now() + TOURNEY.first_move_seconds * 1000).toISOString();
   const stmts: D1PreparedStatement[] = [];
   for (const [a, b] of pairs) {
+    if (isHouse(a) && isHouse(b)) continue; // two bots paired together just sit the round out; no game, no points
     // Fewer whites so far gets white; ties go to the higher seed.
     const [w, bl] = (whites.get(b) ?? 0) < (whites.get(a) ?? 0) ? [b, a] : [a, b];
     const id = newId("gam");
@@ -264,13 +277,17 @@ async function start(db: D1Database, t: Tourney): Promise<void> {
   if (t.kind === "finals") await topUpFinals(db, t);
   let ps = await playersOf(db, t.id);
   const now = nowIso();
-  // An odd field (a lone entrant included) gets the house bot in the spare seat.
-  if (ps.length % 2 === 1 && !ps.some((p) => isHouse(p.agent_id))) {
-    await db.prepare("INSERT INTO tournament_players (tournament_id, agent_id, joined_at, qualified_from) VALUES (?, ?, ?, 'house') ON CONFLICT DO NOTHING")
-      .bind(t.id, TOURNEY.house_seat, now).run();
+  // House bots fill the field to four, and fill an odd seat in a bigger field.
+  const real = ps.filter((p) => !isHouse(p.agent_id)).length;
+  const seats = real === 0 ? 0 : real < TOURNEY.min_field ? TOURNEY.min_field - real : real % 2;
+  const fill = TOURNEY.house_seats.filter((h) => !ps.some((p) => p.agent_id === h)).slice(0, seats);
+  if (fill.length) {
+    await db.batch(fill.map((h) => db.prepare(
+      "INSERT INTO tournament_players (tournament_id, agent_id, joined_at, qualified_from) VALUES (?, ?, ?, 'house') ON CONFLICT DO NOTHING",
+    ).bind(t.id, h, now)));
     ps = await playersOf(db, t.id);
   }
-  if (ps.length < 2) {
+  if (real === 0) {
     const note = "Nobody entered, so it did not run.";
     await db.batch([
       db.prepare("UPDATE tournaments SET status = 'cancelled', note = ?, updated_at = ? WHERE id = ? AND status = 'scheduled'").bind(note, now, t.id),
@@ -300,16 +317,22 @@ async function advance(db: D1Database, t: Tourney): Promise<void> {
     return;
   }
   const st = await standings(db, t);
-  // The house bot can top the table but never wins the event or a finals seat.
-  const winner = st.find((s) => !isHouse(s.agent_id)) ?? st[0];
-  const res = await db.prepare("UPDATE tournaments SET status = 'finished', winner_id = ?, updated_at = ? WHERE id = ? AND status = 'running'")
-    .bind(winner.agent_id, now, t.id).run();
+  // The title is decided only by games between real players; house bots never win it.
+  const realOnes = st.filter((s) => !s.house)
+    .sort((a, b) => b.title_points - a.title_points || b.points - a.points || b.buchholz - a.buchholz || b.rating - a.rating || a.name.localeCompare(b.name));
+  const allGames = await gamesOf(db, t.id);
+  const headToHead = allGames.some((g) => g.status === "finished" && !isHouse(g.white_id) && !isHouse(g.black_id));
+  const winner = realOnes.length >= 2 && headToHead ? realOnes[0] : null;
+  const note = winner ? null : "Practice event: no two real players played each other, so no title was awarded.";
+  const res = await db.prepare("UPDATE tournaments SET status = 'finished', winner_id = ?, note = COALESCE(?, note), updated_at = ? WHERE id = ? AND status = 'running'")
+    .bind(winner?.agent_id ?? null, note, now, t.id).run();
   if (!res.meta.changes) return;
   const stmts: D1PreparedStatement[] = [
-    eventStmt(db, now, "tournament_finished", null, winner.agent_id, `${t.name}: won by ${winner.name} with ${winner.points} points`),
+    eventStmt(db, now, "tournament_finished", null, winner?.agent_id ?? null,
+      winner ? `${t.name}: won by ${winner.name} with ${winner.title_points} points against real players` : `${t.name}: finished as a practice event, no title`),
   ];
   let finals: Tourney | null = null;
-  if (t.kind === "weekly") {
+  if (winner && t.kind === "weekly") {
     await ensureEvent(db, "finals", nextFinals(new Date(t.starts_at)));
     finals = await db.prepare("SELECT * FROM tournaments WHERE kind = 'finals' AND status = 'scheduled' AND starts_at > ? ORDER BY starts_at LIMIT 1")
       .bind(t.starts_at).first<Tourney>();
@@ -319,9 +342,10 @@ async function advance(db: D1Database, t: Tourney): Promise<void> {
          ON CONFLICT(tournament_id, agent_id) DO UPDATE SET qualified_from = excluded.qualified_from`,
       ).bind(finals.id, winner.agent_id, now, t.id));
   }
-  st.forEach((s, i) => isHouse(s.agent_id) || stmts.push(inboxStmt(db, now, s.agent_id, "tournament.finished", null, null, {
-    tournament_id: t.id, tournament: t.name, place: i + 1, points: s.points, winner: winner.name,
-    qualified_for: s.agent_id === winner.agent_id && finals ? { tournament_id: finals.id, name: finals.name, starts_at: finals.starts_at } : undefined,
+  realOnes.forEach((s, i) => stmts.push(inboxStmt(db, now, s.agent_id, "tournament.finished", null, null, {
+    tournament_id: t.id, tournament: t.name, place: winner ? i + 1 : null, points: s.points, title_points: s.title_points,
+    winner: winner?.name ?? null, note: note ?? undefined,
+    qualified_for: winner && s.agent_id === winner.agent_id && finals ? { tournament_id: finals.id, name: finals.name, starts_at: finals.starts_at } : undefined,
   })));
   await db.batch(stmts);
 }
@@ -358,7 +382,7 @@ export async function tournamentView(db: D1Database, id: string, viewer?: Agent 
     seconds_to_start: t.status === "scheduled" ? Math.max(0, Math.round((Date.parse(t.starts_at) - Date.now()) / 1000)) : 0,
     clock: `${t.per_move_seconds} seconds per move (${TOURNEY.first_move_seconds / 60} minutes for the first move of a round). A no-show loses by forfeit.`,
     entry: (t.kind === "weekly" ? "Open to every agent and person. Join any time before it starts." : "Weekly winners qualify. If fewer than four do, the best weekly finishers of the month fill the seats.") +
-      ` With an odd number of players, ${HOUSE[TOURNEY.house_seat].name} takes the spare seat so nobody sits out; it can't win the event or qualify.`,
+      " House bots fill the field to four players (and any odd seat) so everyone gets games. Games against them count for the table, but the title is decided only by games between real players, and with fewer than two real players there is no title.",
     rounds_total: t.rounds, current_round: t.current_round, entrants: st.length,
     you_are_in: viewer ? st.some((s) => s.agent_id === viewer.id) : undefined,
     standings: st.map((s, i) => ({ place: i + 1, ...s })),
