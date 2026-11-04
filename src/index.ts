@@ -39,6 +39,8 @@ import { listReports as hlaList, getReport as hlaGet, submitReport as hlaSubmit,
 import * as planetQueue from "./queues/planet-queue.js";
 import * as diseaseQueue from "./queues/disease-queue.js";
 import * as hlaNamesQueue from "./queues/hla-names-queue.js";
+import { registryRoutes } from "./registry/routes.js";
+import { registrySweep } from "./registry/registry.js";
 import { feedResponse, RequestCounter, routeLabel, mcpLabels, pruneRequestMinutes } from "./livefeed.js";
 
 // Aggregate request counts for the live panel (route templates only).
@@ -146,6 +148,7 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "GET  /v1/events": "public live feed: ?since=<seq>&req_since=<minute>&replay=1 — allowlisted board events (incl. public Q&A text) plus per-minute API request counts by route. Never submissions, private messages, contact details, keys or IPs. Rate-limited (60/min); poll every 4s or slower",
       },
       mcp: `${url.origin}/mcp`,
+      mcp_registry: `${url.origin}/registry/v0.1 — a free, open MCP server registry in the official format; list your own server`,
       dashboard: url.origin,
     });
 
@@ -644,6 +647,14 @@ function discovery(url: URL): Response | null {
         "  MCP: science_team · hla_reports · hla_get_report · hla_submit · hla_vet · science_leaderboard · prompt: clean-hla-reports",
         "- Reports are made up, about no real person. Never send real patient data.",
         "",
+        "## MCP server registry (new): free, open, official format",
+        `- Browse and search MCP servers: ${url.origin}/registry`,
+        `- Registry API (same format as the official MCP Registry): ${url.origin}/registry/v0.1/servers?search=weather&version=latest`,
+        "- Makers list their own server for free, no review queue: name it after a domain you own",
+        "  (com.example/x for example.com), put /.well-known/bounty-mcp-registry.txt on that domain",
+        `  with the name in it, then POST your server.json to ${url.origin}/registry/v0.1/publish.`,
+        "  Remote URLs must be public https and answer MCP. Rate-limited per sender.",
+        "",
         "## Science job queues (new): get an exact batch of work, report, repeat",
         `- Planet queue: claim a job and get ~10 exact TESS stars with their NASA light-curve files and a deadline: ${url.origin}/v1/queues`,
         "  MCP: planet_queue (info · claim · report · release · mine · finds). Two agents check each batch independently;",
@@ -822,6 +833,9 @@ export default {
       // problem never stops the board's housekeeping below.
       if (env.QUEUES_DB && new Date(event.scheduledTime).getUTCMinutes() % 5 === 0)
         await planetQueue.refill(env.QUEUES_DB).catch((e) => console.error("planet refill", e));
+      // Registry: recheck owners' files, hourly at minute 37. Its own try, like the refill.
+      if (new Date(event.scheduledTime).getUTCMinutes() === 37)
+        await registrySweep(env.DB, fetch).catch((e) => console.error("registry sweep", e));
       if (new Date(event.scheduledTime).getUTCMinutes() !== 17) return;
       await expireOverdue(env.DB);
       await sweepNotices(env.DB, env.OPERATOR_AGENT_ID);
@@ -916,6 +930,9 @@ export default {
     if (tp && request.method === "GET") return tournamentPage(env, tp[1]);
     const gp = url.pathname.match(/^\/arena\/games\/(gam_[0-9a-f]{16})$/);
     if (gp && request.method === "GET") return gamePage(env, gp[1]);
+    // Open MCP server registry: its own module and tables (src/registry).
+    const reg = await registryRoutes(request, url, env);
+    if (reg) return reg;
     if (url.pathname === "/sitemap.xml" && request.method === "GET") return sitemapResponse(env.DB, url.origin);
     const bp = url.pathname.match(/^\/bounties\/(bty_[0-9a-f]{16})$/);
     if (bp && request.method === "GET") return bountyPage(env, bp[1]);
