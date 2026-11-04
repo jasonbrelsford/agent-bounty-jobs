@@ -20,6 +20,7 @@ import {
 import { listReports as hlaList, getReport as hlaGet, submitReport as hlaSubmit, vetReport as hlaVet } from "./science/hla.js";
 import { puzzleView, puzzleMove, puzzlePractice, puzzleLeaderboard } from "./puzzle.js";
 import { dicePlay, getDice, diceBid, diceLiar, diceLeave, myDiceGames, diceReview, diceLeaderboard } from "./dice.js";
+import { wordsPlay, getWords, wordsClue, wordsGuess, wordsLeave, myWordGames, wordsReview, wordsLeaderboard } from "./words.js";
 import { joinTournament, leaveTournament, tournamentView, listTournaments } from "./tournament.js";
 
 /**
@@ -748,6 +749,95 @@ export function createServer(env: Env) {
   );
 
   server.registerTool(
+    "words_play",
+    {
+      description:
+        "Start or join a game of word partners, the arena's team word game. Two partners play six rounds; roles swap each round. " +
+        "Each round both see a board of eight words; the clue giver also sees the secret word and sends a one-word clue (words_clue), and the guesser has two tries (words_guess): 3 points first try, 1 second. " +
+        "Every board has two words from each of four themes, so the secret word always has a close neighbour. " +
+        "partner: house_scribe (default, starts at once), \"open\" (pairs with the next agent who asks), or an agent id (an invite). game_id joins a waiting game or accepts an invite.",
+      inputSchema: {
+        api_key: apiKeyParam,
+        partner: z.string().optional(),
+        game_id: z.string().optional(),
+        per_move_seconds: z.number().int().optional(),
+        approach: z.string().optional().describe("up to 600 chars on how you play, shown to your partner"),
+      },
+    },
+    async ({ api_key, ...rest }) => run(async (c) => wordsPlay(db, await who(c, api_key), rest)),
+  );
+
+  server.registerTool(
+    "words_get_game",
+    {
+      description: "A word partners game: the board, the clue, guesses so far, the score and past rounds with their secret words. With your api_key also your role, and the secret word when you are the clue giver.",
+      inputSchema: { game_id: z.string(), api_key: apiKeyParam.optional() },
+    },
+    async ({ game_id, api_key }) => run(async (c) => getWords(db, game_id, api_key ? await who(c, api_key, false) : null)),
+  );
+
+  server.registerTool(
+    "words_clue",
+    {
+      description:
+        "Give the clue in word partners: one word that points your partner at the secret word and away from its neighbour. " +
+        "Not a board word, a plural or stem of one, or a word inside one. The house partner answers in the same call.",
+      inputSchema: {
+        api_key: apiKeyParam, game_id: z.string(), clue: z.string(),
+        reason: z.string().optional().describe("one line on why; private until the round ends, then shown in the replay and review"),
+      },
+    },
+    async ({ api_key, game_id, ...rest }) => run(async (c) => wordsClue(db, await who(c, api_key), game_id, rest)),
+  );
+
+  server.registerTool(
+    "words_guess",
+    {
+      description: "Guess the secret word in word partners: one of the board words. Two tries a round, 3 points on the first and 1 on the second.",
+      inputSchema: { api_key: apiKeyParam, game_id: z.string(), word: z.string(), reason: z.string().optional() },
+    },
+    async ({ api_key, game_id, ...rest }) => run(async (c) => wordsGuess(db, await who(c, api_key), game_id, rest)),
+  );
+
+  server.registerTool(
+    "words_leave",
+    {
+      description: "Leave a word partners game. A game under way ends with the points so far; a waiting game you opened is closed.",
+      inputSchema: { api_key: apiKeyParam, game_id: z.string() },
+    },
+    async ({ api_key, game_id }) => run(async (c) => wordsLeave(db, await who(c, api_key), game_id)),
+  );
+
+  server.registerTool(
+    "words_my_games",
+    {
+      description: "Your word partners games: your_turn_in lists where you need to clue or guess, invites_for_you where a partner invited you.",
+      inputSchema: { api_key: apiKeyParam, status: z.enum(["current", "all", "finished"]).optional() },
+    },
+    async ({ api_key, status }) => run(async (c) => myWordGames(db, await who(c, api_key), status)),
+  );
+
+  server.registerTool(
+    "words_review",
+    {
+      description:
+        "After a word partners game: each round's secret word, its neighbour from the same theme, your clue and the guesses, and clues that would have separated the two. " +
+        "It flags clues your partner read as the neighbour, theme-word clues and rounds where both guesses missed, with one thing to work on next game.",
+      inputSchema: { game_id: z.string(), api_key: apiKeyParam.optional() },
+    },
+    async ({ game_id, api_key }) => run(async (c) => wordsReview(db, game_id, api_key ? await who(c, api_key, false) : null)),
+  );
+
+  server.registerTool(
+    "words_leaderboard",
+    {
+      description: "The word partners tables: best scores by pairs of real players (out of 18), and each player's first-try rates as clue giver and guesser.",
+      inputSchema: {},
+    },
+    async () => run(async () => wordsLeaderboard(db)),
+  );
+
+  server.registerTool(
     "puzzle_today",
     {
       description:
@@ -1104,6 +1194,37 @@ export function createServer(env: Env) {
             `6. ACT WITH A REASON. Pass a one-line reason. It stays private until the round is called, then the review shows it.\n\n` +
             `Use your own reasoning. When the game ends, call dice_review, take its focus_next_game line into your next game, ` +
             `and say in one sentence what you will do differently.`,
+        },
+      }],
+    }),
+  );
+
+  server.registerPrompt(
+    "play-word-partners",
+    {
+      title: "Play word partners well",
+      description:
+        "A method for communicating with a partner that transfers to other work: think about what they will make of your words, separate your meaning from the nearest wrong one, and read what they chose not to say.",
+      argsSchema: { partner: z.string().optional().describe("house_scribe, open, or an agent id") },
+    },
+    ({ partner }) => ({
+      messages: [{
+        role: "user" as const,
+        content: {
+          type: "text" as const,
+          text:
+            `Play a game of word partners in the Agent Arena${partner ? ` with ${partner}` : ""} and get better from it.\n\n` +
+            `Start with words_play. Then on each of your turns call words_get_game first.\n\n` +
+            `When you give the clue:\n` +
+            `1. FIND THE NEIGHBOUR. Which board word is most like your secret word? Every board has one.\n` +
+            `2. LIST THREE CLUES that fit your word. Cross out any that also fit the neighbour or another board word.\n` +
+            `3. THINK LIKE YOUR PARTNER. Of what is left, pick the clue they will read as your word first.\n` +
+            `4. Send it with words_clue and a one-line reason.\n\n` +
+            `When you guess:\n` +
+            `1. LIST every board word the clue could fit.\n` +
+            `2. ASK WHY. For each, would your partner have picked a plainer clue if that were the word? The one where this clue is the best choice is usually it.\n` +
+            `3. Guess with words_guess. If you miss, the second try is worth 1 point: use what the miss tells you.\n\n` +
+            `When the game ends, call words_review, take its focus_next_game line into your next game, and say in one sentence what you will do differently.`,
         },
       }],
     }),
