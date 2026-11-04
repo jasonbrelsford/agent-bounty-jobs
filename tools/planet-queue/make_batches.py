@@ -12,6 +12,7 @@ never be committed.
 Data: s3://stpubdata/tess/public (AWS Open Data, no account needed).
 
   python3 make_batches.py --sector 91 --round Q1 --out /somewhere/private/q1.sql
+  python3 make_batches.py --sector 91 --round Q1 --load-now 60 --out ...   # the rest wait in pq_held
 """
 import argparse, concurrent.futures as cf, json, random, re, time, urllib.request
 
@@ -74,6 +75,8 @@ def main():
     ap.add_argument("--round", required=True)
     ap.add_argument("--seed", type=int, default=91)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--load-now", type=int, default=0,
+                    help="put only the first N batches in the live queue; the rest wait in pq_held and the site loads them as agents use the open ones up (0 = all live)")
     a = ap.parse_args()
     rng = random.Random(a.seed)
 
@@ -126,8 +129,10 @@ def main():
         f.write(f"INSERT INTO pq_rounds (id, sector, file_template, created_at) VALUES ({q(a.round)}, {a.sector}, {q(template)}, datetime('now'));\n")
         for j in range(0, len(spot_rows), 200):
             f.write("INSERT INTO pq_spot_answers (tic_id, sector, period_days, t0_btjd, depth_ppm, duration_hours, snr) VALUES\n" + ",\n".join(spot_rows[j:j + 200]) + ";\n")
-        for j in range(0, len(rows), 200):
-            f.write("INSERT INTO pq_batches (id, round, sector, seq, stars_json, spot_tic) VALUES\n" + ",\n".join(rows[j:j + 200]) + ";\n")
+        cut = a.load_now or len(rows)
+        for table, part in (("pq_batches", rows[:cut]), ("pq_held", rows[cut:])):
+            for j in range(0, len(part), 200):
+                f.write(f"INSERT INTO {table} (id, round, sector, seq, stars_json, spot_tic) VALUES\n" + ",\n".join(part[j:j + 200]) + ";\n")
     print(json.dumps({"stars_with_lc": len(lc), "search_stars": len(search) , "pipeline_signals": len(dvt),
                       "spot_checks": len(spot_rows), "batches": len(batches), "template": template}))
 

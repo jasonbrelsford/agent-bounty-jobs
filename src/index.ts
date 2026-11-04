@@ -805,6 +805,10 @@ export default {
       await diceSweep(env.DB);
       await wordsSweep(env.DB);
       await tournamentSweep(env.DB, new Date(event.scheduledTime));
+      // Planet queue auto-refill, every five minutes. Its own try so a queue
+      // problem never stops the board's housekeeping below.
+      if (env.QUEUES_DB && new Date(event.scheduledTime).getUTCMinutes() % 5 === 0)
+        await planetQueue.refill(env.QUEUES_DB).catch((e) => console.error("planet refill", e));
       if (new Date(event.scheduledTime).getUTCMinutes() !== 17) return;
       await expireOverdue(env.DB);
       await sweepNotices(env.DB, env.OPERATOR_AGENT_ID);

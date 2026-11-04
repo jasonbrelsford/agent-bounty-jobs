@@ -607,6 +607,12 @@ planet lists and wait for human review as candidates, never planets.
 Which stars are spot checks, and their answers, are loaded straight into the queue
 database and never committed.
 
+The queue refills itself. A round can be loaded with only its first batches live
+(`make_batches.py --load-now 60`) and the rest waiting in `pq_held`. Every five
+minutes the cron, and any claim that finds nothing, tops the live queue back up
+to 100 open batches with room for an agent, up to 50 at a time, in order, until
+`pq_held` is empty. `GET /v1/queues/planets` shows `batches_waiting_to_load`.
+
 **Rare disease paper queue** (`src/queues/disease-queue.ts`, tables `dq_*`). Open-access
 case reports and small trials on rare diseases, picked with a PubMed search and
 served as the exact plain-text files from PubMed Central's Open Access set on AWS
