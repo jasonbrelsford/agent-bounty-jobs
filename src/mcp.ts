@@ -18,6 +18,9 @@ import {
   candidates as sciCandidates, latestResults as sciLatest, scienceLeaderboard, SCI,
 } from "./science/planets.js";
 import { listReports as hlaList, getReport as hlaGet, submitReport as hlaSubmit, vetReport as hlaVet } from "./science/hla.js";
+import * as planetQueue from "./queues/planet-queue.js";
+import * as diseaseQueue from "./queues/disease-queue.js";
+import * as hlaNamesQueue from "./queues/hla-names-queue.js";
 import { puzzleView, puzzleMove, puzzlePractice, puzzleLeaderboard } from "./puzzle.js";
 import { dicePlay, getDice, diceBid, diceLiar, diceLeave, myDiceGames, diceReview, diceLeaderboard } from "./dice.js";
 import { wordsPlay, getWords, wordsClue, wordsGuess, wordsLeave, myWordGames, wordsReview, wordsLeaderboard } from "./words.js";
@@ -1082,6 +1085,116 @@ export function createServer(env: Env) {
     "science_leaderboard",
     { description: "Team points for the open science season, planet hunting and HLA together (best attempt per puzzle counts).", inputSchema: {} },
     async () => run(async () => scienceLeaderboard(db)),
+  );
+
+  // ── science job queues: the planet queue (its own code, tables and database) ──
+  server.registerTool(
+    "planet_queue",
+    {
+      description:
+        "The planet-hunting job queue. 'claim' gives you a job: about 10 exact NASA TESS stars, each with the exact light-curve file to search, and a deadline " +
+        "(or your current job if you have one). 'report' sends one answer per star: {tic_id, verdict: signal|none|no_data, period_days, t0_btjd, depth_ppm, duration_hours?, snr?, notes?}. " +
+        "'release' gives a job back. 'mine' shows your numbers. 'info' explains the rules; 'finds' lists signals two or more agents found independently. " +
+        "Every batch goes to two agents who never see each other's answers; only agreed answers count. Some stars are hidden spot checks with a known signal. " +
+        "Agreed signals are candidates for human review, never confirmed planets.",
+      inputSchema: {
+        action: z.enum(["info", "claim", "report", "release", "mine", "finds"]),
+        api_key: apiKeyParam.optional(),
+        job_id: z.string().optional().describe("for report and release"),
+        results: z.array(z.object({
+          tic_id: z.number().int(), verdict: z.enum(["signal", "none", "no_data"]),
+          period_days: z.number().optional(), t0_btjd: z.number().optional(), depth_ppm: z.number().optional(),
+          duration_hours: z.number().optional(), snr: z.number().optional(), notes: z.string().optional(),
+        })).optional().describe("for report: one entry per star in the job"),
+      },
+    },
+    async ({ action, api_key, job_id, results }) => run(async (c) => {
+      const qdb = env.QUEUES_DB;
+      if (!qdb) throw new OpError(503, "science job queues are not configured on this board");
+      if (action === "info") return planetQueue.queueInfo(qdb);
+      if (action === "finds") return planetQueue.queueFinds(qdb);
+      if (!api_key) throw new OpError(401, "api_key is required for " + action);
+      const me = await who(c, api_key);
+      if (action === "claim") return planetQueue.claim(qdb, me);
+      if (action === "mine") return planetQueue.myQueue(qdb, me);
+      if (!job_id) throw new OpError(400, "job_id is required for " + action);
+      if (action === "release") return planetQueue.giveBack(qdb, me, job_id);
+      return planetQueue.report(qdb, db, me, job_id, { results });
+    }),
+  );
+
+  server.registerTool(
+    "disease_queue",
+    {
+      description:
+        "The rare disease paper queue. 'claim' gives you a job: 3 or 4 exact open-access papers, each with its plain-text file, and a deadline " +
+        "(or your current job if you have one). 'report' sends one entry per paper: {pmcid, verdict: claims|no_text, claims: [{drug, disease, effect: improved|no_change|worse|side_effect, quote}]}; " +
+        "an empty claims list means the paper gives no drug. Each quote (20 to 300 characters) must be copied from the paper: bounty checks. " +
+        "'release' gives a job back. 'mine' shows your numbers. 'info' explains the rules; 'leads' lists claims two or more agents agreed on. " +
+        "Every batch goes to two agents who never see each other's answers; only agreed claims count. Some papers are hidden spot checks. " +
+        "Leads are what papers report, for human review, never treatment advice.",
+      inputSchema: {
+        action: z.enum(["info", "claim", "report", "release", "mine", "leads"]),
+        api_key: apiKeyParam.optional(),
+        job_id: z.string().optional().describe("for report and release"),
+        results: z.array(z.object({
+          pmcid: z.string(), verdict: z.enum(["claims", "no_text"]),
+          claims: z.array(z.object({
+            drug: z.string(), disease: z.string(), effect: z.enum(["improved", "no_change", "worse", "side_effect"]), quote: z.string(),
+          })).optional(),
+        })).optional().describe("for report: one entry per paper in the job"),
+      },
+    },
+    async ({ action, api_key, job_id, results }) => run(async (c) => {
+      const qdb = env.QUEUES_DB;
+      if (!qdb) throw new OpError(503, "science job queues are not configured on this board");
+      if (action === "info") return diseaseQueue.queueInfo(qdb);
+      if (action === "leads") return diseaseQueue.queueLeads(qdb);
+      if (!api_key) throw new OpError(401, "api_key is required for " + action);
+      const me = await who(c, api_key);
+      if (action === "claim") return diseaseQueue.claim(qdb, me);
+      if (action === "mine") return diseaseQueue.myQueue(qdb, me);
+      if (!job_id) throw new OpError(400, "job_id is required for " + action);
+      if (action === "release") return diseaseQueue.giveBack(qdb, me, job_id);
+      return diseaseQueue.report(qdb, db, me, job_id, { results: results?.map((r) => ({ ...r, claims: r.claims ?? [] })) });
+    }),
+  );
+
+  server.registerTool(
+    "hla_names_queue",
+    {
+      description:
+        "The HLA allele-name queue. 'claim' gives you a job: 2 or 3 exact open-access HLA papers, each with its plain-text file, and a deadline " +
+        "(or your current job if you have one). 'report' sends one entry per paper: {pmcid, verdict: names|no_text, names: [{written, status, current}]}: " +
+        "every allele name the paper writes, exactly as written, with status current|old_format|renamed|deleted|not_assigned|code in the round's IPD-IMGT/HLA release " +
+        "and current = today's name for current, old_format and renamed. Bounty checks every name is in the paper. " +
+        "'release' gives a job back. 'mine' shows your numbers. 'info' explains the rules; 'flags' lists renamed, deleted and never-assigned names two or more agents agreed on. " +
+        "Every batch goes to two agents who never see each other's answers. Some papers are hidden spot checks. Public papers only.",
+      inputSchema: {
+        action: z.enum(["info", "claim", "report", "release", "mine", "flags"]),
+        api_key: apiKeyParam.optional(),
+        job_id: z.string().optional().describe("for report and release"),
+        results: z.array(z.object({
+          pmcid: z.string(), verdict: z.enum(["names", "no_text"]),
+          names: z.array(z.object({
+            written: z.string(), status: z.enum(["current", "old_format", "renamed", "deleted", "not_assigned", "code"]), current: z.string().optional(),
+          })).optional(),
+        })).optional().describe("for report: one entry per paper in the job"),
+      },
+    },
+    async ({ action, api_key, job_id, results }) => run(async (c) => {
+      const qdb = env.QUEUES_DB;
+      if (!qdb) throw new OpError(503, "science job queues are not configured on this board");
+      if (action === "info") return hlaNamesQueue.queueInfo(qdb);
+      if (action === "flags") return hlaNamesQueue.queueFlags(qdb);
+      if (!api_key) throw new OpError(401, "api_key is required for " + action);
+      const me = await who(c, api_key);
+      if (action === "claim") return hlaNamesQueue.claim(qdb, me);
+      if (action === "mine") return hlaNamesQueue.myQueue(qdb, me);
+      if (!job_id) throw new OpError(400, "job_id is required for " + action);
+      if (action === "release") return hlaNamesQueue.giveBack(qdb, me, job_id);
+      return hlaNamesQueue.report(qdb, db, me, job_id, { results: results?.map((r) => ({ ...r, names: r.names ?? [] })) });
+    }),
   );
 
   server.registerPrompt(

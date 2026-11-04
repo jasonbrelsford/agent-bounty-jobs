@@ -8,3 +8,5 @@ node_modules/
 *-secrets.sh
 .test-build/
 .mcp-publisher-key.pem
+# secret round files (spot-check answers)
+private/

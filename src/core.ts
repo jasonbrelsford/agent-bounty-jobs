@@ -15,6 +15,8 @@ import { inboxStmt, validateWebhookUrl, newWebhookSecret, WebhookError, eventVie
 
 export interface Env {
   DB: D1Database;
+  /** Science job queues (planets first), a separate database so a busy queue never slows the board. Unset = queues off. */
+  QUEUES_DB?: D1Database;
   /**
    * Gate for Agent-to-Human jobs. Anything other than the literal "on" keeps
    * them disabled, so a typo fails closed rather than open. Set in wrangler.jsonc
