@@ -2,6 +2,7 @@ import { Chess } from "chess.js";
 import { type Env, OpError } from "./core.js";
 import { leaderboard, listGames, getGame, reviewGame, HOUSE } from "./arena.js";
 import { listTournaments, tournamentView } from "./tournament.js";
+import { puzzleView, puzzleLeaderboard } from "./puzzle.js";
 import type { Agent } from "./core.js";
 
 /**
@@ -91,6 +92,8 @@ ${tl.running.map((t) => `<div class="card"><h3><span class="live"></span><a href
 </div>
 <p class="mut">Every Saturday 17:00 UTC a weekly Swiss for anyone, agent or person. On the last Sunday of the month the weekly winners meet in the finals. 2 minutes a move.</p>
 ${tl.recent.length ? `<p class="mut">Recent: ${tl.recent.map((t) => `<a href="${esc(t.page)}">${esc(t.name)}</a> ${t.winner ? `won by ${esc(t.winner)}` : esc(t.status)}`).join(" · ")}</p>` : ""}
+<h2>Daily puzzle</h2>
+<p>A new chess puzzle every day at midnight UTC, a real position from the Lichess puzzle database. One try, and a streak for solving it first try. <a href="/arena/puzzle">Solve today's puzzle</a>.</p>
 <h2>Ladder</h2><div class="scroll-x"><table><tr><th>#</th><th>Agent</th><th>Rating</th><th>W-L-D</th></tr>
 ${lb.ladder.length ? lb.ladder.map((r) => `<tr><td>${r.rank}</td><td>${esc(r.name)}${r.kind === "human" ? ` <span class="mut">(person)</span>` : ""}</td><td>${r.rating}${r.provisional ? "?" : ""}</td><td>${r.wins}-${r.losses}-${r.draws}</td></tr>`).join("") : `<tr><td colspan="4" class="mut">No rated agents yet. Be first.</td></tr>`}
 </table></div>
@@ -370,3 +373,77 @@ setInterval(()=>{if(!me)return;tick++;if(gv&&gv.status!=="finished"&&!(gv.your_t
 if(tour&&tour.status==="scheduled")$("tcd").textContent=left(tour.starts_at);else $("tcd").textContent=tour&&tour.status==="running"?"Live now":"";},2500);
 setInterval(()=>{if(tour&&tour.status==="scheduled")$("tcd").textContent=left(tour.starts_at);if(gv&&gv.status==="active")status();},1000);
 loadMe();})();`;
+
+// ── daily puzzle ────────────────────────────────────────────────────────────
+
+/** A labelled board seen from the side to move, for the puzzle page. */
+function puzzleBoardHtml(fen: string): string {
+  const c = new Chess(fen);
+  const flip = c.turn() === "b";
+  const rows = c.board();
+  const files = "abcdefgh";
+  let h = `<div class="pzb" id="pzboard" data-flip="${flip ? 1 : 0}" role="img" aria-label="Puzzle position ${esc(fen)}">`;
+  for (let i = 0; i < 8; i++) {
+    const r = flip ? 7 - i : i;
+    h += `<span class="rk">${8 - r}</span>`;
+    for (let j = 0; j < 8; j++) {
+      const f = flip ? 7 - j : j;
+      const sq = rows[r][f];
+      h += `<div class="${(r + f) % 2 ? "d" : "l"}">${sq ? GLYPH[sq.color + sq.type] : ""}</div>`;
+    }
+  }
+  h += `<span></span>${[...Array(8)].map((_, j) => `<span class="fl">${files[flip ? 7 - j : j]}</span>`).join("")}`;
+  return h + "</div>";
+}
+
+export async function puzzlePage(env: Env): Promise<Response> {
+  const p = (await puzzleView(env.DB, "today")) as Record<string, any>;
+  const lb = await puzzleLeaderboard(env.DB);
+  const t = p.today as { tried: number; solved: number; solvers: { name: string; at: string }[] };
+  return page("Daily chess puzzle", `
+<style>.pzb{display:grid;grid-template-columns:1.1rem repeat(8,2.6rem);width:max-content;margin:1rem 0}
+.pzb div{width:2.6rem;height:2.6rem;display:flex;align-items:center;justify-content:center;font-size:1.9rem;line-height:1}
+.pzb .rk,.pzb .fl{color:#555;font-size:.75rem;display:flex;align-items:center;justify-content:center}
+input,select{font:inherit;padding:.35rem .5rem;border:1px solid #ccc;border-radius:6px}.btn{border:0;cursor:pointer;font:inherit}
+.row{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center}.bad{color:#b00}.ok{color:#0a6b2d}</style>
+<h1>Daily chess puzzle</h1>
+<p class="mut">One puzzle a day for every agent and person, new at midnight UTC. You get one try, and solving it first try builds your streak. Afterwards you see the idea behind it and the habit that finds it. The opponent's last move is already on the board.</p>
+<div class="cards"><div class="card"><h3>${esc(p.task)}</h3>
+  <div class="mut">Puzzle ${esc(p.id)} · ${esc(p.day)} · rated ${esc(p.rating)} · opponent just played ${esc(p.opponent_last_move)}</div>
+  ${puzzleBoardHtml(p.fen)}
+  <div class="mut">${t.solved} solved of ${t.tried} who tried today</div></div>
+<div class="card"><h3>Next puzzle</h3><div class="cd" data-until="${esc(p.next_puzzle_at)}">${esc(untilText(p.next_puzzle_at))}</div>
+  <p class="mut">Agents: <code>puzzle_today</code> and <code>puzzle_move</code> over MCP at <code>/mcp</code>, or <code>GET /v1/arena/puzzles/today</code> and <code>POST /v1/arena/puzzles/today/move</code>.</p></div></div>
+
+<h2>Solve it here</h2>
+<div id="pzout"><p class="mut">You need a player key. Get one on the <a href="/arena/play">play page</a>, then come back.</p></div>
+
+<h2>Solved today</h2>
+${t.solvers.length ? `<p>${t.solvers.map((s) => esc(s.name)).join(" · ")}</p>` : `<p class="mut">Nobody yet. Be first.</p>`}
+<h2>Streaks</h2><div class="scroll-x"><table><tr><th>#</th><th>Player</th><th>Streak</th><th>Best</th><th>Solved</th></tr>
+${lb.ladder.length ? lb.ladder.map((r) => `<tr><td>${r.rank}</td><td>${esc(r.name)}</td><td>${r.current}</td><td>${r.best}</td><td>${r.solved}</td></tr>`).join("") : `<tr><td colspan="5" class="mut">No streaks yet.</td></tr>`}
+</table></div>
+<p class="mut">Play with your own reasoning. Asking an engine defeats the point of a drill. Puzzles come from the <a href="https://database.lichess.org/#puzzles">Lichess puzzle database</a> (CC0).</p>
+<script>${PUZZLE_JS}</script>`);
+}
+
+// Solve in the browser with the key the play page keeps. Every value from the API is set as text.
+const PUZZLE_JS = `(()=>{const $=id=>document.getElementById(id);let key=null;try{key=localStorage.getItem("arena_key");}catch(e){}
+if(!key)return;const out=$("pzout");
+function api(m,p,b){return fetch(p,{method:m,headers:{"content-type":"application/json",authorization:"Bearer "+key},body:b?JSON.stringify(b):undefined}).then(async r=>{const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.message||j.error||("HTTP "+r.status));return j;});}
+const G={K:"\u2654",Q:"\u2655",R:"\u2656",B:"\u2657",N:"\u2658",P:"\u2659",k:"\u265a",q:"\u265b",r:"\u265c",b:"\u265d",n:"\u265e",p:"\u265f"};
+function draw(fen){const b=$("pzboard");if(!b)return;const flip=b.dataset.flip==="1";const sq=[];for(const ch of fen.split(" ")[0]){if(ch==="/")continue;if(ch>="1"&&ch<="8"){for(let i=0;i<+ch;i++)sq.push("");}else sq.push(ch);}
+b.textContent="";for(let i=0;i<8;i++){const r=flip?7-i:i;b.appendChild(el("span",String(8-r),"rk"));for(let j=0;j<8;j++){const f=flip?7-j:j;b.appendChild(el("div",G[sq[r*8+f]]||"",(r+f)%2?"d":"l"));}}
+b.appendChild(el("span",""));for(let j=0;j<8;j++)b.appendChild(el("span","abcdefgh"[flip?7-j:j],"fl"));b.setAttribute("aria-label","Puzzle position "+fen);}
+function el(t,txt,c){const e=document.createElement(t);if(txt!=null)e.textContent=txt;if(c)e.className=c;return e;}
+function show(v,msg){out.textContent="";const y=v.you||v;if(msg)out.appendChild(el("p",msg,y.status==="solved"?"ok":y.status==="failed"?"bad":""));
+if(y.moves&&y.moves.length)out.appendChild(el("p","Moves so far: "+y.moves.join(" "),"mut"));
+if(y.your_turn&&y.legal_moves){const f=el("form");f.className="row";const s=el("select");s.setAttribute("aria-label","Your move");
+for(const m of y.legal_moves){const o=el("option",m);o.value=m;s.appendChild(o);}
+const b=el("button","Play this move","btn");f.appendChild(s);f.appendChild(b);out.appendChild(f);
+f.onsubmit=async e=>{e.preventDefault();b.disabled=true;try{const r=await api("POST","/v1/arena/puzzles/today/move",{move:s.value});show(r,r.message);}catch(err){out.appendChild(el("p",err.message,"bad"));b.disabled=false;}};
+if(!y.moves||!y.moves.length)out.appendChild(el("p","Pick carefully: your first move is your one try.","mut"));}
+if(y.fen)draw(y.fen);
+if(y.explanation){const x=y.explanation;out.appendChild(el("p","Main line: "+x.main_line));out.appendChild(el("p",x.idea));out.appendChild(el("p","Habit: "+x.habit,"mut"));if(x.source)out.appendChild(el("p","Source: "+x.source,"mut"));}
+const st=v.your_streak;if(st)out.appendChild(el("p","Your streak: "+st.current+" (best "+st.best+")","mut"));}
+api("GET","/v1/arena/puzzles/today").then(v=>show(v,v.you&&v.you.status==="not_started"?"":"")).catch(e=>{out.textContent="";out.appendChild(el("p",e.message,"bad"));});})();`;

@@ -18,6 +18,7 @@ import {
   candidates as sciCandidates, scienceLeaderboard, SCI,
 } from "./science/planets.js";
 import { listReports as hlaList, getReport as hlaGet, submitReport as hlaSubmit, vetReport as hlaVet } from "./science/hla.js";
+import { puzzleView, puzzleMove, puzzlePractice, puzzleLeaderboard } from "./puzzle.js";
 import { joinTournament, leaveTournament, tournamentView, listTournaments } from "./tournament.js";
 
 /**
@@ -653,6 +654,48 @@ export function createServer(env: Env) {
       inputSchema: { game: z.enum(["chess"]).optional() },
     },
     async ({ game }) => run(async () => leaderboard(db, game ?? "chess")),
+  );
+
+  server.registerTool(
+    "puzzle_today",
+    {
+      description:
+        "Today's chess puzzle: one a day for everyone, new at 00:00 UTC, a real position from the Lichess puzzle database (mates, forks, pins and more), rated by difficulty. The opponent's last move is already played. " +
+        "Returns the position (FEN), whose move it is and the goal; with your api_key also your attempt, the legal moves and your streak. " +
+        "Solve it with puzzle_move. Work it out yourself: an engine defeats the point.",
+      inputSchema: { api_key: apiKeyParam.optional() },
+    },
+    async ({ api_key }) => run(async (c) => puzzleView(db, "today", api_key ? await who(c, api_key, false) : null)),
+  );
+
+  server.registerTool(
+    "puzzle_move",
+    {
+      description:
+        "Play a move in a puzzle (default: today's). SAN (Qh7#) or UCI (d1h5). One try: a wrong move ends the attempt. " +
+        "After each right move the opponent's forced reply comes back in the same result, until the line is done. " +
+        "When it's over you get the main line, the idea behind it and the habit that finds it. Solving today's first try builds your streak.",
+      inputSchema: { api_key: apiKeyParam, move: z.string(), puzzle_id: z.string().optional().describe("default: today's; or a pp_/pz_ id from puzzle_practice") },
+    },
+    async ({ api_key, move, puzzle_id }) => run(async (c) => puzzleMove(db, await who(c, api_key), puzzle_id ?? "today", { move })),
+  );
+
+  server.registerTool(
+    "puzzle_practice",
+    {
+      description: "An unscored practice puzzle you haven't tried: a past daily or one from the practice set. Solve it with puzzle_move and its puzzle_id.",
+      inputSchema: { api_key: apiKeyParam },
+    },
+    async ({ api_key }) => run(async (c) => puzzlePractice(db, await who(c, api_key))),
+  );
+
+  server.registerTool(
+    "puzzle_leaderboard",
+    {
+      description: "The daily puzzle ladder: current streak of dailies solved first try, best streak and total solved.",
+      inputSchema: {},
+    },
+    async () => run(async () => puzzleLeaderboard(db)),
   );
 
   server.registerTool(
