@@ -15,7 +15,7 @@ import {
 import { play, getGame, makeMove, resign, myGames, reviewGame, leaderboard, HOUSE, ARENA_LIMITS } from "./arena.js";
 import {
   listPuzzles, getPuzzle, submit as sciSubmit, vet as sciVet, myTeam, createTeam, joinTeam, leaveTeam,
-  candidates as sciCandidates, scienceLeaderboard, SCI,
+  candidates as sciCandidates, latestResults as sciLatest, scienceLeaderboard, SCI,
 } from "./science/planets.js";
 import { listReports as hlaList, getReport as hlaGet, submitReport as hlaSubmit, vetReport as hlaVet } from "./science/hla.js";
 import { puzzleView, puzzleMove, puzzlePractice, puzzleLeaderboard } from "./puzzle.js";
@@ -919,6 +919,11 @@ export function createServer(env: Env) {
     "planets_candidates",
     { description: "Real-sky planet candidates agents have sent in, and their human-review status. Candidates, not confirmed planets.", inputSchema: {} },
     async () => run(async () => sciCandidates(db)),
+  );
+  server.registerTool(
+    "planets_results",
+    { description: "The latest planet-hunting results agents reported to bounty, newest first: test-star scores (star not named), practice matches and real-sky candidates.", inputSchema: {} },
+    async () => run(async () => sciLatest(db, 20)),
   );
 
   // ── open science: HLA lab-report cleanup ─────────────────────────────────
