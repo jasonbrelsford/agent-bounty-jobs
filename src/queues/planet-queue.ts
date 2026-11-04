@@ -360,14 +360,29 @@ export async function queueInfo(qdb: D1Database) {
   };
 }
 
-export async function queueFinds(qdb: D1Database, limit = 50) {
-  const r = await qdb.prepare("SELECT * FROM pq_finds ORDER BY updated_at DESC LIMIT ?").bind(Math.min(Math.max(1, limit), 200)).all<Record<string, unknown>>();
+/**
+ * Agreed signals, oldest first so a reader can page through all of them with ?after=<id of the last one>.
+ * Dismissed ones are left out. This is the feed the public findings repository copies once a day.
+ */
+export async function queueFinds(qdb: D1Database, opts: { limit?: number; after?: string | null } = {}) {
+  const limit = Math.min(Math.max(1, Number(opts.limit) || 100), 500);
+  const after = opts.after && /^pqf_[0-9a-f]{16}$/.test(opts.after)
+    ? await qdb.prepare("SELECT created_at, id FROM pq_finds WHERE id = ?").bind(opts.after).first<{ created_at: string; id: string }>()
+    : null;
+  const r = await qdb.prepare(
+    `SELECT * FROM pq_finds WHERE status != 'dismissed' ${after ? "AND (created_at > ? OR (created_at = ? AND id > ?))" : ""} ORDER BY created_at, id LIMIT ?`,
+  ).bind(...(after ? [after.created_at, after.created_at, after.id] : []), limit + 1).all<Record<string, unknown>>();
+  const rows = r.results ?? [];
+  const page = rows.slice(0, limit);
   return {
-    wording: "Signals at least two agents found independently. Candidates for human review, not confirmed planets.",
-    finds: (r.results ?? []).map((f) => ({
+    wording: "Signals at least two agents found independently in NASA TESS data. Candidates, not confirmed planets: only telescope follow-up confirms a planet.",
+    statuses: { review: "candidate, waiting for human review", promoted: "candidate, passed human review", known: "a signal NASA already lists (a recovered known signal)" },
+    finds: page.map((f) => ({
       id: f.id, tic_id: f.tic_id, sector: f.sector, period_days: f.period_days, t0_btjd: f.t0_btjd, depth_ppm: f.depth_ppm,
-      duration_hours: f.duration_hours, agreed_by: f.agreed_by, status: f.status, known_label: f.known_label, review_note: f.review_note, updated_at: f.updated_at,
+      duration_hours: f.duration_hours, agreed_by: f.agreed_by, status: f.status, known_label: f.known_label, review_note: f.review_note,
+      found_at: f.created_at, updated_at: f.updated_at,
     })),
+    next: rows.length > limit ? `?after=${page[page.length - 1].id}&limit=${limit}` : null,
   };
 }
 

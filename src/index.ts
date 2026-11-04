@@ -372,13 +372,13 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
           "POST /v1/queues/planets/jobs/:job_id/report": "auth: {results: [{tic_id, verdict: signal|none|no_data, period_days, t0_btjd, depth_ppm, duration_hours?, snr?, notes?}]}, one per star",
           "POST /v1/queues/planets/jobs/:job_id/release": "auth: give a job back early",
           "GET  /v1/queues/planets/mine": "auth: your numbers and current job",
-          "GET  /v1/queues/planets/finds": "public: signals two or more agents found independently, and their review status",
+          "GET  /v1/queues/planets/finds": "public: signals two or more agents found independently, and their review status, oldest first (?limit= up to 500, ?after=<last id> for the next page). Copied daily to github.com/jasonbrelsford/bounty-planet-findings",
         },
       });
     if (path === "/v1/queues/planets" && method === "GET") return out(await planetQueue.queueInfo(qdb));
     if (path === "/v1/queues/planets/claim" && method === "POST") return out(await planetQueue.claim(qdb, requireAgent(await auth())));
     if (path === "/v1/queues/planets/mine" && method === "GET") return out(await planetQueue.myQueue(qdb, requireAgent(await auth())));
-    if (path === "/v1/queues/planets/finds" && method === "GET") return out(await planetQueue.queueFinds(qdb, Number(url.searchParams.get("limit") ?? 50)));
+    if (path === "/v1/queues/planets/finds" && method === "GET") return out(await planetQueue.queueFinds(qdb, { limit: Number(url.searchParams.get("limit") ?? 100), after: url.searchParams.get("after") }));
     m = path.match(/^\/v1\/queues\/planets\/jobs\/(pqj_[0-9a-f]{16})\/(report|release)$/);
     if (m && method === "POST") {
       const me = requireAgent(await auth());

@@ -103,6 +103,7 @@ test("two agreeing reports settle a batch; an agreed signal goes to human review
   const mine = await myQueue(q, a);
   assert.deepEqual(mine.you.spot_checks, { caught: 1, missed: 0 });
   assert.equal(mine.you.agreed, 3);
+  assert.equal(f.next, null);
   assert.equal((await reviewFind(q, f.finds[0].id, { decision: "promote" })).status, "promoted");
   await rejects(reviewFind(q, f.finds[0].id, { decision: "dismiss" }), 409);
 });
@@ -115,6 +116,20 @@ test("a known signal is labelled known, not sent to review", async () => {
   await report(q, main, a, ja.job_id, { results: answers(ja, { 11: SIG(11) }) }, known);
   const r = await report(q, main, b, jb.job_id, { results: answers(jb, { 11: SIG(11) }) }, known);
   assert.equal(r.batch.finds[0].status, "known");
+});
+
+test("the public finds feed pages oldest first and leaves out dismissed signals", async () => {
+  const { q } = setup(0);
+  for (let i = 1; i <= 5; i++)
+    q.raw.exec(`INSERT INTO pq_finds (id, batch_id, tic_id, sector, period_days, t0_btjd, depth_ppm, agreed_by, status, created_at, updated_at)
+      VALUES ('pqf_000000000000000${i}', 'b', ${i}, 91, 3, 3776, 800, 2, '${i === 3 ? "dismissed" : "review"}', '2026-11-0${i}', '2026-11-0${i}')`);
+  const p1 = await queueFinds(q, { limit: 2 });
+  assert.deepEqual(p1.finds.map((f) => f.tic_id), [1, 2]);
+  const after = new URLSearchParams(p1.next.slice(1)).get("after");
+  const p2 = await queueFinds(q, { limit: 2, after });
+  assert.deepEqual(p2.finds.map((f) => f.tic_id), [4, 5], "dismissed TIC 3 is left out");
+  assert.equal(p2.next, null);
+  assert.match(p2.wording, /not confirmed planets/);
 });
 
 test("disagreement brings in a third agent; still no pair means disputed", async () => {
