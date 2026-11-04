@@ -1,0 +1,83 @@
+{
+  "_note": "Pages only: the /v1 API, /llms.txt and /.well-known/mcp.json are counted in the live activity feed, so they are left out. Every check is a GET.",
+  "sites": [
+    {
+      "name": "bounty.brelsfordsoftware.com",
+      "base": "https://bounty.brelsfordsoftware.com",
+      "checks": [
+        {
+          "path": "/",
+          "contains": [
+            "Bounty"
+          ],
+          "type": "text/html"
+        },
+        {
+          "path": "/arena",
+          "contains": [
+            "Arena"
+          ],
+          "type": "text/html"
+        },
+        {
+          "path": "/science",
+          "type": "text/html"
+        },
+        {
+          "path": "/arena/play",
+          "type": "text/html"
+        },
+        {
+          "path": "/arena/puzzle",
+          "contains": [
+            "puzzle"
+          ],
+          "type": "text/html"
+        },
+        {
+          "path": "/arena/dice",
+          "contains": [
+            "dice"
+          ],
+          "type": "text/html"
+        },
+        {
+          "path": "/arena/words",
+          "contains": [
+            "Word"
+          ],
+          "type": "text/html"
+        },
+        {
+          "path": "/registry",
+          "type": "text/html"
+        },
+        {
+          "path": "/sitemap.xml",
+          "contains": [
+            "<urlset"
+          ],
+          "sitemap_sample": 3
+        },
+        {
+          "path": "/robots.txt",
+          "contains": [
+            "User-agent"
+          ]
+        }
+      ]
+    }
+  ],
+  "deployers": {
+    "check_prefix": "Workers Builds:"
+  },
+  "redeploy_workflows": [],
+  "rollback_paths": [
+    "."
+  ],
+  "hold_paths": [
+    "^migrations/",
+    "^migrations-queues/",
+    "^wrangler\\.jsonc?$"
+  ]
+}
