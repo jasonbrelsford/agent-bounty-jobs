@@ -7,6 +7,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const MIGRATIONS = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+export const QUEUE_MIGRATIONS = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations-queues");
 
 const norm = (args) => args.map((v) => (v === undefined ? null : typeof v === "boolean" ? (v ? 1 : 0) : v));
 const plain = (r) => (r ? { ...r } : r);
@@ -25,10 +26,10 @@ class Stmt {
   }
 }
 
-export function makeD1() {
+export function makeD1(dir = MIGRATIONS) {
   const raw = new DatabaseSync(":memory:");
-  for (const f of readdirSync(MIGRATIONS).filter((f) => f.endsWith(".sql")).sort())
-    raw.exec(readFileSync(join(MIGRATIONS, f), "utf8"));
+  for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort())
+    raw.exec(readFileSync(join(dir, f), "utf8"));
   const db = {
     raw,
     prepare: (sql) => new Stmt(raw, sql),
