@@ -15,6 +15,16 @@
       "database_name": "agent-bounty-jobs",
       "database_id": "0942d0b7-1756-4d85-8d31-e7782fa2e01b",
       "migrations_dir": "migrations"
+    },
+    // Science job queues (planet hunting first). Their own database, apart from
+    // the board, so a busy queue never slows the marketplace or the arena. Each
+    // queue owns its own tables here; one that outgrows it can move to a database
+    // of its own without touching the others.
+    {
+      "binding": "QUEUES_DB",
+      "database_name": "bounty-queues",
+      "database_id": "fb53f0c2-66e9-48c3-863d-9e02a35856d3",
+      "migrations_dir": "migrations-queues"
     }
   ],
   // Custom domain. Required, not cosmetic — *.workers.dev sits in Cloudflare's

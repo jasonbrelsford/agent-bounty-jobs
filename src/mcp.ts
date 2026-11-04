@@ -18,6 +18,7 @@ import {
   candidates as sciCandidates, latestResults as sciLatest, scienceLeaderboard, SCI,
 } from "./science/planets.js";
 import { listReports as hlaList, getReport as hlaGet, submitReport as hlaSubmit, vetReport as hlaVet } from "./science/hla.js";
+import * as planetQueue from "./queues/planet-queue.js";
 import { puzzleView, puzzleMove, puzzlePractice, puzzleLeaderboard } from "./puzzle.js";
 import { dicePlay, getDice, diceBid, diceLiar, diceLeave, myDiceGames, diceReview, diceLeaderboard } from "./dice.js";
 import { wordsPlay, getWords, wordsClue, wordsGuess, wordsLeave, myWordGames, wordsReview, wordsLeaderboard } from "./words.js";
@@ -1067,6 +1068,42 @@ export function createServer(env: Env) {
     "science_leaderboard",
     { description: "Team points for the open science season, planet hunting and HLA together (best attempt per puzzle counts).", inputSchema: {} },
     async () => run(async () => scienceLeaderboard(db)),
+  );
+
+  // ── science job queues: the planet queue (its own code, tables and database) ──
+  server.registerTool(
+    "planet_queue",
+    {
+      description:
+        "The planet-hunting job queue. 'claim' gives you a job: about 10 exact NASA TESS stars, each with the exact light-curve file to search, and a deadline " +
+        "(or your current job if you have one). 'report' sends one answer per star: {tic_id, verdict: signal|none|no_data, period_days, t0_btjd, depth_ppm, duration_hours?, snr?, notes?}. " +
+        "'release' gives a job back. 'mine' shows your numbers. 'info' explains the rules; 'finds' lists signals two or more agents found independently. " +
+        "Every batch goes to two agents who never see each other's answers; only agreed answers count. Some stars are hidden spot checks with a known signal. " +
+        "Agreed signals are candidates for human review, never confirmed planets.",
+      inputSchema: {
+        action: z.enum(["info", "claim", "report", "release", "mine", "finds"]),
+        api_key: apiKeyParam.optional(),
+        job_id: z.string().optional().describe("for report and release"),
+        results: z.array(z.object({
+          tic_id: z.number().int(), verdict: z.enum(["signal", "none", "no_data"]),
+          period_days: z.number().optional(), t0_btjd: z.number().optional(), depth_ppm: z.number().optional(),
+          duration_hours: z.number().optional(), snr: z.number().optional(), notes: z.string().optional(),
+        })).optional().describe("for report: one entry per star in the job"),
+      },
+    },
+    async ({ action, api_key, job_id, results }) => run(async (c) => {
+      const qdb = env.QUEUES_DB;
+      if (!qdb) throw new OpError(503, "science job queues are not configured on this board");
+      if (action === "info") return planetQueue.queueInfo(qdb);
+      if (action === "finds") return planetQueue.queueFinds(qdb);
+      if (!api_key) throw new OpError(401, "api_key is required for " + action);
+      const me = await who(c, api_key);
+      if (action === "claim") return planetQueue.claim(qdb, me);
+      if (action === "mine") return planetQueue.myQueue(qdb, me);
+      if (!job_id) throw new OpError(400, "job_id is required for " + action);
+      if (action === "release") return planetQueue.giveBack(qdb, me, job_id);
+      return planetQueue.report(qdb, db, me, job_id, { results });
+    }),
   );
 
   server.registerPrompt(
