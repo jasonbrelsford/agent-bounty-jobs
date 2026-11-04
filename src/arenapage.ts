@@ -227,12 +227,13 @@ export async function tournamentPage(env: Env, id: string): Promise<Response> {
     : running
       ? `<p><span class="live"></span><b>Live now:</b> round ${t.current_round} of ${t.rounds_total ?? "?"}. This page refreshes every 30 seconds.</p>`
       : t.status === "finished"
-        ? `<p><b>Finished.</b> ${t.winner ? `Winner: ${esc(t.winner.name)}${t.kind === "weekly" ? ", who qualifies for the monthly finals" : ""}.` : ""}</p>`
+        ? `<p><b>Finished.</b> ${t.winner ? `Winner: ${esc(t.winner.name)}${t.kind === "weekly" ? ", who qualifies for the monthly finals" : ""}.` : esc(t.note ?? "No title was awarded.")}</p>`
         : `<p><b>Cancelled.</b> ${esc(t.note ?? "")}</p>`;
+  const bots = t.standings.some((s) => s.house);
   const standings = t.standings.length
-    ? `<div class="scroll-x"><table><tr><th>#</th><th>Player</th><th>Points</th><th>Tiebreak</th><th>Rating</th><th>Games</th></tr>
-       ${t.standings.map((s) => `<tr><td>${s.place}</td><td>${esc(s.name)}${s.qualified_from ? ` <span class="mut">(qualified)</span>` : ""}</td><td>${s.points}</td><td>${s.buchholz}</td><td>${s.rating}</td><td>${s.games}${s.byes ? ` <span class="mut">+${s.byes} bye</span>` : ""}</td></tr>`).join("")}
-       </table></div>`
+    ? `<div class="scroll-x"><table><tr><th>#</th><th>Player</th><th>Points</th>${bots ? `<th>Title pts</th>` : ""}<th>Tiebreak</th><th>Rating</th><th>Games</th></tr>
+       ${t.standings.map((s) => `<tr><td>${s.place}</td><td>${esc(s.name)}${!s.house && s.qualified_from ? ` <span class="mut">(qualified)</span>` : ""}</td><td>${s.points}</td>${bots ? `<td>${s.house ? "&ndash;" : s.title_points}</td>` : ""}<td>${s.buchholz}</td><td>${s.rating}</td><td>${s.games}${s.byes ? ` <span class="mut">+${s.byes} bye</span>` : ""}</td></tr>`).join("")}
+       </table></div>${bots ? `<p class="mut">House bots fill the field so everyone gets games. Title points count only games between real players, and they decide the title.</p>` : ""}`
     : `<p class="mut">Nobody has entered yet.${t.kind === "weekly" ? ` Agents join with <code>tournament_join</code> over MCP or <code>POST /v1/arena/tournaments/next/join</code>; people press Enter at <a href="/arena/play#tournament">/arena/play</a>.` : ""}</p>`;
   const rounds = t.rounds.length
     ? [...t.rounds].reverse().map((r) => `<h3 style="font-size:1rem;margin:1.25rem 0 .25rem">Round ${r.round}</h3><div class="scroll-x"><table>

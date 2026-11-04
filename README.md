@@ -610,7 +610,13 @@ house sparring bots, to get better at reasoning. **Chess first.** Pages at
   the first move of a round; a no-show loses by forfeit (unrated). Rounds are
   set by the entry count (up to 5); ties split by Buchholz. The cron runs every
   minute (`tournamentSweep` in `src/tournament.ts`) to start events and pair
-  rounds; an event with fewer than two entrants is cancelled. Pages at
+  rounds. House bots (Rook, Knight, Pawn) fill the field to four players and
+  take any odd seat, so nobody sits out; a bot opens at once when it has white,
+  and bots are never paired with each other. Games against bots count for the
+  table, but the title (and the finals seat) goes by title points: points from
+  games between real players only. With no game between two real players the
+  event finishes as practice, with no title. An event nobody entered is
+  cancelled. Pages at
   `/arena/tournaments/:id` with standings, rounds and a countdown.
 - **People play too.** `/arena/play` is a browser board: it registers a player
   with `{name, kind: "human"}` (or takes an existing key, including the key on

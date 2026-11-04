@@ -67,18 +67,20 @@ test("weekly lifecycle: join, start, rounds advance, forfeit, winner qualifies f
   const a = await agent(db, "alpha-agent");
   const b = await agent(db, "beta-agent");
   const c = await agent(db, "Casey", "human");
-  const byId = { [a.id]: a, [b.id]: b, [c.id]: c };
+  const d = await agent(db, "delta-agent");
+  const byId = { [a.id]: a, [b.id]: b, [c.id]: c, [d.id]: d };
   let t = await joinTournament(db, a);
   await joinTournament(db, b, "next");
   await joinTournament(db, c, t.id);
   await joinTournament(db, c, t.id); // twice is fine
+  await joinTournament(db, d, t.id);
   t = await tournamentView(db, t.id, c);
-  assert.equal(t.entrants, 3);
+  assert.equal(t.entrants, 4);
   assert.equal(t.you_are_in, true);
   assert.equal(t.kind, "weekly");
   // Leaving and rejoining before the start works.
   await leaveTournament(db, c, t.id);
-  assert.equal((await tournamentView(db, t.id)).entrants, 2);
+  assert.equal((await tournamentView(db, t.id)).entrants, 3);
   await joinTournament(db, c, t.id);
 
   // Nothing happens before the start time.
@@ -88,15 +90,13 @@ test("weekly lifecycle: join, start, rounds advance, forfeit, winner qualifies f
   await tournamentSweep(db, later(t.starts_at, 1));
   t = await tournamentView(db, t.id);
   assert.equal(t.status, "running");
+  assert.equal(t.entrants, 4, "an even field gets no house bot");
   assert.equal(t.rounds_total, 3);
   assert.equal(t.rounds.length, 1);
-  assert.equal(t.rounds[0].games.length, 1, "three players: one game and a bye");
+  assert.equal(t.rounds[0].games.length, 2);
   await rejects(joinTournament(db, await agent(db, "late-comer"), t.id), 409, /started/);
-  const sitting = t.standings.find((s) => s.byes === 1);
-  assert.ok(sitting, "someone has the bye");
-  assert.ok((await types(db, sitting.agent_id)).includes("tournament.bye"));
 
-  // Round 1: the first game is a no-show, so white forfeits (unrated).
+  // Round 1: the first game is a no-show, so white forfeits (unrated); the other ends by resignation.
   let g = await getGame(db, t.rounds[0].games[0].id);
   assert.equal(g.tournament.id, t.id);
   assert.equal(g.tournament.round, 1);
@@ -107,6 +107,8 @@ test("weekly lifecycle: join, start, rounds advance, forfeit, winner qualifies f
   assert.equal(g.termination, "forfeit");
   assert.equal(g.result, "0-1");
   assert.equal(g.rating_change.white, null, "a forfeit is not rated");
+  const g2 = await getGame(db, t.rounds[0].games[1].id);
+  await resign(db, byId[g2.white.id], g2.id);
 
   // Rounds 2 and 3: White resigns every game after one move each.
   for (let round = 2; round <= 3; round++) {
@@ -114,22 +116,23 @@ test("weekly lifecycle: join, start, rounds advance, forfeit, winner qualifies f
     t = await tournamentView(db, t.id);
     assert.equal(t.current_round, round);
     const games = t.rounds.find((r) => r.round === round).games;
-    assert.equal(games.length, 1);
-    const gv = await getGame(db, games[0].id);
-    await makeMove(db, byId[gv.white.id], gv.id, { move: "e4" });
-    await makeMove(db, byId[gv.black.id], gv.id, { move: "e5" });
-    await resign(db, byId[gv.white.id], gv.id);
+    assert.equal(games.length, 2);
+    for (const x of games) {
+      const gv = await getGame(db, x.id);
+      await makeMove(db, byId[gv.white.id], gv.id, { move: "e4" });
+      await makeMove(db, byId[gv.black.id], gv.id, { move: "e5" });
+      await resign(db, byId[gv.white.id], gv.id);
+    }
   }
-  // Nobody plays the same opponent twice in a three-player, three-round event.
+  // Four players, three rounds: everyone meets everyone once.
   const pairs = t.rounds.flatMap((r) => r.games.map((x) => [x.white, x.black].sort().join("|")));
-  assert.equal(new Set(pairs).size, 3);
+  assert.equal(new Set(pairs).size, 6);
 
   await tournamentSweep(db, later(t.starts_at, 40));
   t = await tournamentView(db, t.id);
   assert.equal(t.status, "finished");
   assert.ok(t.winner);
-  assert.equal(t.standings.reduce((s, x) => s + x.points, 0), 6, "three games plus a bye each round");
-  assert.deepEqual(t.standings.map((s) => s.byes), [1, 1, 1], "the bye rotates");
+  assert.equal(t.standings.reduce((s, x) => s + x.points, 0), 6, "six games, a point each");
   const winnerInbox = (await readInbox(db, t.winner.id)).events.find((e) => e.type === "tournament.finished");
   assert.equal(winnerInbox.data.place, 1);
   assert.match(winnerInbox.data.qualified_for.name, /Monthly Finals/);
@@ -148,8 +151,8 @@ test("weekly lifecycle: join, start, rounds advance, forfeit, winner qualifies f
   await tournamentSweep(db, later(finals.starts_at, 1));
   const fr = await tournamentView(db, finals.id);
   assert.equal(fr.status, "running");
-  assert.equal(fr.entrants, 3);
-  assert.equal(fr.standings.filter((s) => s.qualified_from === "top_up").length, 2);
+  assert.equal(fr.entrants, 4);
+  assert.equal(fr.standings.filter((s) => s.qualified_from === "top_up").length, 3);
 
   // Humans see their tournament game in their list, flagged as such.
   const mine = await myGames(db, c);
@@ -163,18 +166,124 @@ test("weekly lifecycle: join, start, rounds advance, forfeit, winner qualifies f
   assert.match(wp, /qualifies for the monthly finals/);
 });
 
-test("a weekly with fewer than two players is cancelled cleanly", async () => {
+test("a weekly nobody entered is cancelled cleanly", async () => {
   const db = makeD1();
   await ensureSchedule(db, new Date("2026-11-02T12:00:00Z"));
-  const solo = await agent(db, "lonely-agent");
-  const t = await joinTournament(db, solo);
+  const t = (await listTournaments(db)).next_weekly;
   await tournamentSweep(db, later(t.starts_at, 1));
   const v = await tournamentView(db, t.id);
   assert.equal(v.status, "cancelled");
-  assert.match(v.note, /Only one player/);
+  assert.match(v.note, /Nobody entered/);
+  assert.equal(v.entrants, 0, "the house bot never plays a field of its own");
   // The next week is already on the calendar.
   const l = await listTournaments(db);
   assert.ok(l.next_weekly);
+});
+
+const isBot = (id) => id.startsWith("house_");
+
+test("house seats: a lone entrant gets three bots and full games, but it's practice with no title", async () => {
+  const db = makeD1();
+  await ensureSchedule(db, new Date("2026-11-02T12:00:00Z"));
+  const solo = await agent(db, "lonely-agent");
+  let t = await joinTournament(db, solo);
+  assert.match(t.entry, /title is decided only by games between real players/);
+  await tournamentSweep(db, later(t.starts_at, 1));
+  t = await tournamentView(db, t.id);
+  assert.equal(t.status, "running");
+  assert.equal(t.entrants, 4, "filled to four");
+  assert.equal(t.rounds_total, 3);
+  assert.equal(t.standings.filter((s) => s.house).length, 3);
+  assert.ok(t.standings.filter((s) => s.house).every((s) => s.qualified_from === "house"));
+  assert.equal(t.rounds[0].games.length, 1, "bots don't play each other, so one game a round");
+  const first = await getGame(db, t.rounds[0].games[0].id, solo);
+  if (first.black?.id === solo.id) {
+    assert.equal(first.moves.length, 1, "the house bot opened at once");
+    assert.equal(first.your_turn, true);
+  } else {
+    const after = await makeMove(db, solo, first.id, { move: "e4" });
+    assert.equal(after.moves.length, 2, "the house bot answers in the same call");
+  }
+  const seen = new Set();
+  for (let round = 1; round <= 3; round++) {
+    if (round > 1) { await tournamentSweep(db, later(t.starts_at, 20 * round)); t = await tournamentView(db, t.id); }
+    assert.equal(t.current_round, round);
+    const g = t.rounds.find((r) => r.round === round).games;
+    assert.equal(g.length, 1);
+    const gv = await getGame(db, g[0].id);
+    seen.add(isBot(gv.white.id) ? gv.white.id : gv.black.id);
+    if (gv.status === "active") await resign(db, solo, gv.id); // lose to every bot
+  }
+  assert.equal(seen.size, 3, "the lone entrant meets each bot once");
+  assert.ok(!(await types(db, solo.id)).includes("tournament.bye"));
+  await tournamentSweep(db, later(t.starts_at, 100));
+  t = await tournamentView(db, t.id);
+  assert.equal(t.status, "finished");
+  assert.equal(t.winner, null, "no title without a game between two real players");
+  assert.match(t.note, /Practice event/);
+  const finals = await tournamentView(db, (await listTournaments(db)).next_finals.id);
+  assert.equal(finals.standings.length, 0, "and no finals seat");
+  const done = (await readInbox(db, solo.id)).events.find((e) => e.type === "tournament.finished");
+  assert.equal(done.payload?.place ?? done.place ?? null, null);
+  const page = await (await tournamentPage({ DB: db }, t.id)).text();
+  assert.match(page, /Practice event/);
+  assert.match(page, /Title pts/);
+});
+
+test("house seats: with two real players the title goes by their game, not by points against bots", async () => {
+  const db = makeD1();
+  await ensureSchedule(db, new Date("2026-11-02T12:00:00Z"));
+  const a = await agent(db, "beats-bots");
+  const b = await agent(db, "beats-a", "human");
+  let t;
+  for (const p of [a, b]) t = await joinTournament(db, p);
+  await tournamentSweep(db, later(t.starts_at, 1));
+  t = await tournamentView(db, t.id);
+  assert.equal(t.entrants, 4);
+  assert.equal(t.rounds_total, 3);
+  let met = 0;
+  for (let round = 1; round <= 3; round++) {
+    if (round > 1) { await tournamentSweep(db, later(t.starts_at, 20 * round)); t = await tournamentView(db, t.id); }
+    assert.equal(t.current_round, round);
+    for (const row of t.rounds.find((x) => x.round === round).games) {
+      const gv = await getGame(db, row.id);
+      assert.ok(!(isBot(gv.white.id) && isBot(gv.black.id)), "two house bots are never paired");
+      if (!isBot(gv.white.id) && !isBot(gv.black.id)) { met++; await resign(db, a, gv.id); continue; } // b beats a
+      if (gv.white.id === b.id || gv.black.id === b.id) { await resign(db, b, gv.id); continue; } // b loses to the bots
+      // a beats the bot (bots never resign, so settle it directly).
+      await db.prepare("UPDATE games SET status = 'finished', result = ?, termination = 'resign' WHERE id = ?")
+        .bind(gv.white.id === a.id ? "1-0" : "0-1", gv.id).run();
+    }
+  }
+  assert.equal(met, 1, "the two real players meet exactly once");
+  await tournamentSweep(db, later(t.starts_at, 100));
+  t = await tournamentView(db, t.id);
+  assert.equal(t.status, "finished");
+  const sa = t.standings.find((s) => s.agent_id === a.id);
+  const sb = t.standings.find((s) => s.agent_id === b.id);
+  assert.ok(sa.points > sb.points, "a scored more overall, all of it against bots");
+  assert.equal(sa.title_points, 0);
+  assert.equal(sb.title_points, 1);
+  assert.equal(t.winner.id, b.id, "b won the game that counts, so b takes the title");
+  const finals = await tournamentView(db, (await listTournaments(db)).next_finals.id);
+  assert.deepEqual(finals.standings.map((s) => s.agent_id), [b.id]);
+});
+
+test("house seats: an odd field of three gets one bot and no byes", async () => {
+  const db = makeD1();
+  await ensureSchedule(db, new Date("2026-11-02T12:00:00Z"));
+  const ps = [await agent(db, "odd-one"), await agent(db, "odd-two"), await agent(db, "Odd Three", "human")];
+  let t;
+  for (const p of ps) t = await joinTournament(db, p);
+  await tournamentSweep(db, later(t.starts_at, 1));
+  t = await tournamentView(db, t.id);
+  assert.equal(t.entrants, 4);
+  assert.equal(t.standings.filter((s) => s.house).length, 1);
+  assert.equal(t.rounds[0].games.length, 2);
+  assert.ok(t.standings.every((s) => s.byes === 0));
+  const houseGame = t.rounds[0].games.find((x) => /house bot/.test(x.white + x.black));
+  assert.ok(houseGame, "someone plays the house bot instead of sitting out");
+  for (const p of ps) assert.ok(!(await types(db, p.id)).includes("tournament.bye"));
 });
 
 test("pages: tournament countdown, escaping, the play client and live game polling", async () => {

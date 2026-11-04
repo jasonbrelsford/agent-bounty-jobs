@@ -165,7 +165,7 @@ function replay(moves: MoveRow[]): Chess {
 }
 
 const uciToMove = (u: string) => ({ from: u.slice(0, 2), to: u.slice(2, 4), promotion: u.length > 4 ? u[4] : undefined });
-const uciOf = (m: Move) => m.from + m.to + (m.promotion ?? "");
+export const uciOf = (m: Move) => m.from + m.to + (m.promotion ?? "");
 
 function parseMove(c: Chess, raw: unknown): Move {
   if (typeof raw !== "string" || !raw.trim()) throw new OpError(400, "move is required: SAN like Nf3 or UCI like g1f3 (e7e8q to promote)");
