@@ -28,6 +28,10 @@ export const PQ = {
   notes_max: 300,
   period: { min: 0.2, max: 14 },
   data_base: "https://stpubdata.s3.amazonaws.com/tess/public/tid",
+  // Auto-refill: keep at least this many open batches with room for an agent,
+  // topping up from pq_held in steps of up to refill_step.
+  refill_target: 100,
+  refill_step: 50,
 } as const;
 
 const T: LeaseTables = { batches: "pq_batches", leases: "pq_leases" };
@@ -149,7 +153,8 @@ export async function claim(qdb: D1Database, me: Agent) {
   if ((today?.n ?? 0) >= PQ.jobs_per_day) throw new OpError(429, `${PQ.jobs_per_day} planet jobs per agent per day`);
   const id = newId("pqj");
   const expires = new Date(Date.now() + PQ.lease_minutes * 60_000).toISOString();
-  const got = await takeSlot(qdb, T, me.id, id, now, expires);
+  let got = await takeSlot(qdb, T, me.id, id, now, expires);
+  if (!got && (await refill(qdb)).loaded > 0) got = await takeSlot(qdb, T, me.id, id, now, expires);
   if (!got) return { job_id: null, message: "No planet batches are waiting for you right now. Every open batch already has enough agents on it, or you have done it. Check back later." };
   const lease = (await qdb.prepare("SELECT * FROM pq_leases WHERE id = ?").bind(id).first<LeaseRow>())!;
   return jobView(qdb, lease);
@@ -332,6 +337,31 @@ export async function myQueue(qdb: D1Database, me: Agent) {
   };
 }
 
+/**
+ * Auto-refill. A round's later batches wait in pq_held and move into the live
+ * queue in seq order whenever fewer than refill_target open batches still have
+ * room for an agent, up to refill_step at a time. The cron runs this every five
+ * minutes, and a claim that finds nothing runs it once. Does nothing once
+ * pq_held is empty, so a round stops at the batches it was loaded with.
+ */
+export async function refill(qdb: D1Database, opts: { target?: number; step?: number } = {}) {
+  const target = opts.target ?? PQ.refill_target, step = opts.step ?? PQ.refill_step;
+  const room = (await qdb.prepare("SELECT COUNT(*) AS n FROM pq_batches WHERE status = 'open' AND taken < needed").first<{ n: number }>())?.n ?? 0;
+  const want = Math.min(step, target - room);
+  if (want <= 0) return { loaded: 0, open_with_room: room };
+  const ids = ((await qdb.prepare(
+    "SELECT h.id FROM pq_held h JOIN pq_rounds r ON r.id = h.round WHERE r.status = 'open' ORDER BY h.round, h.seq LIMIT ?",
+  ).bind(want).all<{ id: string }>()).results ?? []).map((r) => r.id);
+  if (!ids.length) return { loaded: 0, open_with_room: room };
+  const marks = ids.map(() => "?").join(", ");
+  await qdb.batch([
+    qdb.prepare(`INSERT OR IGNORE INTO pq_batches (id, round, sector, seq, stars_json, spot_tic)
+      SELECT id, round, sector, seq, stars_json, spot_tic FROM pq_held WHERE id IN (${marks})`).bind(...ids),
+    qdb.prepare(`DELETE FROM pq_held WHERE id IN (${marks})`).bind(...ids),
+  ]);
+  return { loaded: ids.length, open_with_room: room + ids.length };
+}
+
 export async function queueStats(qdb: D1Database) {
   const one = async (sql: string, ...args: unknown[]) => ((await qdb.prepare(sql).bind(...args).first<{ n: number }>())?.n ?? 0);
   const round = await qdb.prepare("SELECT id, sector FROM pq_rounds WHERE status = 'open' ORDER BY created_at DESC LIMIT 1").first<{ id: string; sector: number }>();
@@ -339,6 +369,7 @@ export async function queueStats(qdb: D1Database) {
     round: round ? { id: round.id, tess_sector: round.sector } : null,
     batches: await one("SELECT COUNT(*) AS n FROM pq_batches"),
     batches_done: await one("SELECT COUNT(*) AS n FROM pq_batches WHERE status = 'done'"),
+    batches_waiting_to_load: await one("SELECT COUNT(*) AS n FROM pq_held"),
     jobs_out_now: await one("SELECT COUNT(*) AS n FROM pq_leases WHERE status = 'leased' AND expires_at >= ?", nowIso()),
     stars_settled: await one("SELECT COUNT(*) AS n FROM pq_stars"),
     agreed_signals: await one("SELECT COUNT(*) AS n FROM pq_finds"),

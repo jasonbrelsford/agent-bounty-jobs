@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { makeD1, QUEUE_MIGRATIONS } from "./d1shim.mjs";
 import { registerAgent, authByKey } from "../.test-build/core.js";
 import {
-  agrees, consensus, spotPass, fileUrl, claim, report, giveBack, myQueue, queueInfo, queueFinds, reviewFind, unbench, PQ,
+  agrees, consensus, spotPass, fileUrl, claim, report, giveBack, myQueue, queueInfo, queueFinds, reviewFind, unbench, refill, PQ,
 } from "../.test-build/queues/planet-queue.js";
 
 const TEMPLATE = "tess2025099153000-s0091-{tic16}-0288-s_lc.fits";
@@ -199,4 +199,34 @@ test("an agent that keeps missing spot checks is benched and its open reports st
   assert.ok((await claim(q, good)).job_id);
   await unbench(q, bad.id);
   assert.equal((await claim(q, bad)).job_id, null, "reinstated, but never the same batch twice");
+});
+
+test("auto-refill tops the open pool up from held batches, in order, until they run out", async () => {
+  const { main, q } = setup(2);
+  for (let i = 3; i <= 9; i++)
+    q.raw.exec(`INSERT INTO pq_held (id, round, sector, seq, stars_json, spot_tic) VALUES ('pqb_q1_0000${i}', 'Q1', 91, ${i}, '[${i}1, ${i}2]', NULL)`);
+  const n = (sql) => q.raw.prepare(sql).get().n;
+  assert.deepEqual(await refill(q, { target: 2, step: 3 }), { loaded: 0, open_with_room: 2 }, "pool is full: nothing moves");
+  assert.equal((await refill(q, { target: 6, step: 3 })).loaded, 3, "a step at a time");
+  assert.deepEqual(q.raw.prepare("SELECT seq FROM pq_batches ORDER BY seq").all().map((r) => r.seq), [1, 2, 3, 4, 5]);
+  assert.equal(n("SELECT COUNT(*) AS n FROM pq_held"), 4);
+  assert.equal((await refill(q, { target: 6, step: 3 })).loaded, 1, "only up to the target");
+  assert.equal((await queueInfo(q)).stats.batches_waiting_to_load, 3);
+  assert.equal(n("SELECT COUNT(*) AS n FROM pq_batches WHERE spot_tic IS NOT NULL"), 1, "spot stars move with their batch and stay secret");
+  assert.ok(!JSON.stringify(await queueInfo(q)).includes(String(SPOT.tic)));
+
+  // A batch with both agents on it no longer counts as room.
+  q.raw.exec("UPDATE pq_batches SET taken = needed");
+  assert.equal((await refill(q, { target: 6, step: 10 })).loaded, 3, "held batches run out");
+  assert.equal((await refill(q, { target: 6, step: 10 })).loaded, 0);
+  assert.equal(n("SELECT COUNT(*) AS n FROM pq_batches"), 9);
+
+  // A claim that finds nothing loads more itself with the default settings.
+  const { q: q2, main: m2 } = setup(1);
+  q2.raw.exec("UPDATE pq_batches SET taken = needed");
+  q2.raw.exec(`INSERT INTO pq_held VALUES ('pqb_q1_00002', 'Q1', 91, 2, '[21, 22]', NULL)`);
+  const job = await claim(q2, await agent(m2, "late"));
+  assert.ok(job.job_id, "claim got the freshly loaded batch");
+  assert.deepEqual(job.stars.map((s) => s.tic_id), [21, 22]);
+  void main;
 });
