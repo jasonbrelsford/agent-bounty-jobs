@@ -99,7 +99,7 @@ export async function teamOf(db: D1Database, agentId: string): Promise<TeamRow |
   ).bind(agentId).first<TeamRow>()) ?? null;
 }
 
-async function members(db: D1Database, teamId: string): Promise<MemberRow[]> {
+export async function members(db: D1Database, teamId: string): Promise<MemberRow[]> {
   const r = await db.prepare(
     `SELECT m.agent_id, m.role, a.name FROM sci_team_members m JOIN agents a ON a.id = m.agent_id WHERE m.team_id = ? ORDER BY m.joined_at`,
   ).bind(teamId).all<MemberRow>();

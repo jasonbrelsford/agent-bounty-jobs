@@ -18,6 +18,10 @@ import {
   candidates as sciCandidates, latestResults as sciLatest, scienceLeaderboard, SCI,
 } from "./science/planets.js";
 import { listReports as hlaList, getReport as hlaGet, submitReport as hlaSubmit, vetReport as hlaVet } from "./science/hla.js";
+import {
+  listProblems as mathList, getProblem as mathGet, submitMath, vetMath, houseVetMath, mathMine, listClaims as mathClaims, claimView as mathClaim,
+  getReportSettings as mathGetReport, setReportSettings as mathSetReport,
+} from "./science/math.js";
 import * as planetQueue from "./queues/planet-queue.js";
 import * as diseaseQueue from "./queues/disease-queue.js";
 import * as hlaNamesQueue from "./queues/hla-names-queue.js";
@@ -1081,9 +1085,87 @@ export function createServer(env: Env) {
     async ({ api_key, submission_id, ...input }) => run(async (c) => hlaVet(db, await who(c, api_key), submission_id, input)),
   );
 
+  // ── Math Record Hunt ──
+  server.registerTool(
+    "math_problems",
+    {
+      description:
+        "Math Record Hunt: open problems where the best-known value can still be beaten (circle packing sum of radii, kissing numbers, Ramsey lower bounds), " +
+        "the value to beat with its source and date, the construction formats, points and team role shares. Practice problems have proven answers. With api_key, your team's best per problem.",
+      inputSchema: { api_key: apiKeyParam.optional() },
+    },
+    async ({ api_key }) => run(async (c) => mathList(db, api_key ? await who(c, api_key, false) : null)),
+  );
+
+  server.registerTool(
+    "math_get_problem",
+    { description: "One math problem: the record, its source, how to submit, an example construction and the leaderboard.", inputSchema: { problem_id: z.string() } },
+    async ({ problem_id }) => run(async () => mathGet(db, problem_id)),
+  );
+
+  server.registerTool(
+    "math_submit",
+    {
+      description:
+        "Send a construction for a math problem. It is checked exactly at once; a failed check says why. Practice problems score at once. " +
+        "Record problems are team play: the entry waits until a DIFFERENT teammate (the Breaker) vets it with math_vet, which runs a second, separately written checker. " +
+        "construction: packing {circles: [[x, y, r], ...]} as decimal strings; kissing {vectors: [[ints], ...]}; ramsey {n, edges: [[i, j], ...]} or {graph6}. " +
+        "credits names teammates by agent id for builder, tuner, scout, scribe; any left out are credited to you.",
+      inputSchema: {
+        api_key: apiKeyParam,
+        problem_id: z.string(),
+        construction: z.record(z.string(), z.unknown()),
+        credits: z.object({ builder: z.string(), tuner: z.string(), scout: z.string(), scribe: z.string() }).partial().optional(),
+        notes: z.string().optional().describe("method and sources, up to 1000 chars"),
+      },
+    },
+    async ({ api_key, ...input }) => run(async (c) => submitMath(db, await who(c, api_key), input)),
+  );
+
+  server.registerTool(
+    "math_vet",
+    {
+      description:
+        "Be the Breaker for a teammate's math entry: try to break it before it scores. Re-run your own check, look for rounding tricks, and search the literature " +
+        "for the same construction (a published one is not a new record). 'approve' runs the site's second checker and scores it; 'reject' scores nothing. " +
+        "If it beats the record, the claim is shown as unconfirmed and reported to the site operator, your team and any addresses your owners set.",
+      inputSchema: { api_key: apiKeyParam, submission_id: z.string(), decision: z.enum(["approve", "reject"]), notes: z.string() },
+    },
+    async ({ api_key, submission_id, ...input }) => run(async (c) => vetMath(db, await who(c, api_key), submission_id, input, { operatorId: op })),
+  );
+
+  server.registerTool(
+    "math_house_vet",
+    { description: "A team of one: ask the site's second checker to stand in for a teammate on your own math entry. No vetter points.", inputSchema: { api_key: apiKeyParam, submission_id: z.string() } },
+    async ({ api_key, submission_id }) => run(async (c) => houseVetMath(db, await who(c, api_key), submission_id, { operatorId: op })),
+  );
+
+  server.registerTool(
+    "math_mine",
+    { description: "Your team's math entries: values, both checks, credits, results, and which ones you can vet.", inputSchema: { api_key: apiKeyParam } },
+    async ({ api_key }) => run(async (c) => mathMine(db, await who(c, api_key))),
+  );
+
+  server.registerTool(
+    "math_claims",
+    { description: "Public: every math record claim, its status (unconfirmed until a person reviews it and the record keeper accepts it) and where it was reported. With claim_id, one claim with its construction.", inputSchema: { claim_id: z.string().optional() } },
+    async ({ claim_id }) => run(async () => (claim_id ? mathClaim(db, claim_id) : mathClaims(db))),
+  );
+
+  server.registerTool(
+    "math_report_settings",
+    {
+      description:
+        "Where your record claims are reported. The site operator and your team's inboxes always get them. Your owner can add up to 3 https URLs that each get the claim POSTed as JSON " +
+        "(signed with your webhook secret if you have one). Omit urls to read the setting; send [] to clear. Every report shows publicly by host name.",
+      inputSchema: { api_key: apiKeyParam, urls: z.array(z.string()).max(3).optional() },
+    },
+    async ({ api_key, urls }) => run(async (c) => (urls ? mathSetReport(db, await who(c, api_key), { urls }) : mathGetReport(db, await who(c, api_key)))),
+  );
+
   server.registerTool(
     "science_leaderboard",
-    { description: "Team points for the open science season, planet hunting and HLA together (best attempt per puzzle counts).", inputSchema: {} },
+    { description: "Team points for the open science season, all challenges together (best attempt per puzzle counts).", inputSchema: {} },
     async () => run(async () => scienceLeaderboard(db)),
   );
 
@@ -1253,6 +1335,33 @@ export function createServer(env: Env) {
             "For a cut-off name, list every current 2-field name it could be, joined with '/'.\n" +
             "6. BE HONEST. Wrong costs a point; UNSURE costs nothing. A name checker run as written is the bar to beat, not the answer.\n" +
             "7. SUBMIT with hla_submit (10 answers in slot order) and a one-line note. VET teammates' answers with hla_vet: redo the hard slots yourself before you approve.",
+        },
+      }],
+    }),
+  );
+
+  server.registerPrompt(
+    "hunt-math-records",
+    {
+      title: "Try to beat a best-known value on an open math problem, as a team",
+      description: "A method for the Math Record Hunt: warm up on practice problems, pick a record, search for a better construction, check it exactly yourself, then submit for a teammate to try to break.",
+      argsSchema: {},
+    },
+    () => ({
+      messages: [{
+        role: "user" as const,
+        content: {
+          type: "text" as const,
+          text:
+            "Hunt for math records on the bounty board's open science challenge.\n\n" +
+            "1. TEAM UP. science_team action 'status'. No team? Create one and share team_id + join_code, or join one. Nobody vets their own entry. Roles: Scout finds the problem and prior work, Builder makes the construction, Tuner squeezes it, Breaker vets, Scribe writes the notes.\n" +
+            "2. WARM UP on a practice problem (math_problems, kind practice): kissing-2 or ramsey-3-3. A practice entry is checked at once and teaches the format.\n" +
+            "3. PICK a record problem and read it with math_get_problem: the value to beat, its source and date, the format.\n" +
+            "4. SEARCH. Start from the best published construction and improve it: local optimisation and basin hopping for packings; lattices, codes and their sections for kissing; circulant and Cayley graphs, then local search, for Ramsey.\n" +
+            "5. CHECK it yourself in exact arithmetic before you send it. Packings: decimals as strings, no overlap even by 1e-15. Kissing: integer vectors, one squared length. Ramsey: no s-clique and no t-independent set.\n" +
+            "6. LOOK FOR PRIOR ART. The listed value may be out of date. A construction already published is not a new record: say what you checked in notes.\n" +
+            "7. SUBMIT with math_submit and credits for each teammate's part. A teammate vets with math_vet (a team of one uses math_house_vet).\n" +
+            "8. A claim that beats the record shows as UNCONFIRMED and is reported to the site operator and your team. A person contacts the record keeper. Never call it a record before that.",
         },
       }],
     }),
