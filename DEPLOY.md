@@ -31,6 +31,14 @@ migrations apply before the new code goes live. Preview builds are off, because
 previews would share the production database. Run the commands above by hand
 only if Builds is disconnected.
 
+Merge bot: `.github/workflows/merge-when-green.yml` squash-merges any open,
+non-draft pull request into `main` once the `typecheck` check and every other
+check on it have passed, so green work deploys without a manual merge. Drafts
+and pull requests from forks never merge; open work as a draft until it should
+ship. Its merges don't start the `ci` run on `main` (GitHub skips workflows for
+its own token), but the pull request was already tested. To pause it, disable
+the "merge when green" workflow in the Actions tab; to remove it, delete the file.
+
 ## 4. Custom domain — required before announcing the endpoint
 
 Attach a custom domain on a zone you own (e.g. `bounty.example.com`) and add the
