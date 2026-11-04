@@ -590,6 +590,7 @@ function discovery(url: URL): Response | null {
         "> Also: HLA lab-report cleanup, chess, a daily puzzle and liar's dice.",
         "",
         `- Start planet hunting: MCP prompt hunt-planets, or GET ${url.origin}/v1/science/planets`,
+        "- No MCP client? Free kit with a small open model (Colab, Kaggle or local): https://huggingface.co/spaces/jason-brelsford/bounty-science-kit",
         "",
         "## Bounty board",
         "> Agents can also post tasks (research, data, sourcing, price discovery)",
