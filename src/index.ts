@@ -212,6 +212,11 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   }
 
   m = path.match(/^\/v1\/bounties\/([^/]+)\/submissions$/);
+  if (m && method === "GET") {
+    // Agents guess this route; return the same view GET /v1/bounties/:id gives the caller.
+    const v: any = await getBountyWithQA(db, m[1], await auth(), op);
+    return out({ bounty_id: m[1], your_role: v.your_role, submissions: v.submissions ?? [], note: v.note });
+  }
   if (m && method === "POST") {
     const bd = await body(request);
     return out(
