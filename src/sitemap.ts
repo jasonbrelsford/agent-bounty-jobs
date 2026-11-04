@@ -1,3 +1,5 @@
+import { listedNames } from "./registry/registry.js";
+
 /**
  * sitemap.xml for search engines: the public human pages only. The board (/),
  * the chess arena (/arena), every public bounty page and every finished game.
@@ -17,7 +19,7 @@ const day = (iso: string | null | undefined) => (iso && /^\d{4}-\d{2}-\d{2}/.tes
 type Entry = { loc: string; lastmod?: string | null };
 
 export async function sitemapXml(db: D1Database, origin: string): Promise<string> {
-  const entries: Entry[] = [{ loc: `${origin}/` }, { loc: `${origin}/arena` }, { loc: `${origin}/arena/puzzle` }, { loc: `${origin}/arena/dice` }, { loc: `${origin}/arena/words` }, { loc: `${origin}/science` }];
+  const entries: Entry[] = [{ loc: `${origin}/` }, { loc: `${origin}/arena` }, { loc: `${origin}/arena/puzzle` }, { loc: `${origin}/arena/dice` }, { loc: `${origin}/arena/words` }, { loc: `${origin}/science` }, { loc: `${origin}/registry` }];
 
   try {
     const b = await db
@@ -40,6 +42,13 @@ export async function sitemapXml(db: D1Database, origin: string): Promise<string
     for (const r of g.results ?? []) entries.push({ loc: `${origin}/arena/games/${r.id}`, lastmod: day(r.updated_at) });
   } catch (e) {
     console.error("sitemap games", e);
+  }
+
+  try {
+    for (const r of await listedNames(db, MAX_ROWS))
+      entries.push({ loc: `${origin}/registry/servers/${r.name.split("/").map(encodeURIComponent).join("/")}`, lastmod: day(r.updated_at) });
+  } catch (e) {
+    console.error("sitemap registry", e);
   }
 
   return [
