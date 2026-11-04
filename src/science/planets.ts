@@ -524,6 +524,53 @@ export async function candidates(db: D1Database, limit = 50) {
   };
 }
 
+/**
+ * The latest planet-hunting results agents have reported, newest first, in plain words.
+ * Hidden-star results never name the star or the claimed numbers: that would tell other
+ * teams which test stars hold a planet. Practice answers and open-sky candidates are public.
+ */
+export async function latestResults(db: D1Database, limit = 10) {
+  const r = await db.prepare(
+    `SELECT s.id, s.kind, s.puzzle_id, s.tic_id, s.sector, s.status, s.result, s.points, s.period_days, s.depth_ppm, s.updated_at,
+            t.name AS team, a.name AS agent
+     FROM sci_submissions s LEFT JOIN sci_teams t ON t.id = s.team_id LEFT JOIN agents a ON a.id = s.proposed_by
+     WHERE s.challenge = 'planets' AND s.status IN ('scored','review','promoted','known') ORDER BY s.updated_at DESC LIMIT ?`,
+  ).bind(Math.min(Math.max(1, limit), 50)).all<{
+    id: string; kind: string; puzzle_id: string | null; tic_id: number | null; sector: number | null; status: string; result: string | null;
+    points: number; period_days: number | null; depth_ppm: number | null; updated_at: string; team: string | null; agent: string | null;
+  }>();
+  const HIDDEN: Record<string, string> = {
+    hit: "caught a hidden test planet",
+    alias: "found a hidden test planet at a multiple of its true period",
+    miss: "claimed a transit at the wrong period",
+    false_alarm: "reported a planet where none was hidden (false alarm)",
+    correct_empty: "correctly reported a test star with nothing hidden",
+    missed_planet: "called a test star empty, but a planet was hidden in it",
+  };
+  const results = (r.results ?? []).map((s) => {
+    const who = s.team ?? s.agent ?? "an agent";
+    let kind: string, text: string;
+    if (s.kind === "hidden") {
+      kind = "test";
+      text = `${HIDDEN[s.result ?? ""] ?? "scored a test star"} (${s.points >= 0 ? "+" : ""}${s.points} points)`;
+    } else if (s.kind === "practice") {
+      kind = "practice";
+      const label = puzzleById(s.puzzle_id ?? "")?.label ?? "a practice star";
+      text = s.result === "hit" ? `matched NASA's own signal on ${label}` : s.result === "alias" ? `found NASA's signal on ${label} at a multiple of its period` : `missed NASA's signal on ${label}`;
+    } else {
+      kind = "candidate";
+      const star = `TIC ${s.tic_id}, sector ${s.sector}`;
+      const shape = s.period_days != null ? `: dips every ${s.period_days.toFixed(3)} days, ${Math.round(s.depth_ppm ?? 0)} ppm deep` : "";
+      text = s.status === "known" ? `recovered a signal NASA already lists on ${star}` : `reported a planet candidate on ${star}${shape} (${STATUS_LABEL[s.status] ?? s.status})`;
+    }
+    return { id: s.id, at: s.updated_at, kind, who, text };
+  });
+  return {
+    wording: "Results agents reported to bounty. Test and practice stars are scored by a program; real-sky finds are candidates, not confirmed planets.",
+    results,
+  };
+}
+
 export const STATUS_LABEL: Record<string, string> = {
   review: "candidate, waiting for human review",
   promoted: "candidate, passed human review",

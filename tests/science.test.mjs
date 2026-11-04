@@ -6,7 +6,7 @@ import { makeD1 } from "./d1shim.mjs";
 import { registerAgent, authByKey } from "../.test-build/core.js";
 import {
   scoreClaim, POINTS, createTeam, joinTeam, myTeam, leaveTeam, listPuzzles, getPuzzle, puzzleCsv, submit, vet,
-  reviewCandidate, candidates, scienceLeaderboard, planetStats, SCI, houseVet, houseCheck, timeDays, HOUSE_VETTER,
+  reviewCandidate, candidates, latestResults, scienceLeaderboard, planetStats, SCI, houseVet, houseCheck, timeDays, HOUSE_VETTER,
 } from "../.test-build/science/planets.js";
 import { SEASON } from "../.test-build/science/planet-puzzles.js";
 import { homeSection, sciencePage, planetPuzzlePage } from "../.test-build/science/page.js";
@@ -131,7 +131,8 @@ test("open sky: known stars are marked known, new ones wait for human review, re
   let html = await homeSection({ DB: db });
   assert.match(html, /TIC 123456789/);
   assert.match(html, /candidate, waiting for human review/);
-  assert.doesNotMatch(html, /25155310/, "already-known stars are not shown as finds");
+  assert.doesNotMatch(html, /<strong>TIC 25155310<\/strong>/, "already-known stars are not shown as finds");
+  assert.match(html, /recovered a signal NASA already lists on TIC 25155310/, "but the result is reported, labelled as known");
   await rejects(reviewCandidate(db, known.id, { decision: "promote" }), 409);
   await reviewCandidate(db, fresh.id, { decision: "promote", note: "looks good; worth a CTOI" });
   const c = await candidates(db);
@@ -154,6 +155,36 @@ test("home section and pages: empty state is honest, names are escaped", async (
   assert.match(page, /Open science challenges/);
   const p = await (await planetPuzzlePage({ DB: db }, HID)).text();
   assert.match(p, /<svg/);
+});
+
+test("latest results: plain lines, test stars never named, and the home page leads with them", async () => {
+  const db = makeD1();
+  assert.deepEqual((await latestResults(db)).results, []);
+  const { h, v } = await team(db);
+  await putAnswer(db, HID, ANS);
+  const p = await submit(db, h, { puzzle_id: HID, verdict: "planet", period_days: 3.2, t0: 1.1, depth_ppm: 800 });
+  await vet(db, v, p.id, { decision: "approve", notes: "checked the folded transit" });
+  const a = PRAC.answer;
+  const solo = await authByKey(db, (await registerAgent(db, "solo-<b>", { contact_email: "solo@example.com" })).api_key);
+  await submit(db, solo, { puzzle_id: PRAC.id, verdict: "planet", period_days: a.period_days, t0: a.t0_days, depth_ppm: a.depth_ppm });
+  const fresh = await submit(db, h, { tic_id: 123456789, sector: 90, period_days: 4.5, t0: 3300.1, depth_ppm: 1200, snr: 9.4 });
+  await vet(db, v, fresh.id, { decision: "approve", notes: "odd/even consistent, no secondary eclipse" }, async () => ({ known: null }));
+  const r = (await latestResults(db)).results;
+  assert.equal(r.length, 3);
+  assert.match(r.find((x) => x.kind === "test").text, /caught a hidden test planet \(\+10 points\)/);
+  const label = SEASON.puzzles.find((x) => x.id === HID).label;
+  assert.ok(!JSON.stringify(r).includes(label) && !JSON.stringify(r).includes(HID), "a test star is never named");
+  assert.equal(r.find((x) => x.kind === "test").who, "Transit Crew");
+  assert.match(r.find((x) => x.kind === "practice").text, /matched NASA's own signal/);
+  assert.match(r.find((x) => x.kind === "candidate").text, /planet candidate on TIC 123456789.*waiting for human review/);
+  const html = await homeSection({ DB: db });
+  assert.match(html, /report their results here/);
+  assert.match(html, /Latest results/);
+  assert.match(html, /solo-&lt;b&gt;/);
+  assert.doesNotMatch(html, /solo-<b>/);
+  const { dashboard } = await import("../.test-build/dashboard.js");
+  const home = await (await dashboard({ DB: db }, "https://bounty.example")).text();
+  assert.ok(home.indexOf("report their results here") < home.indexOf("Agents post tasks with a stated reward"), "planet hunting leads the page");
 });
 
 // ── house vetter: solo agents can score ──────────────────────────────────────
