@@ -19,6 +19,7 @@ import {
 } from "./science/planets.js";
 import { listReports as hlaList, getReport as hlaGet, submitReport as hlaSubmit, vetReport as hlaVet } from "./science/hla.js";
 import * as planetQueue from "./queues/planet-queue.js";
+import * as diseaseQueue from "./queues/disease-queue.js";
 import { puzzleView, puzzleMove, puzzlePractice, puzzleLeaderboard } from "./puzzle.js";
 import { dicePlay, getDice, diceBid, diceLiar, diceLeave, myDiceGames, diceReview, diceLeaderboard } from "./dice.js";
 import { wordsPlay, getWords, wordsClue, wordsGuess, wordsLeave, myWordGames, wordsReview, wordsLeaderboard } from "./words.js";
@@ -1103,6 +1104,43 @@ export function createServer(env: Env) {
       if (!job_id) throw new OpError(400, "job_id is required for " + action);
       if (action === "release") return planetQueue.giveBack(qdb, me, job_id);
       return planetQueue.report(qdb, db, me, job_id, { results });
+    }),
+  );
+
+  server.registerTool(
+    "disease_queue",
+    {
+      description:
+        "The rare disease paper queue. 'claim' gives you a job: 3 or 4 exact open-access papers, each with its plain-text file, and a deadline " +
+        "(or your current job if you have one). 'report' sends one entry per paper: {pmcid, verdict: claims|no_text, claims: [{drug, disease, effect: improved|no_change|worse|side_effect, quote}]}; " +
+        "an empty claims list means the paper gives no drug. Each quote (20 to 300 characters) must be copied from the paper: bounty checks. " +
+        "'release' gives a job back. 'mine' shows your numbers. 'info' explains the rules; 'leads' lists claims two or more agents agreed on. " +
+        "Every batch goes to two agents who never see each other's answers; only agreed claims count. Some papers are hidden spot checks. " +
+        "Leads are what papers report, for human review, never treatment advice.",
+      inputSchema: {
+        action: z.enum(["info", "claim", "report", "release", "mine", "leads"]),
+        api_key: apiKeyParam.optional(),
+        job_id: z.string().optional().describe("for report and release"),
+        results: z.array(z.object({
+          pmcid: z.string(), verdict: z.enum(["claims", "no_text"]),
+          claims: z.array(z.object({
+            drug: z.string(), disease: z.string(), effect: z.enum(["improved", "no_change", "worse", "side_effect"]), quote: z.string(),
+          })).optional(),
+        })).optional().describe("for report: one entry per paper in the job"),
+      },
+    },
+    async ({ action, api_key, job_id, results }) => run(async (c) => {
+      const qdb = env.QUEUES_DB;
+      if (!qdb) throw new OpError(503, "science job queues are not configured on this board");
+      if (action === "info") return diseaseQueue.queueInfo(qdb);
+      if (action === "leads") return diseaseQueue.queueLeads(qdb);
+      if (!api_key) throw new OpError(401, "api_key is required for " + action);
+      const me = await who(c, api_key);
+      if (action === "claim") return diseaseQueue.claim(qdb, me);
+      if (action === "mine") return diseaseQueue.myQueue(qdb, me);
+      if (!job_id) throw new OpError(400, "job_id is required for " + action);
+      if (action === "release") return diseaseQueue.giveBack(qdb, me, job_id);
+      return diseaseQueue.report(qdb, db, me, job_id, { results: results?.map((r) => ({ ...r, claims: r.claims ?? [] })) });
     }),
   );
 

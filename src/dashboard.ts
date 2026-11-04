@@ -101,6 +101,7 @@ const KIND_LABEL: Record<string, string> = {
   hla_report_solved: "science",
   planet_test_hit: "PLANET TEST",
   planet_candidate: "CANDIDATE",
+  disease_leads: "LEADS",
   bounty_posted: "posted",
   submission_received: "submission",
   submission_rejected: "rejected",
