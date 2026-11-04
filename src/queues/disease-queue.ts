@@ -286,7 +286,8 @@ export async function report(qdb: D1Database, mainDb: D1Database, me: Agent, job
   if (l.status === "done") throw new OpError(409, "already reported");
   if (l.status === "released") throw new OpError(409, "you gave this job back");
   const late = l.status === "expired" || l.expires_at < now;
-  if (late && (b.status !== "open" || b.taken >= b.needed)) throw new OpError(409, "the deadline passed and the batch went to another agent. Claim a new job.");
+  const othersHold = b.taken - (l.status === "leased" && l.counted ? 1 : 0);
+  if (late && (b.status !== "open" || othersHold >= b.needed)) throw new OpError(409, "the deadline passed and the batch went to another agent. Claim a new job.");
   const papers = await batchPapers(qdb, b);
   const ids = papers.map((p) => p.pmcid);
   const answers = parseResults(input.results, ids);
