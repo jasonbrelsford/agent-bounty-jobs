@@ -6,7 +6,7 @@ import { makeD1 } from "./d1shim.mjs";
 import { registerAgent, authByKey } from "../.test-build/core.js";
 import {
   scoreClaim, POINTS, createTeam, joinTeam, myTeam, leaveTeam, listPuzzles, getPuzzle, puzzleCsv, submit, vet,
-  reviewCandidate, candidates, scienceLeaderboard, planetStats, SCI,
+  reviewCandidate, candidates, scienceLeaderboard, planetStats, SCI, houseVet, houseCheck, timeDays, HOUSE_VETTER,
 } from "../.test-build/science/planets.js";
 import { SEASON } from "../.test-build/science/planet-puzzles.js";
 import { homeSection, sciencePage, planetPuzzlePage } from "../.test-build/science/page.js";
@@ -154,4 +154,80 @@ test("home section and pages: empty state is honest, names are escaped", async (
   assert.match(page, /Open science challenges/);
   const p = await (await planetPuzzlePage({ DB: db }, HID)).text();
   assert.match(p, /<svg/);
+});
+
+// ── house vetter: solo agents can score ──────────────────────────────────────
+
+const inject = (p, P, t0, depth) => ({
+  ...p, flux_ppm: p.flux_ppm.map((v, i) => {
+    if (v == null) return v;
+    const ph = (((timeDays(p, i) - t0) % P) + P) % P;
+    return ph < 0.05 || ph > P - 0.05 ? v - depth : v;
+  }),
+});
+
+test("house vetter check: passes a clear dip, rejects a claim with no dip, uses the public light curve only", () => {
+  const p = SEASON.puzzles.find((x) => x.id === HID);
+  const ok = houseCheck(inject(p, 5.3, 1.3, 3000), { period_days: 5.3, t0: 1.3, duration_hours: 2.4 });
+  assert.equal(ok.decision, "approve", ok.notes);
+  assert.match(ok.notes, /odd .* and even .* ppm agree/);
+  const no = houseCheck(inject(p, 5.3, 1.3, 3000), { period_days: 2.5, t0: 0.7, duration_hours: 2.4 });
+  assert.equal(no.decision, "reject");
+  assert.match(no.notes, /signal-to-noise/);
+  const a = PRAC.answer;
+  assert.equal(houseCheck(PRAC, { period_days: a.period_days, t0: a.t0_days, duration_hours: a.duration_hours }).decision, "approve", "a real NASA signal passes");
+});
+
+test("house vetter check: flags unequal odd and even dips as an eclipsing binary", () => {
+  const p = SEASON.puzzles.find((x) => x.id === HID);
+  const P = 2.65, t0 = 1.3;
+  const eb = { ...p, flux_ppm: p.flux_ppm.map((v, i) => {
+    if (v == null) return v;
+    const t = timeDays(p, i), k = Math.round((t - t0) / P);
+    return Math.abs(t - t0 - k * P) < 0.05 ? v - (k % 2 ? 1000 : 5000) : v;
+  }) };
+  const r = houseCheck(eb, { period_days: P, t0, duration_hours: 2.4 });
+  assert.equal(r.decision, "reject");
+  assert.match(r.notes, /eclipsing binary/);
+});
+
+test("house vetter: a team of one scores; teams with a teammate and other agents cannot use it", async () => {
+  const db = makeD1();
+  await putAnswer(db, HID, ANS);
+  await putAnswer(db, HID2, { has_planet: 0 });
+  const solo = await agent(db, "solo-hunter");
+  const t = await createTeam(db, solo, { name: "Lone Star" });
+  assert.match(t.next, /house vetter/);
+  // A "none" claim is approved as submitted and scored against the key.
+  const n = await submit(db, solo, { puzzle_id: HID2, verdict: "none" });
+  assert.match(n.next, /house vetter/);
+  const nv = await houseVet(db, solo, n.id);
+  assert.equal(nv.status, "scored");
+  assert.equal(nv.result, "correct_empty");
+  assert.equal(nv.vetter_points, 0, "the house vetter earns nothing");
+  // A planet claim with no dip in the public data is rejected and uses no attempt.
+  const bad = await submit(db, solo, { puzzle_id: HID, verdict: "planet", period_days: 2.5, t0: 0.7, depth_ppm: 800 });
+  const bv = await houseVet(db, solo, bad.id);
+  assert.equal(bv.status, "rejected");
+  assert.equal(bv.vetted_by, HOUSE_VETTER);
+  // Only the proposer asks, only once.
+  await rejects(houseVet(db, solo, bad.id), 409);
+  const other = await agent(db, "other");
+  await rejects(houseVet(db, other, bad.id), 404);
+  // Leaderboard marks the team.
+  const lb = await scienceLeaderboard(db);
+  const row = lb.teams.find((x) => x.name === "Lone Star");
+  assert.equal(row.house_vetted, 1);
+  assert.match(await sciencePage({ DB: db }).then((r) => r.text()), /with the house vetter/);
+  // Open sky passes to the NASA check and human review.
+  const sky = await submit(db, solo, { tic_id: 123456789, sector: 90, period_days: 4.5, t0: 3300.1, depth_ppm: 1200, snr: 9.4 });
+  const sv = await houseVet(db, solo, sky.id, async () => ({ known: null }));
+  assert.equal(sv.status, "review");
+  // With a teammate on board, the house vetter steps aside.
+  const mate = await agent(db, "mate");
+  await joinTeam(db, mate, { team_id: t.team.id, join_code: t.team.join_code });
+  const p2 = await submit(db, solo, { puzzle_id: HID, verdict: "planet", period_days: 3.2, t0: 1.1, depth_ppm: 800 });
+  await rejects(houseVet(db, solo, p2.id), 409, /teammate/);
+  const asked = await submit(db, mate, { puzzle_id: HID2, verdict: "none" });
+  await rejects(houseVet(db, solo, asked.id), 403);
 });

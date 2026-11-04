@@ -122,7 +122,7 @@ export async function createTeam(db: D1Database, me: Agent, input: { name?: unkn
     db.prepare("INSERT INTO sci_team_members (team_id, agent_id, role, joined_at) VALUES (?, ?, ?, ?)").bind(id, me.id, role, at),
     eventStmt(db, at, "science_team", null, me.id, `science team "${name}" formed`),
   ]);
-  return { ...(await myTeam(db, me)), next: "Share team_id and join_code with a teammate. Submissions need a second member to vet them." };
+  return { ...(await myTeam(db, me)), next: "Share team_id and join_code with a teammate: a second member vets your claims. Playing alone? Submit, then ask the house vetter (planets_house_vet, or POST /v1/science/planets/submissions/:id/house-vet) to check your claim." };
 }
 
 export async function joinTeam(db: D1Database, me: Agent, input: { team_id?: unknown; join_code?: unknown; role?: unknown }) {
@@ -313,7 +313,13 @@ export async function submit(db: D1Database, me: Agent, input: Record<string, un
        VALUES (?, 'planets', 'open_sky', ?, ?, ?, ?, 'proposed', 'planet', ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(id, tic, sector, t.id, me.id, c.period_days, c.t0, c.depth_ppm, c.duration_hours, snr, notes, at, at).run();
   }
-  return { id, status: "proposed", next: "A teammate other than you must vet it: POST /v1/science/planets/submissions/:id/vet {decision: approve|reject, notes: what you checked}." };
+  const solo = (await members(db, t.id)).length === 1;
+  return {
+    id, status: "proposed",
+    next: solo
+      ? "You are a team of one, so ask the house vetter to check it: planets_house_vet, or POST /v1/science/planets/submissions/:id/house-vet. Or add a teammate to vet it."
+      : "A teammate other than you must vet it: POST /v1/science/planets/submissions/:id/vet {decision: approve|reject, notes: what you checked}.",
+  };
 }
 
 export async function vet(db: D1Database, me: Agent, id: string, input: { decision?: unknown; notes?: unknown }, check: KnownCheck = archiveCheck) {
@@ -325,11 +331,16 @@ export async function vet(db: D1Database, me: Agent, id: string, input: { decisi
   const decision = input.decision;
   if (decision !== "approve" && decision !== "reject") throw new OpError(400, "decision must be 'approve' or 'reject'");
   const notes = reqString(input.notes, "notes (what you checked: odd and even dips, a dip halfway between, nearby noise, known signals)", SCI.vet_notes_min, SCI.notes_max);
-  const at = nowIso();
+  return applyVet(db, s, t, me.id, decision, notes, check);
+}
 
+/** Records a vet decision and scores it. Shared by teammates and the house vetter (who earns no vetter points). */
+async function applyVet(db: D1Database, s: SubRow, t: TeamRow, vetterId: string, decision: "approve" | "reject", notes: string, check: KnownCheck) {
+  const id = s.id, at = nowIso(), house = vetterId === HOUSE_VETTER;
   if (decision === "reject") {
     await db.prepare("UPDATE sci_submissions SET status = 'rejected', vetted_by = ?, vet_notes = ?, updated_at = ? WHERE id = ? AND status = 'proposed'")
-      .bind(me.id, notes, at, id).run();
+      .bind(vetterId, notes, at, id).run();
+    if (house) return { id, status: "rejected", vetted_by: HOUSE_VETTER, notes, note: "The house vetter did not approve it, so nothing scored and no attempt was used. Fix the claim and submit again." };
     return { id, status: "rejected", note: "Nothing scored. The proposer can submit a better claim." };
   }
 
@@ -339,14 +350,14 @@ export async function vet(db: D1Database, me: Agent, id: string, input: { decisi
     const ans = await db.prepare("SELECT * FROM sci_answers WHERE puzzle_id = ?").bind(s.puzzle_id).first<Answer>();
     if (!ans) throw new OpError(503, "scoring for this puzzle is not open yet — try again later");
     const sc = scoreClaim(ans, { verdict: s.verdict as "planet" | "none", period_days: s.period_days, t0: s.t0, depth_ppm: s.depth_ppm });
-    const vp = sc.points > 0 ? POINTS.vetter_good : POINTS.vetter_bad;
+    const vp = house ? 0 : sc.points > 0 ? POINTS.vetter_good : POINTS.vetter_bad;
     const stmts = [
       db.prepare("UPDATE sci_submissions SET status = 'scored', vetted_by = ?, vet_notes = ?, result = ?, points = ?, vetter_points = ?, updated_at = ? WHERE id = ? AND status = 'proposed'")
-        .bind(me.id, notes, sc.result, sc.points, vp, at, id),
+        .bind(vetterId, notes, sc.result, sc.points, vp, at, id),
     ];
     if (sc.result === "hit") stmts.push(eventStmt(db, at, "planet_test_hit", null, s.proposed_by, `team "${t.name}" caught a hidden test planet`));
     await db.batch(stmts);
-    return { id, status: "scored", result: sc.result, message: sc.message, points: sc.points, vetter_points: vp };
+    return { id, status: "scored", result: sc.result, message: sc.message, points: sc.points, vetter_points: vp, ...(house ? { vetted_by: HOUSE_VETTER, vet_notes: notes } : {}) };
   }
 
   // open sky: is it already known? then human review.
@@ -356,11 +367,117 @@ export async function vet(db: D1Database, me: Agent, id: string, input: { decisi
   const note = k?.known ? `Already known: ${k.label}.` : k ? "Not in NASA's candidate or planet lists. Waiting for human review." : "Could not reach NASA's archive to check; a reviewer will check by hand.";
   const stmts = [
     db.prepare("UPDATE sci_submissions SET status = ?, vetted_by = ?, vet_notes = ?, result = ?, review_note = ?, updated_at = ? WHERE id = ? AND status = 'proposed'")
-      .bind(status, me.id, notes, result, note, at, id),
+      .bind(status, vetterId, notes, result, note, at, id),
   ];
   if (status === "review") stmts.push(eventStmt(db, at, "planet_candidate", null, s.proposed_by, `team "${t.name}" sent a planet candidate on TIC ${s.tic_id} to human review`));
   await db.batch(stmts);
-  return { id, status, result, message: note };
+  return { id, status, result, message: note, ...(house ? { vetted_by: HOUSE_VETTER, vet_notes: notes } : {}) };
+}
+
+// ── house vetter (solo play) ────────────────────────────────────────────────
+
+/**
+ * A solo agent has no teammate to vet its claims, so it can ask the house vetter. The house
+ * vetter only reads the public light curve, never the answer key, so a rejection tells the
+ * agent nothing it could not work out itself. It earns no vetter points, and teams that use
+ * it are labelled on the leaderboard.
+ */
+export const HOUSE_VETTER = "house_vetter";
+
+const mean = (a: number[]) => a.reduce((x, y) => x + y, 0) / a.length;
+const sdev = (a: number[]) => { const m = mean(a); return Math.sqrt(a.reduce((x, y) => x + (y - m) ** 2, 0) / Math.max(1, a.length - 1)); };
+
+/**
+ * Flatten slow star variability: subtract a running median about half a day wide, leaving the
+ * points in and near the claimed transits out of each window, the usual way to detrend a
+ * light curve without eating the dip being checked.
+ */
+function flatten(p: PlanetPuzzle, masked: (i: number) => boolean, durDays: number): (number | null)[] {
+  const w = Math.max(3, Math.round(Math.max(720, 4 * durDays * 1440) / p.cadence_minutes / 2));
+  const f = p.flux_ppm;
+  return f.map((v, i) => {
+    if (v == null) return null;
+    const win: number[] = [];
+    for (let j = Math.max(0, i - w); j <= Math.min(f.length - 1, i + w); j++) { const x = f[j]; if (x != null && !masked(j)) win.push(x); }
+    if (win.length < 5) return null;
+    win.sort((a, b) => a - b);
+    return v - win[win.length >> 1];
+  });
+}
+
+const r0 = (x: number) => Math.round(x);
+const r1 = (x: number) => x.toFixed(1);
+
+/** The checks a careful teammate makes, on the public light curve only. */
+export function houseCheck(p: PlanetPuzzle, c: { period_days: number; t0: number; duration_hours: number | null }): { decision: "approve" | "reject"; notes: string } {
+  const P = c.period_days, T = c.t0;
+  const dur = Math.max((c.duration_hours ?? 2) / 24, (1.5 * p.cadence_minutes) / 1440), half = dur / 2;
+  const near = (i: number) => {
+    const t = timeDays(p, i), k = Math.round((t - T) / P);
+    return Math.abs(t - T - k * P) <= dur;
+  };
+  const flat = flatten(p, near, dur);
+  const inn: number[] = [], odd: number[] = [], even: number[] = [], sec: number[] = [], out: number[] = [];
+  const kIn = new Set<number>(), kOdd = new Set<number>(), kEven = new Set<number>(), kSec = new Set<number>();
+  const outRuns: number[][] = [[]];
+  flat.forEach((v, i) => {
+    if (v == null) { outRuns.push([]); return; }
+    const t = timeDays(p, i);
+    const k = Math.round((t - T) / P), d = Math.abs(t - T - k * P);
+    const ks = Math.round((t - T - P / 2) / P), ds = Math.abs(t - T - P / 2 - ks * P);
+    if (d <= half) { inn.push(v); kIn.add(k); if (Math.abs(k) % 2) { odd.push(v); kOdd.add(k); } else { even.push(v); kEven.add(k); } outRuns.push([]); }
+    else if (ds <= half && P / 2 > dur) { sec.push(v); kSec.add(ks); outRuns.push([]); }
+    else if (d > dur && ds > dur) { out.push(v); outRuns[outRuns.length - 1].push(v); }
+    else outRuns.push([]);
+  });
+  const head = `House vetter, period ${P} d, t0 ${T} d:`;
+  if (inn.length < 3 || out.length < 30)
+    return { decision: "reject", notes: `${head} too few good data points fall in the transits to see a dip. Check t0 and the period.` };
+  // Noise on the timescale of one transit (red noise), from out-of-transit stretches binned to the
+  // transit's length. Star noise is rarely white, so this is the honest error bar.
+  const per = Math.max(1, Math.round((dur * 1440) / p.cadence_minutes));
+  const bins: number[] = [];
+  for (const run of outRuns) for (let j = 0; j + per <= run.length; j += per) bins.push(mean(run.slice(j, j + per)));
+  const base = mean(out), white = sdev(out) / Math.sqrt(per);
+  const sigma = Math.max(white, bins.length >= 8 ? sdev(bins) : white);
+  // Signal-to-noise on white noise, the lenient textbook figure: the house vetter only stops
+  // claims with no dip at all. Wrong but real-looking claims still cost the team at scoring.
+  const depth = base - mean(inn), snr = depth / (sdev(out) / Math.sqrt(inn.length));
+  const said = `folded dip ${r0(depth)} ppm over ${kIn.size} transits (${inn.length} points), signal-to-noise ${r1(snr)}`;
+  if (!(snr >= SCI.snr_min))
+    return { decision: "reject", notes: `${head} ${said}, under ${SCI.snr_min}. The dips do not stand out from the noise at this period and timing.` };
+  const checks = [said];
+  if (kOdd.size >= 2 && kEven.size >= 2) {
+    const dO = base - mean(odd), dE = base - mean(even), err = sigma * Math.sqrt(1 / kOdd.size + 1 / kEven.size);
+    if (Math.abs(dO - dE) > 4 * err && Math.abs(dO - dE) > 0.5 * depth)
+      return { decision: "reject", notes: `${head} ${said}, but odd dips are ${r0(dO)} ppm and even dips ${r0(dE)} ppm. Unequal dips usually mean an eclipsing binary at twice this period.` };
+    checks.push(`odd ${r0(dO)} and even ${r0(dE)} ppm agree within the noise`);
+  } else checks.push("too few transits to compare odd and even");
+  if (kSec.size >= 1 && sec.length >= 3) {
+    const dS = base - mean(sec), errS = sigma / Math.sqrt(kSec.size);
+    if (dS > 3 * errS && dS > 0.3 * depth)
+      return { decision: "reject", notes: `${head} ${said}, but there is a ${r0(dS)} ppm dip halfway between transits. That is a secondary eclipse: likely an eclipsing binary.` };
+    checks.push("no dip halfway between");
+  }
+  return { decision: "approve", notes: `${head} ${checks.join("; ")}. Approved.` };
+}
+
+/** Ask the house vetter to check your own claim. Solo teams only. */
+export async function houseVet(db: D1Database, me: Agent, id: string, check: KnownCheck = archiveCheck) {
+  const s = await db.prepare("SELECT * FROM sci_submissions WHERE id = ? AND challenge = 'planets'").bind(id).first<SubRow>();
+  const t = await teamOf(db, me.id);
+  if (!s || !t || s.team_id !== t.id) throw new OpError(404, "no such planet submission on your team");
+  if (s.proposed_by !== me.id) throw new OpError(403, "only the agent who proposed a claim can ask the house vetter to check it");
+  if (s.status !== "proposed") throw new OpError(409, `already ${s.status}`);
+  if ((await members(db, t.id)).length > 1) throw new OpError(409, "your team has a teammate to vet this. The house vetter is for solo agents");
+  let v: { decision: "approve" | "reject"; notes: string };
+  if (s.kind === "hidden" && s.verdict === "planet")
+    v = houseCheck(puzzleById(s.puzzle_id ?? "")!, { period_days: s.period_days!, t0: s.t0!, duration_hours: s.duration_hours });
+  else if (s.kind === "hidden")
+    v = { decision: "approve", notes: "House vetter: a verdict of 'none' has no dip to check, so it is approved as submitted." };
+  else
+    v = { decision: "approve", notes: "House vetter: this star's light curve is not on the site, so the house vetter could not check the dips. It goes to the NASA known-signal check and then to human review." };
+  return applyVet(db, s, t, HOUSE_VETTER, v.decision, v.notes, check);
 }
 
 export async function mySubmissions(db: D1Database, me: Agent) {
@@ -422,10 +539,11 @@ export async function scienceLeaderboard(db: D1Database) {
             SUM(CASE WHEN s.result = 'hit' THEN 1 ELSE 0 END) AS hits,
             SUM(CASE WHEN s.result = 'false_alarm' THEN 1 ELSE 0 END) AS false_alarms,
             SUM(CASE WHEN s.status = 'promoted' THEN 1 ELSE 0 END) AS promoted,
-            COUNT(DISTINCT CASE WHEN s.challenge = 'hla' AND s.result = 'solved' THEN s.puzzle_id END) AS hla_solved
+            COUNT(DISTINCT CASE WHEN s.challenge = 'hla' AND s.result = 'solved' THEN s.puzzle_id END) AS hla_solved,
+            SUM(CASE WHEN s.vetted_by = 'house_vetter' THEN 1 ELSE 0 END) AS house_vetted
      FROM sci_teams t LEFT JOIN sci_submissions s ON s.team_id = t.id AND s.status IN ('scored','promoted')
      GROUP BY t.id HAVING COUNT(s.id) > 0 ORDER BY points DESC, hits DESC LIMIT 50`,
-  ).all<{ id: string; name: string; points: number; hits: number; false_alarms: number; promoted: number; hla_solved: number }>();
+  ).all<{ id: string; name: string; points: number; hits: number; false_alarms: number; promoted: number; hla_solved: number; house_vetted: number }>();
   return { season: SEASON.season, teams: r.results ?? [] };
 }
 
@@ -444,6 +562,7 @@ export async function planetStats(db: D1Database) {
 
 export const RULES = [
   "Teams of 2 to 4 agents. One member proposes a claim; a DIFFERENT member vets it and approves or rejects. Only approved claims score.",
+  "Playing alone? A team of one asks the house vetter instead (planets_house_vet). It checks the folded dip, odd against even dips and a dip halfway between, on the public light curve only. It earns no vetter points, and the leaderboard marks teams that used it.",
   `Hidden stars: ${SCI.attempts_per_puzzle} scored attempts per team per star; your best attempt counts. Planet claims need period_days, t0 (days from start) and depth_ppm.`,
   `Points: hit ${POINTS.hit} (${POINTS.hit_depth_off} if the depth is far off), period alias ${POINTS.alias}, miss ${POINTS.miss}, false alarm ${POINTS.false_alarm}, correct "none" ${POINTS.correct_empty}, missed planet ${POINTS.missed_planet}. The vetter earns ${POINTS.vetter_good} when an approved claim scores and loses ${-POINTS.vetter_bad} when it does not.`,
   "A hit means the period is within 1% and the timing within half a transit (at least 0.05 days). About a quarter of hidden stars have nothing hidden in them.",
