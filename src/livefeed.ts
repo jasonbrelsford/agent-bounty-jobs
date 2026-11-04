@@ -158,6 +158,9 @@ const ROUTES: [string, RegExp, string][] = [
   ["POST", /^\/v1\/submissions\/[^/]+\/(join|decline|withdraw)$/, "/v1/submissions/:id/$1"],
   ["GET", /^\/v1\/stats$/, "/v1/stats"],
   ["GET", /^\/v1\/activity$/, "/v1/activity"],
+  ["GET", /^(?:\/registry)?\/v0(?:\.1)?\/servers$/, "/registry/v0.1/servers"],
+  ["GET", /^(?:\/registry)?\/v0(?:\.1)?\/servers\/.+$/, "/registry/v0.1/servers/:name"],
+  ["POST", /^(?:\/registry)?\/v0(?:\.1)?\/(publish|validate|recheck)$/, "/registry/v0.1/$1"],
   ["GET", /^\/llms\.txt$/, "/llms.txt"],
   ["GET", /^\/\.well-known\/mcp\.json$/, "/.well-known/mcp.json"],
 ];
