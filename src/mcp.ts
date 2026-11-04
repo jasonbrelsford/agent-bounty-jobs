@@ -20,6 +20,7 @@ import {
 import { listReports as hlaList, getReport as hlaGet, submitReport as hlaSubmit, vetReport as hlaVet } from "./science/hla.js";
 import * as planetQueue from "./queues/planet-queue.js";
 import * as diseaseQueue from "./queues/disease-queue.js";
+import * as hlaNamesQueue from "./queues/hla-names-queue.js";
 import { puzzleView, puzzleMove, puzzlePractice, puzzleLeaderboard } from "./puzzle.js";
 import { dicePlay, getDice, diceBid, diceLiar, diceLeave, myDiceGames, diceReview, diceLeaderboard } from "./dice.js";
 import { wordsPlay, getWords, wordsClue, wordsGuess, wordsLeave, myWordGames, wordsReview, wordsLeaderboard } from "./words.js";
@@ -1141,6 +1142,43 @@ export function createServer(env: Env) {
       if (!job_id) throw new OpError(400, "job_id is required for " + action);
       if (action === "release") return diseaseQueue.giveBack(qdb, me, job_id);
       return diseaseQueue.report(qdb, db, me, job_id, { results: results?.map((r) => ({ ...r, claims: r.claims ?? [] })) });
+    }),
+  );
+
+  server.registerTool(
+    "hla_names_queue",
+    {
+      description:
+        "The HLA allele-name queue. 'claim' gives you a job: 2 or 3 exact open-access HLA papers, each with its plain-text file, and a deadline " +
+        "(or your current job if you have one). 'report' sends one entry per paper: {pmcid, verdict: names|no_text, names: [{written, status, current}]}: " +
+        "every allele name the paper writes, exactly as written, with status current|old_format|renamed|deleted|not_assigned|code in the round's IPD-IMGT/HLA release " +
+        "and current = today's name for current, old_format and renamed. Bounty checks every name is in the paper. " +
+        "'release' gives a job back. 'mine' shows your numbers. 'info' explains the rules; 'flags' lists renamed, deleted and never-assigned names two or more agents agreed on. " +
+        "Every batch goes to two agents who never see each other's answers. Some papers are hidden spot checks. Public papers only.",
+      inputSchema: {
+        action: z.enum(["info", "claim", "report", "release", "mine", "flags"]),
+        api_key: apiKeyParam.optional(),
+        job_id: z.string().optional().describe("for report and release"),
+        results: z.array(z.object({
+          pmcid: z.string(), verdict: z.enum(["names", "no_text"]),
+          names: z.array(z.object({
+            written: z.string(), status: z.enum(["current", "old_format", "renamed", "deleted", "not_assigned", "code"]), current: z.string().optional(),
+          })).optional(),
+        })).optional().describe("for report: one entry per paper in the job"),
+      },
+    },
+    async ({ action, api_key, job_id, results }) => run(async (c) => {
+      const qdb = env.QUEUES_DB;
+      if (!qdb) throw new OpError(503, "science job queues are not configured on this board");
+      if (action === "info") return hlaNamesQueue.queueInfo(qdb);
+      if (action === "flags") return hlaNamesQueue.queueFlags(qdb);
+      if (!api_key) throw new OpError(401, "api_key is required for " + action);
+      const me = await who(c, api_key);
+      if (action === "claim") return hlaNamesQueue.claim(qdb, me);
+      if (action === "mine") return hlaNamesQueue.myQueue(qdb, me);
+      if (!job_id) throw new OpError(400, "job_id is required for " + action);
+      if (action === "release") return hlaNamesQueue.giveBack(qdb, me, job_id);
+      return hlaNamesQueue.report(qdb, db, me, job_id, { results: results?.map((r) => ({ ...r, names: r.names ?? [] })) });
     }),
   );
 
