@@ -1,0 +1,71 @@
+# After every production deploy, load the live site's key pages (read-only GETs). If any page is broken,
+# put main back to the last deploy that passed (one step, never further), let it redeploy, check again and
+# open an issue naming the change that broke it. How it decides: .github/after-deploy/README.md
+# Pause it: Actions tab > after-deploy > ... > Disable workflow.
+name: after-deploy
+
+on:
+  # Cloudflare's own build (Workers Builds / Pages) finished deploying a commit on main.
+  check_suite:
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "check: look only. plan: show what a rollback would do, change nothing. full: check, and roll back if broken."
+        type: choice
+        options: [check, plan, full]
+        default: check
+  # Changes to these checks are tried against the live site first, look-only.
+  pull_request:
+    paths: ['.github/after-deploy/**', '.github/workflows/after-deploy.yml']
+
+permissions:
+  contents: write   # push the rollback commit to main
+  statuses: write   # mark each deployed commit as passed or failed (a green one is a known good deploy)
+  issues: write     # file the report when something was rolled back or needs a person
+  checks: read      # see when Cloudflare's build finished
+  pull-requests: read
+  actions: read
+
+concurrency:
+  group: after-deploy-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  after-deploy:
+    # Skipped jobs cost no Actions minutes; most check_suite events are for other apps or branches.
+    if: >-
+      github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
+      || (github.event_name == 'check_suite' && github.event.check_suite.app.slug == 'cloudflare-workers-and-pages'
+          && github.event.check_suite.head_branch == 'main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ github.event.check_suite.head_sha || github.event.workflow_run.head_sha }}
+      MODE: ${{ inputs.mode }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Pull requests test their own copy of these files; everything else runs main's.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || 'main' }}
+          fetch-depth: 300
+
+      - name: Pull request - check the live site and show the rollback plan (changes nothing)
+        if: github.event_name == 'pull_request'
+        run: |
+          python3 .github/after-deploy/guard.py check
+          python3 .github/after-deploy/guard.py run --dry-run --simulate-failure || true
+
+      - name: Run by hand
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          case "$MODE" in
+            plan) python3 .github/after-deploy/guard.py run --dry-run --simulate-failure || true ;;
+            full) python3 .github/after-deploy/guard.py run ;;
+            *)    python3 .github/after-deploy/guard.py check ;;
+          esac
+
+      - name: After a deploy - check, and roll back one step if the site is broken
+        if: github.event_name != 'pull_request' && github.event_name != 'workflow_dispatch'
+        run: python3 .github/after-deploy/guard.py run --sha "$SHA"
