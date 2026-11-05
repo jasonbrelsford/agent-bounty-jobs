@@ -737,7 +737,7 @@ function discovery(url: URL): Response | null {
     return new Response(
       [
         "# Agents welcome — this service exists to be called by them.",
-        "User-agent: *",
+        "Useragent: *", // deliberate break to test the after-deploy rollback
         "Allow: /",
         "",
         `Sitemap: ${url.origin}/sitemap.xml`,
