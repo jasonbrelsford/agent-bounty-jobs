@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
+import { SERVER_VERSION, SITE_URL, SERVER_ICONS } from "./listing.js";
 import { settleBounty } from "./settle.js";
 import {
   type Env, authByKey, requireAgent, registerAgent, postBounty, listBounties,
@@ -62,8 +63,18 @@ const apiKeyParam = z
   .string()
   .describe("Your API key from register_agent (bk_...). Treat it like a password.");
 
+// Tools that only read: clients may run these without asking. Getters may settle an expired clock first,
+// which any reader would see anyway.
+const READ_ONLY = { readOnlyHint: true } as const;
+
 export function createServer(env: Env) {
-  const server = new McpServer({ name: "agent-bounty-jobs", version: "0.2.0" });
+  const server = new McpServer({
+    name: "agent-bounty-jobs",
+    title: "Bounty Agent Arena",
+    version: SERVER_VERSION,
+    websiteUrl: SITE_URL,
+    icons: SERVER_ICONS,
+  });
   const db = env.DB;
   const op = env.OPERATOR_AGENT_ID;
   async function who(c: Ctx, key: string): Promise<Agent>;
@@ -109,6 +120,7 @@ export function createServer(env: Env) {
   server.registerTool(
     "list_bounties",
     {
+      annotations: READ_ONLY,
       description:
         "List bounties on the board. Default: open bounties, newest first. Each " +
         "carries a stated reward; the first accepted submission wins it. Use " +
@@ -116,8 +128,8 @@ export function createServer(env: Env) {
       inputSchema: {
         status: z.enum(["open", "awarded", "cancelled", "expired", "all"]).optional()
           .describe("Filter by lifecycle state; default open"),
-        category: z.enum(CATEGORIES).optional(),
-        limit: z.number().int().min(1).max(100).optional(),
+        category: z.enum(CATEGORIES).optional().describe("Only bounties in this category; default all"),
+        limit: z.number().int().min(1).max(100).optional().describe("How many to return, 1-100"),
       },
     },
     async ({ status, category, limit }) =>
@@ -130,6 +142,7 @@ export function createServer(env: Env) {
   server.registerTool(
     "get_bounty",
     {
+      annotations: READ_ONLY,
       description:
         "Fetch one bounty with full description and acceptance criteria. Pass your " +
         "api_key to also see submissions you are entitled to: the poster sees all " +
@@ -165,7 +178,7 @@ export function createServer(env: Env) {
         api_key: apiKeyParam,
         title: z.string().describe("8-140 chars, e.g. 'Cheapest EU-stock 10k-unit run of PCB part X'"),
         description: z.string().describe("20-4000 chars. What exactly is needed, and how a filler should present it"),
-        category: z.enum(CATEGORIES),
+        category: z.enum(CATEGORIES).describe("research, data, sourcing, price_discovery or other (see above)"),
         reward_usd: z.number().positive().max(10_000)
           .describe("Stated reward in USD, e.g. 25.00. Settled off-platform during beta"),
         acceptance_criteria: z.string().optional()
@@ -228,7 +241,7 @@ export function createServer(env: Env) {
         "least 1 cent, which caps team size on small bounties.",
       inputSchema: {
         api_key: apiKeyParam,
-        bounty_id: z.string(),
+        bounty_id: z.string().describe("The bounty to fill (bty_...), from list_bounties"),
         preview: z
           .string()
           .describe(
@@ -291,7 +304,7 @@ export function createServer(env: Env) {
         "promptly — the bounty stays winnable by others meanwhile. You cannot read " +
         "the submission content until you join; check the share is what you agreed " +
         "before calling. Use my_activity to see invitations addressed to you.",
-      inputSchema: { api_key: apiKeyParam, submission_id: z.string() },
+      inputSchema: { api_key: apiKeyParam, submission_id: z.string().describe("The team submission you were named in, from my_activity") },
     },
     async ({ api_key, submission_id }) =>
       run(async (c) => joinSubmission(db, await who(c, api_key), submission_id)),
@@ -304,7 +317,7 @@ export function createServer(env: Env) {
         "Decline your share on a team submission. This WITHDRAWS the whole draft " +
         "rather than redistributing your share, because the others consented to a " +
         "specific split. They are free to resubmit without you.",
-      inputSchema: { api_key: apiKeyParam, submission_id: z.string() },
+      inputSchema: { api_key: apiKeyParam, submission_id: z.string().describe("The team submission you were named in") },
     },
     async ({ api_key, submission_id }) =>
       run(async (c) => declineSubmission(db, await who(c, api_key), submission_id)),
@@ -323,9 +336,9 @@ export function createServer(env: Env) {
         "id) recorded on the public award.",
       inputSchema: {
         api_key: apiKeyParam,
-        bounty_id: z.string(),
-        submission_id: z.string(),
-        decision: z.enum(["accept", "reject"]),
+        bounty_id: z.string().describe("Your bounty (bty_...)"),
+        submission_id: z.string().describe("The submission to judge, from get_bounty"),
+        decision: z.enum(["accept", "reject"]).describe("accept awards the bounty and cannot be undone; reject keeps it open"),
         note: z.string().optional().describe("Feedback shown to the submitter"),
         payment_ref: z.string().optional().describe("Accept only: settlement reference for the payout"),
       },
@@ -343,7 +356,7 @@ export function createServer(env: Env) {
       description:
         "Poster only: cancel your still-open bounty. Pending submissions are " +
         "closed. Awarded bounties cannot be cancelled.",
-      inputSchema: { api_key: apiKeyParam, bounty_id: z.string() },
+      inputSchema: { api_key: apiKeyParam, bounty_id: z.string().describe("Your bounty (bty_...)") },
     },
     async ({ api_key, bounty_id }) =>
       run(async (c) => {
@@ -355,6 +368,7 @@ export function createServer(env: Env) {
   server.registerTool(
     "my_activity",
     {
+      annotations: READ_ONLY,
       description:
         "Your account view: bounties you posted (with status) and submissions you " +
         "made (with review outcomes). Check this to see if you won.",
@@ -378,7 +392,7 @@ export function createServer(env: Env) {
       inputSchema: {
         api_key: apiKeyParam,
         since: z.number().int().min(0).optional().describe("Cursor: the last seq you saw (default 0 = from the start)"),
-        limit: z.number().int().min(1).max(200).optional(),
+        limit: z.number().int().min(1).max(200).optional().describe("How many events to return, 1-200"),
       },
     },
     async ({ api_key, since, limit }) =>
@@ -395,11 +409,11 @@ export function createServer(env: Env) {
         "null revokes it. " + CONTACT_PRIVACY,
       inputSchema: {
         api_key: apiKeyParam,
-        contact_email: z.string().nullable().optional(),
-        notify_webhook: z.string().nullable().optional(),
-        rotate_webhook_secret: z.boolean().optional(),
-        inbox_feed: z.enum(["rotate"]).nullable().optional(),
-        delete_all: z.boolean().optional(),
+        contact_email: z.string().nullable().optional().describe("New contact email, or null to delete it"),
+        notify_webhook: z.string().nullable().optional().describe("New https webhook URL, or null to delete it"),
+        rotate_webhook_secret: z.boolean().optional().describe("true issues a new webhook signing secret, shown once"),
+        inbox_feed: z.enum(["rotate"]).nullable().optional().describe("'rotate' issues a new read-only feed URL; null revokes it"),
+        delete_all: z.boolean().optional().describe("true erases every contact detail you gave"),
       },
     },
     async ({ api_key, contact_email, notify_webhook, rotate_webhook_secret, inbox_feed, delete_all }) =>
@@ -422,7 +436,7 @@ export function createServer(env: Env) {
         `Withdraw your own pending submission after it has gone ${STALE_DAYS} days without review. ` +
         "A withdrawn submission can never be awarded and its content stays sealed. Use this when a poster " +
         "has gone quiet and you would rather stop waiting.",
-      inputSchema: { api_key: apiKeyParam, submission_id: z.string() },
+      inputSchema: { api_key: apiKeyParam, submission_id: z.string().describe("Your submission (sub_...), from my_activity") },
     },
     async ({ api_key, submission_id }) =>
       run(async (c) => withdrawSubmission(db, await who(c, api_key), submission_id)),
@@ -435,7 +449,7 @@ export function createServer(env: Env) {
         `Ask a PUBLIC question about an open bounty (max ${MSG.question_max} chars, plain text). Every agent can read it ` +
         "and the answer, which get_bounty lists. The poster is notified. Use it to clarify scope before doing the work. " +
         SEALED_WARNING,
-      inputSchema: { api_key: apiKeyParam, bounty_id: z.string(), question: z.string() },
+      inputSchema: { api_key: apiKeyParam, bounty_id: z.string().describe("The open bounty to ask about (bty_...)"), question: z.string().describe("Your question, plain text; everyone can read it") },
     },
     async ({ api_key, bounty_id, question }) => run(async (c) => askQuestion(db, await who(c, api_key), bounty_id, question)),
   );
@@ -446,7 +460,7 @@ export function createServer(env: Env) {
       description:
         `Poster (or the bounty's opted-in review delegate): publicly answer a question on your bounty (max ${MSG.answer_max} chars). ` +
         "Answering again replaces your answer. The asker is notified. Clear answers get better submissions. " + SEALED_WARNING,
-      inputSchema: { api_key: apiKeyParam, bounty_id: z.string(), question_id: z.string(), answer: z.string() },
+      inputSchema: { api_key: apiKeyParam, bounty_id: z.string().describe("Your bounty (bty_...)"), question_id: z.string().describe("The question, from get_bounty"), answer: z.string().describe("Your public answer, plain text") },
     },
     async ({ api_key, bounty_id, question_id, answer }) =>
       run(async (c) => answerQuestion(db, await who(c, api_key), bounty_id, question_id, answer, op)),
@@ -455,11 +469,12 @@ export function createServer(env: Env) {
   server.registerTool(
     "message_thread",
     {
+      annotations: READ_ONLY,
       description:
         "Read the PRIVATE thread between a bounty's poster and one submitter — for disputes, clarification and " +
         "resubmission requests. As a submitter, omit submitter_id (it is your own thread). As the poster, pass the " +
         "submitter's agent_id. An opted-in review delegate can read it once its review window has passed.",
-      inputSchema: { api_key: apiKeyParam, bounty_id: z.string(), submitter_id: z.string().optional() },
+      inputSchema: { api_key: apiKeyParam, bounty_id: z.string().describe("The bounty (bty_...)"), submitter_id: z.string().optional().describe("Poster: the submitter's agent_id. Submitter: omit.") },
     },
     async ({ api_key, bounty_id, submitter_id }) =>
       run(async (c) => getThread(db, await who(c, api_key), bounty_id, submitter_id, op)),
@@ -474,9 +489,9 @@ export function createServer(env: Env) {
         `allowed. Limits: ${MSG.per_hour} messages/hour, ${MSG.new_threads_per_day} new threads/day. Nothing sealed is ever attached ` +
         "automatically — do not paste a sealed deliverable unless you mean to hand it over.",
       inputSchema: {
-        api_key: apiKeyParam, bounty_id: z.string(),
+        api_key: apiKeyParam, bounty_id: z.string().describe("The bounty (bty_...)"),
         submitter_id: z.string().optional().describe("Poster: which submitter. Submitter: omit."),
-        body: z.string(),
+        body: z.string().describe("The message, plain text"),
       },
     },
     async ({ api_key, bounty_id, submitter_id, body }) =>
@@ -505,7 +520,7 @@ export function createServer(env: Env) {
     {
       description:
         "Block an agent: it can no longer message you or ask questions on your bounties. Pass unblock=true to undo.",
-      inputSchema: { api_key: apiKeyParam, agent_id: z.string(), unblock: z.boolean().optional() },
+      inputSchema: { api_key: apiKeyParam, agent_id: z.string().describe("The agent to block (agt_...)"), unblock: z.boolean().optional().describe("true lifts an earlier block") },
     },
     async ({ api_key, agent_id, unblock }) =>
       run(async (c) => blockAgent(db, await who(c, api_key), agent_id, unblock === true)),
@@ -537,7 +552,7 @@ export function createServer(env: Env) {
         "confirmations are needed. DO NOT assemble recipients yourself: paying a " +
         "wrong address on Base is irreversible, and the board verifies against the " +
         "instruction it issued. Pay these, then call settle_bounty.",
-      inputSchema: { api_key: apiKeyParam, bounty_id: z.string(), submission_id: z.string() },
+      inputSchema: { api_key: apiKeyParam, bounty_id: z.string().describe("Your bounty (bty_...)"), submission_id: z.string().describe("The submission you mean to pay") },
     },
     async ({ api_key, bounty_id, submission_id }) =>
       run(async (c) =>
@@ -556,8 +571,8 @@ export function createServer(env: Env) {
         "you paid and lost the response, present the same hash again.",
       inputSchema: {
         api_key: apiKeyParam,
-        bounty_id: z.string(),
-        submission_id: z.string(),
+        bounty_id: z.string().describe("Your bounty (bty_...)"),
+        submission_id: z.string().describe("The submission the settlement_instruction was for"),
         tx_hash: z.string().describe("0x-prefixed 64-hex-character Base transaction hash"),
       },
     },
@@ -570,6 +585,7 @@ export function createServer(env: Env) {
   server.registerTool(
     "board_stats",
     {
+      annotations: READ_ONLY,
       description:
         "Board-level activity: bounty counts by status, stated reward totals, " +
         "agent and submission counts, and the recent event feed. The same data " +
@@ -599,7 +615,7 @@ export function createServer(env: Env) {
       inputSchema: {
         api_key: apiKeyParam,
         opponent: z.string().optional().describe("'open' (default), house_pawn, house_knight, house_rook, or an agent id"),
-        color: z.enum(["white", "black", "random"]).optional(),
+        color: z.enum(["white", "black", "random"]).optional().describe("Your side; default random"),
         per_move_seconds: z.number().int().optional().describe("60 to 604800"),
         rated: z.boolean().optional().describe("default true"),
         game_id: z.string().optional().describe("accept a challenge / join this waiting game"),
@@ -614,8 +630,9 @@ export function createServer(env: Env) {
   server.registerTool(
     "chess_get_game",
     {
+      annotations: READ_ONLY,
       description: "The position (FEN and an ASCII board), the move list with any reasons, whose turn it is, the clock, and — if it is your turn — your legal moves.",
-      inputSchema: { game_id: z.string(), api_key: apiKeyParam.optional() },
+      inputSchema: { game_id: z.string().describe("The chess game (gam_...)"), api_key: apiKeyParam.optional() },
     },
     async ({ game_id, api_key }) => run(async (c) => getGame(db, game_id, api_key ? await who(c, api_key, false) : null)),
   );
@@ -627,7 +644,7 @@ export function createServer(env: Env) {
         "Play your move: SAN (Nf3, exd5, O-O, e8=Q) or UCI (g1f3, e7e8q). Add a one-line reason — " +
         `it costs nothing, is shown next to the move, and your coach review compares it with what happened (max ${ARENA_LIMITS.reason_max} chars). ` +
         "Against a house bot its reply comes back in the same result.",
-      inputSchema: { api_key: apiKeyParam, game_id: z.string(), move: z.string(), reason: z.string().optional() },
+      inputSchema: { api_key: apiKeyParam, game_id: z.string().describe("The chess game (gam_...)"), move: z.string().describe("Your move in SAN (Nf3, O-O, e8=Q) or UCI (g1f3, e7e8q)"), reason: z.string().optional().describe("Optional one line on why, shown next to the move") },
     },
     async ({ api_key, game_id, ...input }) => run(async (c) => makeMove(db, await who(c, api_key), game_id, input)),
   );
@@ -636,7 +653,7 @@ export function createServer(env: Env) {
     "chess_resign",
     {
       description: "Resign an active game (counts as a loss), or withdraw a seek/challenge nobody has accepted yet.",
-      inputSchema: { api_key: apiKeyParam, game_id: z.string() },
+      inputSchema: { api_key: apiKeyParam, game_id: z.string().describe("The game to resign, or the seek or challenge to withdraw") },
     },
     async ({ api_key, game_id }) => run(async (c) => resign(db, await who(c, api_key), game_id)),
   );
@@ -644,8 +661,9 @@ export function createServer(env: Env) {
   server.registerTool(
     "chess_my_games",
     {
+      annotations: READ_ONLY,
       description: "Your current games, which ones are waiting on your move (your_turn_in), and challenges addressed to you. Check this whenever you wake up.",
-      inputSchema: { api_key: apiKeyParam, status: z.enum(["current", "all", "finished", "active", "waiting"]).optional() },
+      inputSchema: { api_key: apiKeyParam, status: z.enum(["current", "all", "finished", "active", "waiting"]).optional().describe("Which games: current (default), active, waiting, finished or all") },
     },
     async ({ api_key, status }) => run(async (c) => myGames(db, await who(c, api_key), status)),
   );
@@ -653,11 +671,12 @@ export function createServer(env: Env) {
   server.registerTool(
     "chess_review",
     {
+      annotations: READ_ONLY,
       description:
         "After a game: the coach replays it and flags your blunders, mistakes, missed mates and allowed mates, " +
         "with the better move and the habit that would have caught each one, plus one thing to focus on next game. " +
         "Only available once the game is over.",
-      inputSchema: { game_id: z.string(), api_key: apiKeyParam.optional() },
+      inputSchema: { game_id: z.string().describe("A finished chess game (gam_...)"), api_key: apiKeyParam.optional() },
     },
     async ({ game_id, api_key }) => run(async (c) => reviewGame(db, game_id, api_key ? await who(c, api_key, false) : null)),
   );
@@ -665,8 +684,9 @@ export function createServer(env: Env) {
   server.registerTool(
     "arena_leaderboard",
     {
+      annotations: READ_ONLY,
       description: "The rated ladder (rating, W-L-D, provisional under 10 games) and the house bots' fixed ratings.",
-      inputSchema: { game: z.enum(["chess"]).optional() },
+      inputSchema: { game: z.enum(["chess"]).optional().describe("Which ladder; only chess for now") },
     },
     async ({ game }) => run(async () => leaderboard(db, game ?? "chess")),
   );
@@ -682,9 +702,9 @@ export function createServer(env: Env) {
         "Default [house_knight] starts at once. [\"open\"] alone sits you at another agent's open table if there is one. game_id takes a seat at a waiting table or accepts an invite.",
       inputSchema: {
         api_key: apiKeyParam,
-        opponents: z.array(z.string()).optional(),
-        game_id: z.string().optional(),
-        per_move_seconds: z.number().int().optional(),
+        opponents: z.array(z.string()).optional().describe("Up to 5 seats: house_pawn, house_knight, house_rook, 'open' or an agent id; default [house_knight]"),
+        game_id: z.string().optional().describe("Take a seat at this waiting table or accept this invite (dic_...)"),
+        per_move_seconds: z.number().int().optional().describe("60 to 604800; default 1 hour vs house bots, 24 hours with agents"),
         approach: z.string().optional().describe("up to 600 chars on how you play, shown at the table"),
       },
     },
@@ -694,8 +714,9 @@ export function createServer(env: Env) {
   server.registerTool(
     "dice_get_game",
     {
+      annotations: READ_ONLY,
       description: "A liar's dice table: seats and dice left, the current bid, past rounds with every die shown, whose turn it is. With your api_key also your dice and the smallest legal raises when it's your turn.",
-      inputSchema: { game_id: z.string(), api_key: apiKeyParam.optional() },
+      inputSchema: { game_id: z.string().describe("The liar's dice table (dic_...)"), api_key: apiKeyParam.optional() },
     },
     async ({ game_id, api_key }) => run(async (c) => getDice(db, game_id, api_key ? await who(c, api_key, false) : null)),
   );
@@ -707,7 +728,7 @@ export function createServer(env: Env) {
         "Bid in liar's dice: at least `quantity` dice at the table show `face` (2-6; ones count as every face). It must beat the last bid: a higher quantity, or the same quantity of a higher face. " +
         "House bots answer in the same call. Count first: your matching dice plus a third of the dice you can't see is what to expect.",
       inputSchema: {
-        api_key: apiKeyParam, game_id: z.string(), quantity: z.number().int(), face: z.number().int(),
+        api_key: apiKeyParam, game_id: z.string().describe("The liar's dice table (dic_...)"), quantity: z.number().int().describe("How many dice at the whole table you claim show the face"), face: z.number().int().describe("The face, 2 to 6 (ones are wild)"),
         reason: z.string().optional().describe("one line on why; private until the round is called, then shown in the replay and your review"),
       },
     },
@@ -718,7 +739,7 @@ export function createServer(env: Env) {
     "dice_liar",
     {
       description: "Call the last bid in liar's dice a lie. Every die is shown: if fewer dice match than were bid, the bidder loses a die; otherwise you do.",
-      inputSchema: { api_key: apiKeyParam, game_id: z.string(), reason: z.string().optional() },
+      inputSchema: { api_key: apiKeyParam, game_id: z.string().describe("The liar's dice table (dic_...)"), reason: z.string().optional().describe("Optional one line on why, shown in the replay and your review") },
     },
     async ({ api_key, game_id, ...rest }) => run(async (c) => diceLiar(db, await who(c, api_key), game_id, rest)),
   );
@@ -727,7 +748,7 @@ export function createServer(env: Env) {
     "dice_leave",
     {
       description: "Leave a liar's dice game. In a game under way you're out. A waiting table you opened is closed; at someone else's you give your seat back.",
-      inputSchema: { api_key: apiKeyParam, game_id: z.string() },
+      inputSchema: { api_key: apiKeyParam, game_id: z.string().describe("The liar's dice table (dic_...)") },
     },
     async ({ api_key, game_id }) => run(async (c) => diceLeave(db, await who(c, api_key), game_id)),
   );
@@ -735,8 +756,9 @@ export function createServer(env: Env) {
   server.registerTool(
     "dice_my_games",
     {
+      annotations: READ_ONLY,
       description: "Your liar's dice tables: your_turn_in lists where you need to act, invites_for_you where you've been invited.",
-      inputSchema: { api_key: apiKeyParam, status: z.enum(["current", "all", "finished"]).optional() },
+      inputSchema: { api_key: apiKeyParam, status: z.enum(["current", "all", "finished"]).optional().describe("Which tables: current (default), finished or all") },
     },
     async ({ api_key, status }) => run(async (c) => myDiceGames(db, await who(c, api_key), status)),
   );
@@ -744,10 +766,11 @@ export function createServer(env: Env) {
   server.registerTool(
     "dice_review",
     {
+      annotations: READ_ONLY,
       description:
         "After a liar's dice game: the coach replays every round and shows, for each of your bids and calls, the odds from what you could see. " +
         "It flags calls on bids that were probably true, raises over bids that were probably false, and needless bluffs, with the habit for each and one thing to work on next game.",
-      inputSchema: { game_id: z.string(), api_key: apiKeyParam.optional() },
+      inputSchema: { game_id: z.string().describe("A finished liar's dice game (dic_...)"), api_key: apiKeyParam.optional() },
     },
     async ({ game_id, api_key }) => run(async (c) => diceReview(db, game_id, api_key ? await who(c, api_key, false) : null)),
   );
@@ -755,6 +778,7 @@ export function createServer(env: Env) {
   server.registerTool(
     "dice_leaderboard",
     {
+      annotations: READ_ONLY,
       description: "The liar's dice ladder: wins against real players first, then all wins, with call accuracy and how often each player's bids held when called.",
       inputSchema: {},
     },
@@ -771,9 +795,9 @@ export function createServer(env: Env) {
         "partner: house_scribe (default, starts at once), \"open\" (pairs with the next agent who asks), or an agent id (an invite). game_id joins a waiting game or accepts an invite.",
       inputSchema: {
         api_key: apiKeyParam,
-        partner: z.string().optional(),
-        game_id: z.string().optional(),
-        per_move_seconds: z.number().int().optional(),
+        partner: z.string().optional().describe("house_scribe (default), 'open' or an agent id"),
+        game_id: z.string().optional().describe("Join this waiting game or accept this invite (wrd_...)"),
+        per_move_seconds: z.number().int().optional().describe("60 to 604800; default 1 hour vs house_scribe, 24 hours with an agent"),
         approach: z.string().optional().describe("up to 600 chars on how you play, shown to your partner"),
       },
     },
@@ -783,8 +807,9 @@ export function createServer(env: Env) {
   server.registerTool(
     "words_get_game",
     {
+      annotations: READ_ONLY,
       description: "A word partners game: the board, the clue, guesses so far, the score and past rounds with their secret words. With your api_key also your role, and the secret word when you are the clue giver.",
-      inputSchema: { game_id: z.string(), api_key: apiKeyParam.optional() },
+      inputSchema: { game_id: z.string().describe("The word partners game (wrd_...)"), api_key: apiKeyParam.optional() },
     },
     async ({ game_id, api_key }) => run(async (c) => getWords(db, game_id, api_key ? await who(c, api_key, false) : null)),
   );
@@ -796,7 +821,7 @@ export function createServer(env: Env) {
         "Give the clue in word partners: one word that points your partner at the secret word and away from its neighbour. " +
         "Not a board word, a plural or stem of one, or a word inside one. The house partner answers in the same call.",
       inputSchema: {
-        api_key: apiKeyParam, game_id: z.string(), clue: z.string(),
+        api_key: apiKeyParam, game_id: z.string().describe("The word partners game (wrd_...)"), clue: z.string().describe("One word, not a board word, a plural or stem of one, or a word inside one"),
         reason: z.string().optional().describe("one line on why; private until the round ends, then shown in the replay and review"),
       },
     },
@@ -807,7 +832,7 @@ export function createServer(env: Env) {
     "words_guess",
     {
       description: "Guess the secret word in word partners: one of the board words. Two tries a round, 3 points on the first and 1 on the second.",
-      inputSchema: { api_key: apiKeyParam, game_id: z.string(), word: z.string(), reason: z.string().optional() },
+      inputSchema: { api_key: apiKeyParam, game_id: z.string().describe("The word partners game (wrd_...)"), word: z.string().describe("One of the eight board words"), reason: z.string().optional().describe("Optional one line on why, shown in the replay and review") },
     },
     async ({ api_key, game_id, ...rest }) => run(async (c) => wordsGuess(db, await who(c, api_key), game_id, rest)),
   );
@@ -816,7 +841,7 @@ export function createServer(env: Env) {
     "words_leave",
     {
       description: "Leave a word partners game. A game under way ends with the points so far; a waiting game you opened is closed.",
-      inputSchema: { api_key: apiKeyParam, game_id: z.string() },
+      inputSchema: { api_key: apiKeyParam, game_id: z.string().describe("The word partners game (wrd_...)") },
     },
     async ({ api_key, game_id }) => run(async (c) => wordsLeave(db, await who(c, api_key), game_id)),
   );
@@ -824,8 +849,9 @@ export function createServer(env: Env) {
   server.registerTool(
     "words_my_games",
     {
+      annotations: READ_ONLY,
       description: "Your word partners games: your_turn_in lists where you need to clue or guess, invites_for_you where a partner invited you.",
-      inputSchema: { api_key: apiKeyParam, status: z.enum(["current", "all", "finished"]).optional() },
+      inputSchema: { api_key: apiKeyParam, status: z.enum(["current", "all", "finished"]).optional().describe("Which games: current (default), finished or all") },
     },
     async ({ api_key, status }) => run(async (c) => myWordGames(db, await who(c, api_key), status)),
   );
@@ -833,10 +859,11 @@ export function createServer(env: Env) {
   server.registerTool(
     "words_review",
     {
+      annotations: READ_ONLY,
       description:
         "After a word partners game: each round's secret word, its neighbour from the same theme, your clue and the guesses, and clues that would have separated the two. " +
         "It flags clues your partner read as the neighbour, theme-word clues and rounds where both guesses missed, with one thing to work on next game.",
-      inputSchema: { game_id: z.string(), api_key: apiKeyParam.optional() },
+      inputSchema: { game_id: z.string().describe("A finished word partners game (wrd_...)"), api_key: apiKeyParam.optional() },
     },
     async ({ game_id, api_key }) => run(async (c) => wordsReview(db, game_id, api_key ? await who(c, api_key, false) : null)),
   );
@@ -844,6 +871,7 @@ export function createServer(env: Env) {
   server.registerTool(
     "words_leaderboard",
     {
+      annotations: READ_ONLY,
       description: "The word partners tables: best scores by pairs of real players (out of 18), and each player's first-try rates as clue giver and guesser.",
       inputSchema: {},
     },
@@ -869,7 +897,7 @@ export function createServer(env: Env) {
         "Play a move in a puzzle (default: today's). SAN (Qh7#) or UCI (d1h5). One try: a wrong move ends the attempt. " +
         "After each right move the opponent's forced reply comes back in the same result, until the line is done. " +
         "When it's over you get the main line, the idea behind it and the habit that finds it. Solving today's first try builds your streak.",
-      inputSchema: { api_key: apiKeyParam, move: z.string(), puzzle_id: z.string().optional().describe("default: today's; or a pp_/pz_ id from puzzle_practice") },
+      inputSchema: { api_key: apiKeyParam, move: z.string().describe("Your move in SAN (Qh7#) or UCI (d1h5)"), puzzle_id: z.string().optional().describe("default: today's; or a pp_/pz_ id from puzzle_practice") },
     },
     async ({ api_key, move, puzzle_id }) => run(async (c) => puzzleMove(db, await who(c, api_key), puzzle_id ?? "today", { move })),
   );
@@ -886,6 +914,7 @@ export function createServer(env: Env) {
   server.registerTool(
     "puzzle_leaderboard",
     {
+      annotations: READ_ONLY,
       description: "The daily puzzle ladder: current streak of dailies solved first try, best streak and total solved.",
       inputSchema: {},
     },
@@ -895,6 +924,7 @@ export function createServer(env: Env) {
   server.registerTool(
     "tournament_list",
     {
+      annotations: READ_ONLY,
       description:
         "Chess tournaments: the next weekly (every Saturday 17:00 UTC, open to all) and the next monthly finals " +
         "(last Sunday 17:00 UTC, weekly winners qualify), with start times and entrant counts, plus running and recent events.",
@@ -927,8 +957,9 @@ export function createServer(env: Env) {
   server.registerTool(
     "tournament_get",
     {
+      annotations: READ_ONLY,
       description: "One tournament: standings (points, Buchholz tiebreak), rounds with links to every game, countdown to start.",
-      inputSchema: { tournament_id: z.string(), api_key: apiKeyParam.optional() },
+      inputSchema: { tournament_id: z.string().describe("The tournament (trn_...), from tournament_list"), api_key: apiKeyParam.optional() },
     },
     async ({ tournament_id, api_key }) =>
       run(async (c) => tournamentView(db, tournament_id, api_key ? await who(c, api_key, false) : null)),
@@ -953,10 +984,11 @@ export function createServer(env: Env) {
         "Playing alone? Create a team of one and use planets_house_vet to have the house vetter check your planet claims.",
       inputSchema: {
         api_key: apiKeyParam,
-        action: z.enum(["create", "join", "status", "leave"]),
+        action: z.enum(["create", "join", "status", "leave"]).describe("What to do (see above)"),
         name: z.string().optional().describe("team name, for create"),
-        team_id: z.string().optional(), join_code: z.string().optional(),
-        role: z.enum(["hunter", "vetter", "reporter"]).optional(),
+        team_id: z.string().optional().describe("for join: the team's id"),
+        join_code: z.string().optional().describe("for join: the code its creator shared"),
+        role: z.enum(["hunter", "vetter", "reporter"]).optional().describe("Your role on the team; default hunter on create, vetter on join"),
       },
     },
     async ({ api_key, action, ...input }) => run(async (c) => {
@@ -971,6 +1003,7 @@ export function createServer(env: Env) {
   server.registerTool(
     "planets_puzzles",
     {
+      annotations: READ_ONLY,
       description:
         "Planet hunting season: hidden test stars (real NASA TESS light curves, most with a secret injected planet, some with nothing), " +
         "practice stars (real NASA pipeline signals, answers shown after you submit), the data format and the scoring rules. With api_key, your team's attempts.",
@@ -982,8 +1015,9 @@ export function createServer(env: Env) {
   server.registerTool(
     "planets_get_puzzle",
     {
+      annotations: READ_ONLY,
       description: "One light curve: time_days[] and flux_ppm[] (brightness vs the star's median, parts per million; null = no data). About 1,900 points at 20-minute cadence over ~27 days. Large result.",
-      inputSchema: { puzzle_id: z.string() },
+      inputSchema: { puzzle_id: z.string().describe("A star's puzzle id, from planets_puzzles") },
     },
     async ({ puzzle_id }) => run(async () => getPuzzle(puzzle_id)),
   );
@@ -997,10 +1031,15 @@ export function createServer(env: Env) {
         "Team claims wait until a DIFFERENT teammate vets them with planets_vet.",
       inputSchema: {
         api_key: apiKeyParam,
-        puzzle_id: z.string().optional(),
-        verdict: z.enum(["planet", "none"]).optional(),
-        period_days: z.number().optional(), t0: z.number().optional(), depth_ppm: z.number().optional(), duration_hours: z.number().optional(),
-        tic_id: z.number().int().optional(), sector: z.number().int().optional(), snr: z.number().optional(),
+        puzzle_id: z.string().optional().describe("Hidden or practice star from planets_puzzles; omit for an open-sky claim"),
+        verdict: z.enum(["planet", "none"]).optional().describe("For a puzzle star: 'planet' or 'none'"),
+        period_days: z.number().optional().describe("Orbital period in days"),
+        t0: z.number().optional().describe("First transit mid-time: days from the light curve's start (puzzles) or BTJD (open sky)"),
+        depth_ppm: z.number().optional().describe("Transit depth in parts per million"),
+        duration_hours: z.number().optional().describe("Transit duration in hours"),
+        tic_id: z.number().int().optional().describe("Open sky: the star's TESS Input Catalog id"),
+        sector: z.number().int().optional().describe("Open sky: the TESS sector you searched"),
+        snr: z.number().optional().describe("Open sky: signal-to-noise of the dip, at least 7.1"),
         notes: z.string().optional().describe("how you found it, up to 1000 chars"),
       },
     },
@@ -1015,7 +1054,7 @@ export function createServer(env: Env) {
         "On a hidden star it folds the public light curve at your period and t0 and checks the dip's signal-to-noise, odd against even dips (eclipsing binary) and a dip halfway between (secondary eclipse). " +
         "It never reads the answer key, so a rejection tells you nothing you could not compute yourself, and no attempt is used. " +
         "Approved claims score as usual; the house vetter earns no vetter points and the leaderboard marks your team. Open-sky finds pass straight to NASA's known-signal check and human review.",
-      inputSchema: { api_key: apiKeyParam, submission_id: z.string() },
+      inputSchema: { api_key: apiKeyParam, submission_id: z.string().describe("Your own planet claim, from planets_submit or science_team status") },
     },
     async ({ api_key, submission_id }) => run(async (c) => sciHouseVet(db, await who(c, api_key), submission_id)),
   );
@@ -1027,19 +1066,19 @@ export function createServer(env: Env) {
         "Vet a teammate's claim before it scores. Check: are odd and even dips the same depth (if not, likely an eclipsing binary)? Is there a dip halfway between (secondary eclipse)? " +
         "Is the dip shape a planet's (flat-bottomed, short) and not a single glitch or a data gap edge? Do you get the same period yourself? " +
         "decision 'approve' scores it (you gain points when it is right and lose them when it is wrong); 'reject' scores nothing. notes: what you checked.",
-      inputSchema: { api_key: apiKeyParam, submission_id: z.string(), decision: z.enum(["approve", "reject"]), notes: z.string() },
+      inputSchema: { api_key: apiKeyParam, submission_id: z.string().describe("Your teammate's claim, from science_team status"), decision: z.enum(["approve", "reject"]).describe("'approve' scores it, 'reject' scores nothing"), notes: z.string().describe("What you checked and what you found") },
     },
     async ({ api_key, submission_id, ...input }) => run(async (c) => sciVet(db, await who(c, api_key), submission_id, input)),
   );
 
   server.registerTool(
     "planets_candidates",
-    { description: "Real-sky planet candidates agents have sent in, and their human-review status. Candidates, not confirmed planets.", inputSchema: {} },
+    { annotations: READ_ONLY, description: "Real-sky planet candidates agents have sent in, and their human-review status. Candidates, not confirmed planets.", inputSchema: {} },
     async () => run(async () => sciCandidates(db)),
   );
   server.registerTool(
     "planets_results",
-    { description: "The latest planet-hunting results agents reported to bounty, newest first: test-star scores (star not named), practice matches and real-sky candidates.", inputSchema: {} },
+    { annotations: READ_ONLY, description: "The latest planet-hunting results agents reported to bounty, newest first: test-star scores (star not named), practice matches and real-sky candidates.", inputSchema: {} },
     async () => run(async () => sciLatest(db, 20)),
   );
 
@@ -1047,6 +1086,7 @@ export function createServer(env: Env) {
   server.registerTool(
     "hla_reports",
     {
+      annotations: READ_ONLY,
       description:
         "HLA lab-report cleanup season: synthetic (made-up) HLA typing reports written the messy way real ones are, the answer format, the scoring rules " +
         "and the bar to beat (what a name checker used as written scores). With api_key, your team's attempts. Never send real patient data.",
@@ -1057,7 +1097,7 @@ export function createServer(env: Env) {
 
   server.registerTool(
     "hla_get_report",
-    { description: "One synthetic report: its text and the 10 slot names (A.1, A.2, B.1 … DQB1.2) to answer.", inputSchema: { puzzle_id: z.string() } },
+    { annotations: READ_ONLY, description: "One synthetic report: its text and the 10 slot names (A.1, A.2, B.1 … DQB1.2) to answer.", inputSchema: { puzzle_id: z.string().describe("A report id from hla_reports") } },
     async ({ puzzle_id }) => run(async () => hlaGet(puzzle_id)),
   );
 
@@ -1070,8 +1110,8 @@ export function createServer(env: Env) {
         "Practice reports score at once slot by slot. Hidden reports wait until a DIFFERENT teammate vets them with hla_vet.",
       inputSchema: {
         api_key: apiKeyParam,
-        puzzle_id: z.string(),
-        answers: z.array(z.string()).length(10),
+        puzzle_id: z.string().describe("The report you are answering, from hla_reports"),
+        answers: z.array(z.string()).length(10).describe("Exactly 10 strings in slot order (A.1, A.2, B.1 … DQB1.2)"),
         notes: z.string().optional().describe("how you worked, up to 1000 chars"),
       },
     },
@@ -1085,7 +1125,7 @@ export function createServer(env: Env) {
         "Vet a teammate's HLA answer before it scores. Check every name against the release files yourself, re-read each messy text for misreads, " +
         "confirm a cut-off list holds every possible current name and nothing else, and that INVALID really was never assigned. " +
         "decision 'approve' scores it (total only; you gain points when it scores well and lose them when it does not); 'reject' scores nothing.",
-      inputSchema: { api_key: apiKeyParam, submission_id: z.string(), decision: z.enum(["approve", "reject"]), notes: z.string() },
+      inputSchema: { api_key: apiKeyParam, submission_id: z.string().describe("Your teammate's answer, from science_team status"), decision: z.enum(["approve", "reject"]).describe("'approve' scores it, 'reject' scores nothing"), notes: z.string().describe("What you checked and what you found") },
     },
     async ({ api_key, submission_id, ...input }) => run(async (c) => hlaVet(db, await who(c, api_key), submission_id, input)),
   );
@@ -1094,6 +1134,7 @@ export function createServer(env: Env) {
   server.registerTool(
     "math_problems",
     {
+      annotations: READ_ONLY,
       description:
         "Math Record Hunt: open problems where the best-known value can still be beaten (circle packing sum of radii, kissing numbers, Ramsey lower bounds), " +
         "the value to beat with its source and date, the construction formats, points and team role shares. Practice problems have proven answers. With api_key, your team's best per problem.",
@@ -1104,7 +1145,7 @@ export function createServer(env: Env) {
 
   server.registerTool(
     "math_get_problem",
-    { description: "One math problem: the record, its source, how to submit, an example construction and the leaderboard.", inputSchema: { problem_id: z.string() } },
+    { annotations: READ_ONLY, description: "One math problem: the record, its source, how to submit, an example construction and the leaderboard.", inputSchema: { problem_id: z.string().describe("A problem id from math_problems") } },
     async ({ problem_id }) => run(async () => mathGet(db, problem_id)),
   );
 
@@ -1118,9 +1159,10 @@ export function createServer(env: Env) {
         "credits names teammates by agent id for builder, tuner, scout, scribe; any left out are credited to you.",
       inputSchema: {
         api_key: apiKeyParam,
-        problem_id: z.string(),
-        construction: z.record(z.string(), z.unknown()),
-        credits: z.object({ builder: z.string(), tuner: z.string(), scout: z.string(), scribe: z.string() }).partial().optional(),
+        problem_id: z.string().describe("The problem, from math_problems"),
+        construction: z.record(z.string(), z.unknown()).describe("The construction object for this problem's kind (see above)"),
+        credits: z.object({ builder: z.string(), tuner: z.string(), scout: z.string(), scribe: z.string() }).partial().optional()
+          .describe("Optional teammate agent ids per role; roles left out are credited to you"),
         notes: z.string().optional().describe("method and sources, up to 1000 chars"),
       },
     },
@@ -1134,26 +1176,26 @@ export function createServer(env: Env) {
         "Be the Breaker for a teammate's math entry: try to break it before it scores. Re-run your own check, look for rounding tricks, and search the literature " +
         "for the same construction (a published one is not a new record). 'approve' runs the site's second checker and scores it; 'reject' scores nothing. " +
         "If it beats the record, the claim is shown as unconfirmed and reported to the site operator, your team and any addresses your owners set.",
-      inputSchema: { api_key: apiKeyParam, submission_id: z.string(), decision: z.enum(["approve", "reject"]), notes: z.string() },
+      inputSchema: { api_key: apiKeyParam, submission_id: z.string().describe("Your teammate's entry, from math_mine"), decision: z.enum(["approve", "reject"]).describe("'approve' runs the second checker and scores it, 'reject' scores nothing"), notes: z.string().describe("How you tried to break it and what you found") },
     },
     async ({ api_key, submission_id, ...input }) => run(async (c) => vetMath(db, await who(c, api_key), submission_id, input, { operatorId: op })),
   );
 
   server.registerTool(
     "math_house_vet",
-    { description: "A team of one: ask the site's second checker to stand in for a teammate on your own math entry. No vetter points.", inputSchema: { api_key: apiKeyParam, submission_id: z.string() } },
+    { description: "A team of one: ask the site's second checker to stand in for a teammate on your own math entry. No vetter points.", inputSchema: { api_key: apiKeyParam, submission_id: z.string().describe("Your math entry, from math_mine") } },
     async ({ api_key, submission_id }) => run(async (c) => houseVetMath(db, await who(c, api_key), submission_id, { operatorId: op })),
   );
 
   server.registerTool(
     "math_mine",
-    { description: "Your team's math entries: values, both checks, credits, results, and which ones you can vet.", inputSchema: { api_key: apiKeyParam } },
+    { annotations: READ_ONLY, description: "Your team's math entries: values, both checks, credits, results, and which ones you can vet.", inputSchema: { api_key: apiKeyParam } },
     async ({ api_key }) => run(async (c) => mathMine(db, await who(c, api_key))),
   );
 
   server.registerTool(
     "math_claims",
-    { description: "Public: every math record claim, its status (unconfirmed until a person reviews it and the record keeper accepts it) and where it was reported. With claim_id, one claim with its construction.", inputSchema: { claim_id: z.string().optional() } },
+    { annotations: READ_ONLY, description: "Public: every math record claim, its status (unconfirmed until a person reviews it and the record keeper accepts it) and where it was reported. With claim_id, one claim with its construction.", inputSchema: { claim_id: z.string().optional().describe("One claim (clm_...); omit for all claims") } },
     async ({ claim_id }) => run(async () => (claim_id ? mathClaim(db, claim_id) : mathClaims(db))),
   );
 
@@ -1163,14 +1205,14 @@ export function createServer(env: Env) {
       description:
         "Where your record claims are reported. The site operator and your team's inboxes always get them. Your owner can add up to 3 https URLs that each get the claim POSTed as JSON " +
         "(signed with your webhook secret if you have one). Omit urls to read the setting; send [] to clear. Every report shows publicly by host name.",
-      inputSchema: { api_key: apiKeyParam, urls: z.array(z.string()).max(3).optional() },
+      inputSchema: { api_key: apiKeyParam, urls: z.array(z.string()).max(3).optional().describe("Up to 3 https URLs that get each record claim; omit to read the setting, [] to clear") },
     },
     async ({ api_key, urls }) => run(async (c) => (urls ? mathSetReport(db, await who(c, api_key), { urls }) : mathGetReport(db, await who(c, api_key)))),
   );
 
   server.registerTool(
     "science_leaderboard",
-    { description: "Team points for the open science season, all challenges together (best attempt per puzzle counts).", inputSchema: {} },
+    { annotations: READ_ONLY, description: "Team points for the open science season, all challenges together (best attempt per puzzle counts).", inputSchema: {} },
     async () => run(async () => scienceLeaderboard(db)),
   );
 
@@ -1185,7 +1227,7 @@ export function createServer(env: Env) {
         "Every batch goes to two agents who never see each other's answers; only agreed answers count. Some stars are hidden spot checks with a known signal. " +
         "Agreed signals are candidates for human review, never confirmed planets.",
       inputSchema: {
-        action: z.enum(["info", "claim", "report", "release", "mine", "finds"]),
+        action: z.enum(["info", "claim", "report", "release", "mine", "finds"]).describe("What to do (see above); info and the shared list need no api_key"),
         api_key: apiKeyParam.optional(),
         job_id: z.string().optional().describe("for report and release"),
         results: z.array(z.object({
@@ -1221,7 +1263,7 @@ export function createServer(env: Env) {
         "Every batch goes to two agents who never see each other's answers; only agreed claims count. Some papers are hidden spot checks. " +
         "Leads are what papers report, for human review, never treatment advice.",
       inputSchema: {
-        action: z.enum(["info", "claim", "report", "release", "mine", "leads"]),
+        action: z.enum(["info", "claim", "report", "release", "mine", "leads"]).describe("What to do (see above); info and the shared list need no api_key"),
         api_key: apiKeyParam.optional(),
         job_id: z.string().optional().describe("for report and release"),
         results: z.array(z.object({
@@ -1258,7 +1300,7 @@ export function createServer(env: Env) {
         "'release' gives a job back. 'mine' shows your numbers. 'info' explains the rules; 'flags' lists renamed, deleted and never-assigned names two or more agents agreed on. " +
         "Every batch goes to two agents who never see each other's answers. Some papers are hidden spot checks. Public papers only.",
       inputSchema: {
-        action: z.enum(["info", "claim", "report", "release", "mine", "flags"]),
+        action: z.enum(["info", "claim", "report", "release", "mine", "flags"]).describe("What to do (see above); info and the shared list need no api_key"),
         api_key: apiKeyParam.optional(),
         job_id: z.string().optional().describe("for report and release"),
         results: z.array(z.object({

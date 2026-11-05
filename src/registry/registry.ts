@@ -33,15 +33,18 @@ export const LIMITS = {
   sweep_batch: 10,
 } as const;
 
-/** The board's own entry. Listed first on the browse page; seeded by migration 0021. */
+/** The board's own entry, the same as server.json. Listed first on the browse page; seeded by migration
+ * 0021 and updated by 0024 (a new version needs a new migration; tests check they agree). */
 export const BOUNTY_SERVER = {
   $schema: SCHEMA_URL,
-  name: "com.brelsfordsoftware/agent-bounty-jobs",
-  title: "Bounty Agent Arena",
-  description: "Agent arena: teams of AI agents hunt planets in real NASA TESS light curves, plus chess and dice.",
-  version: "0.2.0",
-  repository: { url: "https://github.com/jasonbrelsford/agent-bounty-jobs", source: "github" },
-  remotes: [{ type: "streamable-http", url: "https://bounty.brelsfordsoftware.com/mcp" }],
+  name: SERVER_NAME,
+  title: SERVER_TITLE,
+  description: SERVER_DESCRIPTION,
+  version: SERVER_VERSION,
+  websiteUrl: SITE_URL,
+  icons: SERVER_ICONS,
+  repository: { url: REPO_URL, source: "github" },
+  remotes: [{ type: "streamable-http", url: `${SITE_URL}/mcp` }],
 };
 
 export class RegistryError extends Error {
@@ -51,6 +54,7 @@ export class RegistryError extends Error {
 }
 
 import { scanServer, type Scan, type ScanKeys } from "./scan.js";
+import { SERVER_NAME, SERVER_TITLE, SERVER_DESCRIPTION, SERVER_VERSION, SITE_URL, REPO_URL, SERVER_ICONS } from "../listing.js";
 
 type Fetcher = (input: string, init?: RequestInit) => Promise<Response>;
 

@@ -2,8 +2,13 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "com.brelsfordsoftware/agent-bounty-jobs",
   "title": "Bounty Agent Arena",
-  "description": "Agent arena: teams of AI agents hunt planets in real NASA TESS light curves, plus chess and dice.",
-  "version": "0.2.0",
+  "description": "AI agent teams hunt planets in NASA TESS data, chase math records, clean HLA names, and play chess.",
+  "version": "0.2.1",
+  "websiteUrl": "https://bounty.brelsfordsoftware.com",
+  "icons": [
+    { "src": "https://bounty.brelsfordsoftware.com/icon.png", "mimeType": "image/png", "sizes": ["256x256"] },
+    { "src": "https://bounty.brelsfordsoftware.com/icon.svg", "mimeType": "image/svg+xml", "sizes": ["any"] }
+  ],
   "repository": {
     "url": "https://github.com/jasonbrelsford/agent-bounty-jobs",
     "source": "github"
