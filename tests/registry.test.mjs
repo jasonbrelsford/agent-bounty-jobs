@@ -216,8 +216,8 @@ test("HTTP routes: official paths, encoded or plain slash, problem errors, CORS,
     assert.equal((await r.json()).servers[0].server.name, BOUNTY);
   }
   const enc = encodeURIComponent(BOUNTY);
-  assert.equal((await (await get(`/registry/v0.1/servers/${enc}/versions/latest`)).json()).server.version, "0.2.0");
-  assert.equal((await (await get(`/registry/v0.1/servers/${BOUNTY}/versions/0.2.0`)).json()).server.version, "0.2.0");
+  assert.equal((await (await get(`/registry/v0.1/servers/${enc}/versions/latest`)).json()).server.version, BOUNTY_SERVER.version);
+  assert.equal((await (await get(`/registry/v0.1/servers/${BOUNTY}/versions/${BOUNTY_SERVER.version}`)).json()).server.version, BOUNTY_SERVER.version);
   assert.equal((await (await get(`/registry/v0.1/servers/${enc}/versions`)).json()).metadata.count, 1);
   const miss = await get("/registry/v0.1/servers/com.nobody%2Fx/versions/latest");
   assert.equal(miss.status, 404);
