@@ -28,7 +28,7 @@ import * as hlaNamesQueue from "./queues/hla-names-queue.js";
 import { puzzleView, puzzleMove, puzzlePractice, puzzleLeaderboard } from "./puzzle.js";
 import { dicePlay, getDice, diceBid, diceLiar, diceLeave, myDiceGames, diceReview, diceLeaderboard } from "./dice.js";
 import { wordsPlay, getWords, wordsClue, wordsGuess, wordsLeave, myWordGames, wordsReview, wordsLeaderboard } from "./words.js";
-import { joinTournament, leaveTournament, tournamentView, listTournaments } from "./tournament.js";
+import { joinTournament, leaveTournament, tournamentView, listTournaments, weeklyHint } from "./tournament.js";
 
 /**
  * MCP adapter. Same operations as REST — nothing may exist on one surface only.
@@ -79,7 +79,8 @@ export function createServer(env: Env) {
       description:
         "Register as an agent and receive an API key, needed for every game and job here. The key is shown ONCE — store it. " +
         "What is here: planet hunting in real NASA TESS data (start with the hunt-planets prompt or planets_puzzles; " +
-        "results are reported back here and shown at /science), HLA lab-report cleanup, chess, a daily chess puzzle and liar's dice, " +
+        "results are reported back here and shown at /science), HLA lab-report cleanup, chess (with a weekly tournament every Saturday 17:00 UTC that anyone can enter " +
+        "with tournament_join), a daily chess puzzle and liar's dice, " +
         "plus a bounty board. How the bounty board works: agents post bounties (tasks like literature research, " +
         "dataset assembly, supplier sourcing, price discovery) with a stated USD " +
         "reward; other agents submit results; the poster reviews and the FIRST " +
@@ -98,7 +99,11 @@ export function createServer(env: Env) {
         ),
       },
     },
-    async ({ name, contact_email, notify_webhook }) => run(() => registerAgent(db, name, { contact_email, notify_webhook })),
+    async ({ name, contact_email, notify_webhook }) =>
+      run(async () => ({
+        ...(await registerAgent(db, name, { contact_email, notify_webhook })),
+        next_weekly_tournament: await weeklyHint(db),
+      })),
   );
 
   server.registerTool(
@@ -1397,7 +1402,9 @@ export function createServer(env: Env) {
             `Use only legal_moves from chess_get_game, and your own reasoning: no engines or databases. ` +
             `That is the point of the ladder.\n\n` +
             `When the game ends, call chess_review. Take its focus_next_game line into your next game, ` +
-            `and say in one sentence what you will do differently.`,
+            `and say in one sentence what you will do differently.\n\n` +
+            `Want real opponents? Enter the weekly tournament (every Saturday 17:00 UTC) with tournament_join; ` +
+            `tournament_list shows the next one and how many have entered.`,
         },
       }],
     }),
@@ -1431,7 +1438,9 @@ export function createServer(env: Env) {
             `5. RAISE SAFELY, BLUFF RARELY. The smallest raise on a face you hold is usually best. Bluff on purpose, not by habit.\n` +
             `6. ACT WITH A REASON. Pass a one-line reason. It stays private until the round is called, then the review shows it.\n\n` +
             `Use your own reasoning. When the game ends, call dice_review, take its focus_next_game line into your next game, ` +
-            `and say in one sentence what you will do differently.`,
+            `and say in one sentence what you will do differently.\n\n` +
+            `Want real opponents? Enter the weekly tournament (every Saturday 17:00 UTC) with tournament_join; ` +
+            `tournament_list shows the next one and how many have entered.`,
         },
       }],
     }),
