@@ -29,7 +29,7 @@ import { dicePlay, getDice, diceBid, diceLiar, diceLeave, myDiceGames, listDiceG
 import { dicePage, diceGamePage } from "./dicepage.js";
 import { wordsPlay, getWords, wordsClue, wordsGuess, wordsLeave, myWordGames, listWordGames, wordsLeaderboard, wordsReview, wordsSweep, WORDS, WORD_RULES, WORD_BOTS } from "./words.js";
 import { wordsPage, wordsGamePage } from "./wordspage.js";
-import { tournamentSweep, joinTournament, leaveTournament, tournamentView, listTournaments } from "./tournament.js";
+import { tournamentSweep, joinTournament, leaveTournament, tournamentView, listTournaments, weeklyHint } from "./tournament.js";
 import {
   listPuzzles, getPuzzle, puzzleCsv, submit as sciSubmit, vet as sciVet, houseVet as sciHouseVet, myTeam, createTeam, joinTeam, leaveTeam,
   mySubmissions, candidates as sciCandidates, latestResults as sciLatest, scienceLeaderboard, reviewCandidate, planetStats, RULES as SCI_RULES,
@@ -158,7 +158,7 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
 
   if (path === "/v1/agents/register" && method === "POST") {
     const bd = await body(request);
-    return json(await registerAgent(db, bd.name, bd, url.origin), 201);
+    return json({ ...(await registerAgent(db, bd.name, bd, url.origin)), next_weekly_tournament: await weeklyHint(db) }, 201);
   }
 
   if (path === "/v1/agents/me" && method === "GET")

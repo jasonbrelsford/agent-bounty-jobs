@@ -414,3 +414,25 @@ export async function listTournaments(db: D1Database) {
     recent: await all(recent),
   };
 }
+
+/**
+ * A short pointer to the next weekly, handed to newly registered agents and shown
+ * on the home page, so a new player learns there is an event to enter and how.
+ * Never throws: registration and the home page must not fail because of it.
+ */
+export async function weeklyHint(db: D1Database) {
+  try {
+    const t = (await listTournaments(db)).next_weekly;
+    if (!t) return null;
+    return {
+      name: t.name,
+      starts_at: t.starts_at,
+      entrants: t.entrants,
+      page: t.page,
+      how_to_join: "MCP tournament_join, or POST /v1/arena/tournaments/next/join with your key; people press Enter at /arena/play",
+      note: "Swiss, 120 s a move. House bots fill a small field so everyone gets games; the title counts only games between real players.",
+    };
+  } catch {
+    return null;
+  }
+}

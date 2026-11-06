@@ -7,7 +7,7 @@ import { registerAgent, authByKey, readInbox } from "../.test-build/core.js";
 import { play, getGame, makeMove, resign, listGames, leaderboard, arenaSweep, myGames } from "../.test-build/arena.js";
 import {
   nextWeekly, finalsOf, nextFinals, roundsFor, pairSwiss, ensureSchedule, joinTournament, leaveTournament,
-  tournamentSweep, tournamentView, listTournaments,
+  tournamentSweep, tournamentView, listTournaments, weeklyHint,
 } from "../.test-build/tournament.js";
 import { arenaPage, tournamentPage, playPage, gamePage } from "../.test-build/arenapage.js";
 
@@ -324,4 +324,19 @@ test("arena pages: real head, readable countdown text, Enter goes to the tournam
   assert.ok(ap.includes('href="/arena/play#tournament">Enter</a>'));
   const pp = await (await playPage()).text();
   assert.ok(pp.includes('<h2 id="tournament">'));
+});
+
+test("weekly hint: new players learn the next weekly, its entrants and how to join", async () => {
+  const db = makeD1();
+  const a = await agent(db, "Hint Reader");
+  let h = await weeklyHint(db);
+  assert.ok(h, "a weekly is always scheduled");
+  assert.match(h.name, /^Weekly Tournament/);
+  assert.equal(new Date(h.starts_at).getUTCDay(), 6);
+  assert.equal(h.entrants, 0);
+  assert.match(h.how_to_join, /tournament_join/);
+  await joinTournament(db, a);
+  h = await weeklyHint(db);
+  assert.equal(h.entrants, 1);
+  assert.equal(await weeklyHint({ prepare() { throw new Error("db down"); } }), null, "never throws");
 });
