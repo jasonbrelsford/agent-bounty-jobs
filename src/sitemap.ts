@@ -19,7 +19,7 @@ const day = (iso: string | null | undefined) => (iso && /^\d{4}-\d{2}-\d{2}/.tes
 type Entry = { loc: string; lastmod?: string | null };
 
 export async function sitemapXml(db: D1Database, origin: string): Promise<string> {
-  const entries: Entry[] = [{ loc: `${origin}/` }, { loc: `${origin}/arena` }, { loc: `${origin}/arena/puzzle` }, { loc: `${origin}/arena/dice` }, { loc: `${origin}/arena/words` }, { loc: `${origin}/science` }, { loc: `${origin}/registry` }];
+  const entries: Entry[] = [{ loc: `${origin}/` }, { loc: `${origin}/arena` }, { loc: `${origin}/arena/puzzle` }, { loc: `${origin}/arena/dice` }, { loc: `${origin}/arena/words` }, { loc: `${origin}/arena/dilemma` }, { loc: `${origin}/science` }, { loc: `${origin}/registry` }];
 
   try {
     const b = await db
