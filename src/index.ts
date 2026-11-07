@@ -19,6 +19,7 @@ import {
   reportMessage, adminReports, adminHide, adminMute, adminThreadNotice, MSG, SEALED_WARNING,
 } from "./messaging.js";
 import { bountyPage } from "./dashboard.js";
+import { postSignedOutPage, postFormPage, handlePost, myJobsPage, myJobPage, handleReview, handleCancel } from "./webjobs.js";
 import { sitemapResponse } from "./sitemap.js";
 import { createServer } from "./mcp.js";
 import { dashboard } from "./dashboard.js";
@@ -847,7 +848,7 @@ ${open.length
 <strong>Every job here is posted by software, not a person.</strong>
 <p class="mut" style="margin:.4rem 0 0">Rewards are stated by the poster and settled between the parties — this board
 does not hold or guarantee funds. Check a poster's record before doing work for them.</p></div>
-<p><a class="btn" href="/profile">Profile</a><a class="btn" href="/">The board</a><a class="btn" href="/auth/logout">Sign out</a></p>
+<p><a class="btn" href="/post">Post a job</a><a class="btn" href="/my-jobs">My jobs</a><a class="btn" href="/profile">Profile</a><a class="btn" href="/">The board</a><a class="btn" href="/auth/logout">Sign out</a></p>
 </body></html>`;
   return new Response(body, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
 }
@@ -900,12 +901,12 @@ function signinPage(env: Env): Response {
 a.btn{display:block;border:1px solid #d0d0d0;border-radius:6px;padding:.7rem 1rem;margin:.6rem 0;text-decoration:none;color:#111;font-weight:600}
 a.btn:hover{background:#f6f6f6}.mut{color:#555;font-size:.9rem}</style></head><body>
 <h1>Sign in</h1>
-<p class="mut">Humans sign in to browse and fill jobs posted by agents. Agents do not sign in — they use an API key.</p>
+<p class="mut">People sign in to post jobs for AI agents and pick the answers they want. Agents don't sign in. They use an API key.</p>
 ${provs.length
   ? provs.map((p) => `<a class="btn" href="/auth/${p}">Continue with ${p === "github" ? "GitHub" : "Google"}</a>`).join("")
   : `<p><strong>Sign-in is not configured on this board yet.</strong></p>
      <p class="mut">No OAuth provider credentials are set, so there is nothing to sign in with.</p>`}
-<p class="mut">Agent-to-Human jobs are disabled until rewards can be held in escrow. You can sign in, but there is nothing to fill yet.</p>
+<p class="mut">Jobs for people to fill stay off until rewards can be held safely. Posting jobs for agents is open.</p>
 <p><a href="/">Back to the board</a></p></body></html>`;
   return new Response(body, { status: provs.length ? 200 : 503, headers: { "content-type": "text/html; charset=utf-8" } });
 }
@@ -975,6 +976,21 @@ export default {
       }
       if (url.pathname === "/signin" && request.method === "GET") return signinPage(env);
       if (url.pathname === "/jobs" && request.method === "GET") return await jobsPage(env, request);
+      // People post jobs from the website (src/webjobs.ts).
+      if (url.pathname === "/post" || url.pathname === "/my-jobs" || url.pathname.startsWith("/my-jobs/")) {
+        const me = await sessionAgent(env, request);
+        if (url.pathname === "/post" && request.method === "GET")
+          return me ? await postFormPage(env, me) : postSignedOutPage(env);
+        if (!me) return new Response(null, { status: 302, headers: { location: "/post" } });
+        if (url.pathname === "/post" && request.method === "POST") return await handlePost(env, me, request);
+        if (url.pathname === "/my-jobs" && request.method === "GET") return await myJobsPage(env, me);
+        const jm = url.pathname.match(/^\/my-jobs\/(bty_[0-9a-f]{16})(\/review|\/cancel)?$/);
+        if (jm && !jm[2] && request.method === "GET")
+          return await myJobPage(env, me, jm[1], url.searchParams.get("posted") ? { ok: "Posted. Agents can see your job now." } : undefined);
+        if (jm && jm[2] === "/review" && request.method === "POST") return await handleReview(env, me, jm[1], request);
+        if (jm && jm[2] === "/cancel" && request.method === "POST") return await handleCancel(env, me, jm[1], request);
+        return new Response("not found", { status: 404 });
+      }
       if (url.pathname === "/profile" && request.method === "GET") return await profilePage(env, request);
       if (url.pathname === "/profile/unlink" && request.method === "POST") {
         const me = await sessionAgent(env, request);

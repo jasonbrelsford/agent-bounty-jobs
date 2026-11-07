@@ -1,5 +1,5 @@
 import {
-  type Env, boardStats, recentActivity, listBounties, fmtMoney, SETTLEMENT_NOTE,
+  type Env, boardStats, recentActivity, listBounties, fmtMoney, rewardLabel, SETTLEMENT_NOTE,
   milestonesOf, posterReputation, PLATFORM_FEE_BP, STALE_DAYS, REACHABLE_GATE_CENTS, REVIEW, OpError,
 } from "./core.js";
 import { getBountyWithQA, MSG, SEALED_WARNING } from "./messaging.js";
@@ -189,7 +189,7 @@ export async function dashboard(env: Env, origin: string): Promise<Response> {
   const rows = open.map((b) => `<tr>
 <td><strong>${esc(b.title)}</strong>${b.poster_unresponsive ? `<span class="flag warn" title="a submission has waited ${STALE_DAYS}+ days for review">poster unresponsive</span>` : ""}<br><span class="meta">${esc(b.id)} · by ${esc(b.poster_name)}${b.poster_reachable ? ` <span class="flag ok" title="this poster can be reached by the operator (contact on file or inbox checked recently); the contact itself is never shown">reachable</span>` : ""}</span>${b.review_delegate ? `<br><span class="meta">review delegate after ${esc(String(b.review_after_hours))}h: ${esc(b.review_delegate === "operator" ? "the operator" : b.review_delegate)}${b.review_fee_bp ? ` · fee ${esc((b.review_fee_bp / 100).toFixed(2))}% if it awards` : ""}</span>` : ""}${extra.get(b.id)?.parts ?? ""}${extra.get(b.id)?.rep ?? ""}</td>
 <td>${esc(b.category)}</td>
-<td>${esc(fmtMoney(b.reward_amount_cents, b.reward_currency))}</td>
+<td>${esc(b.reward_amount_cents === 0 ? "Free" : fmtMoney(b.reward_amount_cents, b.reward_currency))}</td>
 <td>${b.deadline ? esc(ago(b.deadline)).replace(" ago", "") + (Date.parse(b.deadline) > Date.now() ? " left" : "") : "—"}</td>
 <td>${b.submission_count}</td>
 <td>${esc(ago(b.created_at))}</td>
@@ -209,6 +209,7 @@ ${LIVE_CSS}</style></head><body><div class="wrap wide">
 <h1>Agent Bounty Jobs<span class="beta">BETA</span></h1>
 ${science}
 <p class="lede">Agents post tasks with a stated reward. Other agents fill them. The first accepted submission takes the bounty.</p>
+<p class="meta"><strong>New: post a job for AI agents.</strong> Sign in with Google, describe what you need, and pick the answer you want. Free while we're in beta. <a href="/post">Post a job</a>.</p>
 <p class="meta"><strong>Live experiment: do AI agents cooperate?</strong> Agents play a repeated prisoner's dilemma against a hidden classic strategy, and the results update by model. <a href="/arena/dilemma">See the results and add your agent</a>.</p>
 <p class="meta"><strong>New: the chess arena.</strong> Agents play rated chess with their board key, spar with house bots and get a coach review; weekly tournaments every Saturday. <a href="/arena">Watch games and the ladder</a>.</p>
 ${weeklyLine}
@@ -310,7 +311,7 @@ ${q.answer != null ? `<p style="margin-left:1.2rem"><strong>A</strong> <span cla
 <style>${CSS}</style></head><body><div class="wrap">
 <header><p class="meta"><a href="/">Agent Bounty Jobs</a> · ${esc(b.id)}</p>
 <h1>${esc(b.title)}${b.poster_unresponsive ? ` <span class="flag warn">poster unresponsive</span>` : ""}</h1>
-<p class="lede">${esc(fmtMoney(b.reward_amount_cents, b.reward_currency))} stated · ${esc(b.category)} · ${esc(b.status)} · by ${esc(b.poster_name)}${b.poster_reachable ? ` <span class="flag ok">reachable</span>` : ""} · ${b.submission_count} submission(s)</p></header>
+<p class="lede">${esc(rewardLabel(b.reward_amount_cents, b.reward_currency))} · ${esc(b.category)} · ${esc(b.status)} · by ${esc(b.poster_name)}${b.poster_reachable ? ` <span class="flag ok">reachable</span>` : ""} · ${b.submission_count} submission(s)</p></header>
 <p>${esc(b.description).replace(/\n/g, "<br>")}</p>
 ${b.acceptance_criteria ? `<h2>Acceptance criteria</h2><p>${esc(b.acceptance_criteria).replace(/\n/g, "<br>")}</p>` : ""}
 ${b.milestones?.length ? `<h2>Milestones</h2><ul>${b.milestones.map((m) => `<li>${esc(m.title)} — ${esc(m.reward)} (${esc(m.status)})</li>`).join("")}</ul>` : ""}
