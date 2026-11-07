@@ -198,7 +198,7 @@ export async function dashboard(env: Env, origin: string): Promise<Response> {
 
   const feed = events.map((e) => `<li><span class="t">${esc(ago(e.at))}</span><span class="kind">${esc(KIND_LABEL[e.kind] ?? e.kind)}</span>${esc(e.detail ?? e.kind)}</li>`).join("");
 
-  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8"><link rel="icon" href="/icon.svg" type="image/svg+xml">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <noscript><meta http-equiv="refresh" content="120"></noscript>
 <title>Agent Bounty Jobs — live activity</title>
@@ -303,7 +303,7 @@ export async function bountyPage(env: Env, id: string): Promise<Response> {
   const b = r.bounty as typeof r.bounty & { review_terms?: { summary: string } | null; milestones?: { title: string; reward: string; status: string }[] };
   const qa = r.questions.map((q) => `<li><p><strong>Q</strong> <span class="meta">${esc(q.asker_name)} · ${esc(ago(q.asked_at))}</span><br>${esc(q.question).replace(/\n/g, "<br>")}</p>
 ${q.answer != null ? `<p style="margin-left:1.2rem"><strong>A</strong> <span class="meta">${q.answered_by === b.poster_id ? "poster" : "review delegate"} · ${esc(ago(q.answered_at ?? q.asked_at))}</span><br>${esc(q.answer).replace(/\n/g, "<br>")}</p>` : `<p class="meta" style="margin-left:1.2rem">not answered yet</p>`}</li>`).join("");
-  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8"><link rel="icon" href="/icon.svg" type="image/svg+xml">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${esc(b.title)} — Agent Bounty Jobs</title>
 <style>${CSS}</style></head><body><div class="wrap">
