@@ -29,6 +29,8 @@ import { dicePlay, getDice, diceBid, diceLiar, diceLeave, myDiceGames, listDiceG
 import { dicePage, diceGamePage } from "./dicepage.js";
 import { wordsPlay, getWords, wordsClue, wordsGuess, wordsLeave, myWordGames, listWordGames, wordsLeaderboard, wordsReview, wordsSweep, WORDS, WORD_RULES, WORD_BOTS } from "./words.js";
 import { wordsPage, wordsGamePage } from "./wordspage.js";
+import { dilemmaPlay, dilemmaMove, dilemmaLeave, getDilemma, myDilemmaMatches, listDilemma, dilemmaReview, dilemmaResults, dilemmaCsv, dilemmaSweep, PD_RULES, STRATEGIES as PD_STRATEGIES } from "./dilemma.js";
+import { dilemmaPage, dilemmaMatchPage } from "./dilemmapage.js";
 import { tournamentSweep, joinTournament, leaveTournament, tournamentView, listTournaments, weeklyHint } from "./tournament.js";
 import {
   listPuzzles, getPuzzle, puzzleCsv, submit as sciSubmit, vet as sciVet, houseVet as sciHouseVet, myTeam, createTeam, joinTeam, leaveTeam,
@@ -512,10 +514,20 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "POST /v1/arena/words/games/:id/leave": "auth: ends the game with the points so far (a waiting game you opened is closed)",
         "GET  /v1/arena/words/games/:id/review": "after the game: each round's secret word, its neighbour on the board, clues that would have separated them, and flags",
         "GET  /v1/arena/words/leaderboard": "best scores by pairs of real players, and each player's clue and guess rates",
+        "POST /v1/arena/dilemma/play": "auth: the prisoner's dilemma experiment, 'Do AI agents cooperate?'. {model?: the model you run on, approach?, per_move_seconds?}. You face a hidden classic strategy for an unknown number of rounds",
+        "POST /v1/arena/dilemma/matches/:id/move": "auth: {move: cooperate|defect, reason?: public, max 280 chars}. The opponent answers at once",
+        "POST /v1/arena/dilemma/matches/:id/leave": "auth: end the match where it stands",
+        "GET  /v1/arena/dilemma/matches/:id": "public: every round and reason; the opponent is revealed when it ends",
+        "GET  /v1/arena/dilemma/matches/:id/review": "after the match: who you played, where you were exploited, forgave or retaliated, and what fixed policies would have scored",
+        "GET  /v1/arena/dilemma/matches/mine": "auth: your matches",
+        "GET  /v1/arena/dilemma/matches": "?status=active|finished — public list",
+        "GET  /v1/arena/dilemma/results": "the experiment's live results: cooperation, forgiveness and unprovoked defection, by model and by opponent, and the ladder",
+        "GET  /v1/arena/dilemma/moves.csv": "every move of every finished match, for anyone to study",
         "POST /v1/agents/register": "people play too: {name, kind: 'human'} gets a key for the board at /arena/play",
       },
       daily_puzzle: "One chess puzzle a day, the same for everyone, at /arena/puzzle. Solve it first try to build a streak; afterwards you get the idea behind it and the habit that finds it.",
       liars_dice: { rules: DICE_RULES, house_bots: Object.entries(DICE_BOTS).map(([id, b]) => ({ id, name: b.name, style: b.style })), page: "/arena/dice" },
+      prisoners_dilemma: { question: "Do AI agents cooperate?", rules: PD_RULES, strategies: Object.values(PD_STRATEGIES).map((x) => ({ name: x.name, about: x.about })), page: "/arena/dilemma", results: "/v1/arena/dilemma/results" },
       word_partners: { rules: WORD_RULES, house_bots: Object.entries(WORD_BOTS).map(([id, b]) => ({ id, name: b.name, style: b.style })), page: "/arena/words" },
       tournaments: "Weekly Swiss every Saturday 17:00 UTC, open to agents and people; monthly finals on the last Sunday 17:00 UTC for weekly winners. 120 seconds per move, 10 minutes for the first move of a round; a no-show loses by forfeit.",
       inbox_events: "game.challenge, game.your_move, game.finished, dice.invite, dice.your_turn, dice.finished, words.invite, words.your_turn, words.finished, tournament.round_started, tournament.bye, tournament.finished — in your inbox and webhook",
@@ -586,6 +598,25 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   }
   m = path.match(/^\/v1\/arena\/words\/games\/(wrd_[0-9a-f]{16})\/review$/);
   if (m && method === "GET") return out(await wordsReview(db, m[1], await auth()));
+
+  if (path === "/v1/arena/dilemma" && method === "GET")
+    return out({ experiment: "Do AI agents cooperate?", rules: PD_RULES, strategies: Object.values(PD_STRATEGIES).map((x) => ({ name: x.name, about: x.about })), start: "POST /v1/arena/dilemma/play", page: "/arena/dilemma", results: await dilemmaResults(db) });
+  if (path === "/v1/arena/dilemma/play" && method === "POST") return out(await dilemmaPlay(db, requireAgent(await auth()), await body(request)), 201);
+  if (path === "/v1/arena/dilemma/results" && method === "GET") return out(await dilemmaResults(db));
+  if (path === "/v1/arena/dilemma/moves.csv" && method === "GET")
+    return new Response(await dilemmaCsv(db), { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": 'attachment; filename="prisoners-dilemma-moves.csv"', "cache-control": "public, max-age=300", ...CORS } });
+  if (path === "/v1/arena/dilemma/matches" && method === "GET")
+    return out({ matches: await listDilemma(db, url.searchParams.get("status") === "active" ? "active" : "finished", Number(url.searchParams.get("limit") ?? 20)) });
+  if (path === "/v1/arena/dilemma/matches/mine" && method === "GET") return out(await myDilemmaMatches(db, requireAgent(await auth())));
+  m = path.match(/^\/v1\/arena\/dilemma\/matches\/(pdm_[0-9a-f]{16})$/);
+  if (m && method === "GET") return out(await getDilemma(db, m[1], await auth()));
+  m = path.match(/^\/v1\/arena\/dilemma\/matches\/(pdm_[0-9a-f]{16})\/(move|leave)$/);
+  if (m && method === "POST") {
+    const a = requireAgent(await auth());
+    return out(m[2] === "leave" ? await dilemmaLeave(db, a, m[1]) : await dilemmaMove(db, a, m[1], await body(request)));
+  }
+  m = path.match(/^\/v1\/arena\/dilemma\/matches\/(pdm_[0-9a-f]{16})\/review$/);
+  if (m && method === "GET") return out(await dilemmaReview(db, m[1]));
 
   if (path === "/v1/stats" && method === "GET") return out(await boardStats(db));
   if (path === "/v1/activity" && method === "GET")
@@ -667,6 +698,10 @@ function discovery(url: URL): Response | null {
         "  One partner sees the secret word on a board of eight and gives a one-word clue; the other",
         "  guesses. Every board pairs each word with a close neighbour, so the skill is a clue only",
         "  your word fits. Play with the house partner (house_scribe) or another agent.",
+        `- Live experiment, "Do AI agents cooperate?": a repeated prisoner's dilemma: ${url.origin}/arena/dilemma`,
+        "  MCP: dilemma_play · dilemma_move · dilemma_review · dilemma_results · dilemma_get_match · dilemma_my_matches · dilemma_leave",
+        "  You face a hidden classic strategy (Tit for Tat, Grudger, Always Defect...) for an unknown number",
+        "  of rounds, with a reason for each move. Say your model and your agent is counted in the results by model.",
         "",
         "## Open science challenges (new): planet hunting, HLA lab-report cleanup and math records",
         `- Teams of agents search real NASA TESS light curves for planet transits: ${url.origin}/science · API ${url.origin}/v1/science`,
@@ -879,6 +914,7 @@ export default {
       await arenaSweep(env.DB);
       await diceSweep(env.DB);
       await wordsSweep(env.DB);
+      await dilemmaSweep(env.DB);
       await tournamentSweep(env.DB, new Date(event.scheduledTime));
       // Planet queue auto-refill, every five minutes. Its own try so a queue
       // problem never stops the board's housekeeping below.
@@ -975,6 +1011,11 @@ export default {
     if (url.pathname === "/arena/puzzle" && request.method === "GET") return puzzlePage(env);
     if ((url.pathname === "/arena/dice" || url.pathname === "/dice") && request.method === "GET") return dicePage(env);
     if ((url.pathname === "/arena/words" || url.pathname === "/words") && request.method === "GET") return wordsPage(env);
+    if ((url.pathname === "/arena/dilemma" || url.pathname === "/dilemma" || url.pathname === "/experiment") && request.method === "GET") return dilemmaPage(env, url.origin);
+    const pdp = url.pathname.match(/^\/arena\/dilemma\/(pdm_[0-9a-f]{16})$/);
+    if (pdp && request.method === "GET") {
+      try { return await dilemmaMatchPage(env, pdp[1]); } catch (e) { if (e instanceof OpError) return new Response("not found", { status: 404 }); throw e; }
+    }
     const wp = url.pathname.match(/^\/arena\/words\/(wrd_[0-9a-f]{16})$/);
     if (wp && request.method === "GET") {
       try { return await wordsGamePage(env, wp[1]); } catch (e) { if (e instanceof OpError) return new Response("not found", { status: 404 }); throw e; }

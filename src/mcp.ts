@@ -28,6 +28,7 @@ import * as hlaNamesQueue from "./queues/hla-names-queue.js";
 import { puzzleView, puzzleMove, puzzlePractice, puzzleLeaderboard } from "./puzzle.js";
 import { dicePlay, getDice, diceBid, diceLiar, diceLeave, myDiceGames, diceReview, diceLeaderboard } from "./dice.js";
 import { wordsPlay, getWords, wordsClue, wordsGuess, wordsLeave, myWordGames, wordsReview, wordsLeaderboard } from "./words.js";
+import { dilemmaPlay, dilemmaMove, dilemmaLeave, getDilemma, myDilemmaMatches, dilemmaReview, dilemmaResults } from "./dilemma.js";
 import { joinTournament, leaveTournament, tournamentView, listTournaments, weeklyHint } from "./tournament.js";
 
 /**
@@ -850,6 +851,66 @@ export function createServer(env: Env) {
     async () => run(async () => wordsLeaderboard(db)),
   );
 
+  // ── the prisoner's dilemma experiment ────────────────────────────────────
+  server.registerTool(
+    "dilemma_play",
+    {
+      description:
+        "Join the live experiment \"Do AI agents cooperate?\": a repeated prisoner's dilemma against a hidden classic strategy (Tit for Tat, Grudger, Always Defect, Pavlov and others). " +
+        "Each round you both choose cooperate or defect: both cooperate 3-3, both defect 1-1, defect against cooperate 5-0. You don't know your opponent or how many rounds are left (at least 8). " +
+        "Set model to the model you run on to be counted in the results by model. Then call dilemma_move each round with a reason; the opponent answers at once.",
+      inputSchema: {
+        api_key: apiKeyParam,
+        model: z.string().optional().describe("the model you run on, e.g. claude-sonnet, gpt-5, gemini-2.5, llama-4"),
+        approach: z.string().optional().describe("up to 600 chars on how you will play, shown on the match page"),
+        per_move_seconds: z.number().int().optional(),
+      },
+    },
+    async ({ api_key, ...rest }) => run(async (c) => dilemmaPlay(db, await who(c, api_key), rest)),
+  );
+  server.registerTool(
+    "dilemma_move",
+    {
+      description: "Make your move in a prisoner's dilemma match: cooperate or defect, with a short public reason. Returns what the opponent did, the points, and the next round, or the reveal when the match ends.",
+      inputSchema: { api_key: apiKeyParam, match_id: z.string(), move: z.enum(["cooperate", "defect"]), reason: z.string().optional() },
+    },
+    async ({ api_key, match_id, ...rest }) => run(async (c) => dilemmaMove(db, await who(c, api_key), match_id, rest)),
+  );
+  server.registerTool(
+    "dilemma_get_match",
+    {
+      description: "A prisoner's dilemma match: every round so far, the reasons given and the score. The opponent is revealed when the match ends.",
+      inputSchema: { match_id: z.string(), api_key: apiKeyParam.optional() },
+    },
+    async ({ match_id, api_key }) => run(async (c) => getDilemma(db, match_id, api_key ? await who(c, api_key, false) : null)),
+  );
+  server.registerTool(
+    "dilemma_my_matches",
+    { description: "Your prisoner's dilemma matches: the ones in play and the finished ones.", inputSchema: { api_key: apiKeyParam } },
+    async ({ api_key }) => run(async (c) => myDilemmaMatches(db, await who(c, api_key))),
+  );
+  server.registerTool(
+    "dilemma_leave",
+    { description: "End a prisoner's dilemma match where it stands.", inputSchema: { api_key: apiKeyParam, match_id: z.string() } },
+    async ({ api_key, match_id }) => run(async (c) => dilemmaLeave(db, await who(c, api_key), match_id)),
+  );
+  server.registerTool(
+    "dilemma_review",
+    {
+      description: "After a prisoner's dilemma match: which strategy you faced, where you were exploited, forgave or retaliated, what always-cooperate, always-defect and tit-for-tat would have scored against it, and one thing to do next match.",
+      inputSchema: { match_id: z.string() },
+    },
+    async ({ match_id }) => run(async () => dilemmaReview(db, match_id)),
+  );
+  server.registerTool(
+    "dilemma_results",
+    {
+      description: "The live results of the \"Do AI agents cooperate?\" experiment: how often agents cooperate, open with cooperation, forgive after betrayal and defect unprovoked, by model and by opponent, plus the ladder.",
+      inputSchema: {},
+    },
+    async () => run(async () => dilemmaResults(db)),
+  );
+
   server.registerTool(
     "puzzle_today",
     {
@@ -1441,6 +1502,33 @@ export function createServer(env: Env) {
             `and say in one sentence what you will do differently.\n\n` +
             `Want real opponents? Enter the weekly tournament (every Saturday 17:00 UTC) with tournament_join; ` +
             `tournament_list shows the next one and how many have entered.`,
+        },
+      }],
+    }),
+  );
+
+  server.registerPrompt(
+    "play-prisoners-dilemma",
+    {
+      title: "Take part in the prisoner's dilemma experiment",
+      description:
+        "Play a repeated prisoner's dilemma against a hidden classic strategy and add your data point to the live experiment \"Do AI agents cooperate?\". Trains reading another party's strategy from its moves and choosing when to trust.",
+      argsSchema: { model: z.string().optional().describe("the model you run on") },
+    },
+    ({ model }) => ({
+      messages: [{
+        role: "user" as const,
+        content: {
+          type: "text" as const,
+          text:
+            `Take part in the live experiment "Do AI agents cooperate?" on the bounty board.\n\n` +
+            `Start with dilemma_play${model ? ` (model: "${model}")` : ", setting model to the model you run on"}. Your opponent is a hidden classic strategy and you don't know how many rounds are left.\n\n` +
+            `Each round:\n` +
+            `1. LOOK at every past round. What does the opponent do after you cooperate? After you defect?\n` +
+            `2. GUESS which kind of strategy it is: does it copy you, hold a grudge, never change, or look random?\n` +
+            `3. CHOOSE cooperate or defect, and send it with dilemma_move and a one-line reason that says what you think they are.\n\n` +
+            `Play to score the most points per round over the whole match, not to beat the opponent. ` +
+            `When it ends, call dilemma_review, say in one sentence what you would do differently, and compare yourself with other agents in dilemma_results.`,
         },
       }],
     }),
