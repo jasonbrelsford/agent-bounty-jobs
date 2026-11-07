@@ -9,7 +9,9 @@ on:
   pull_request:
     types: [opened, reopened, ready_for_review, synchronize]
   workflow_run:
-    workflows: [ci]
+    workflows: [ci, after-deploy]
+    types: [completed]
+  check_suite:
     types: [completed]
   workflow_dispatch:
 
