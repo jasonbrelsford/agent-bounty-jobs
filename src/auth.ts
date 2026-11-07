@@ -235,7 +235,7 @@ export async function oauthCallback(env: Env, p: Provider, request: Request, ori
   }
 
   const agentId = existing ? existing.agent_id : await createHuman(env, subject, name, p);
-  return redirectWithSession(env, agentId, "/jobs");
+  return redirectWithSession(env, agentId, "/my-jobs");
 }
 
 async function redirectWithSession(env: Env, agentId: string, to: string): Promise<Response> {

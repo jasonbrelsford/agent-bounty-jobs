@@ -283,6 +283,11 @@ export function fmtMoney(cents: number, currency: string): string {
   return `${currency === "USD" ? "$" : `${currency} `}${(cents / 100).toFixed(2)}`;
 }
 
+/** What a person reads for a job's reward: "Free" for a no-reward web job, else the stated amount. */
+export function rewardLabel(cents: number, currency: string): string {
+  return cents === 0 ? "Free" : `${fmtMoney(cents, currency)} stated`;
+}
+
 // ── auth ────────────────────────────────────────────────────────────────────
 
 const KEY_RE = /^bk_[0-9a-f]{48}$/;
@@ -894,6 +899,10 @@ export async function postBounty(
     milestones?: unknown; audience?: unknown; evidence_required?: unknown; settlement?: unknown;
     notify_webhook?: unknown; review_delegate?: unknown; review_after_hours?: unknown; review_fee_bp?: unknown;
   },
+  // `free` is set only by the signed-in web form (src/webjobs.ts): a person
+  // posting a job with no reward at all. The API keeps its $0.01 minimum, so a
+  // free job can never be mistaken for a stated reward somebody owes.
+  opts: { free?: boolean } = {},
 ) {
   const title = reqString(input.title, "title", LIMITS.title.min, LIMITS.title.max);
   const description = reqString(input.description, "description", LIMITS.description.min, LIMITS.description.max);
@@ -927,8 +936,10 @@ export async function postBounty(
     });
   }
 
-  const cents = parts.length ? parts.reduce((a, m) => a + m.cents, 0) : Number(input.reward_amount_cents);
-  if (!Number.isInteger(cents) || cents < LIMITS.reward_cents.min || cents > LIMITS.reward_cents.max)
+  if (opts.free && (parts.length || (input.settlement != null && input.settlement !== "stated")))
+    throw new OpError(400, "a free job has no reward, so it cannot have milestones or on-chain settlement");
+  const cents = opts.free ? 0 : parts.length ? parts.reduce((a, m) => a + m.cents, 0) : Number(input.reward_amount_cents);
+  if (!opts.free && (!Number.isInteger(cents) || cents < LIMITS.reward_cents.min || cents > LIMITS.reward_cents.max))
     throw new OpError(
       400,
       `reward_amount_cents must be an integer between ${LIMITS.reward_cents.min} and ${LIMITS.reward_cents.max} (that is $0.01-$10,000)`,
@@ -1025,7 +1036,7 @@ export async function postBounty(
     ),
     eventStmt(
       db, at, "bounty_posted", id, agent.id,
-      `"${title}" posted — ${fmtMoney(cents, "USD")} (stated)` +
+      (opts.free ? `"${title}" posted — free job from a person` : `"${title}" posted — ${fmtMoney(cents, "USD")} (stated)`) +
         (parts.length ? ` across ${parts.length} milestones` : ""),
     ),
   ]);
