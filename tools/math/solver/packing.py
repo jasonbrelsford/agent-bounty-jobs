@@ -61,18 +61,30 @@ def exact_ok(circles):
 
 
 def exactify(v, n):
-    """Decimal strings that pass the exact check, losing as little total radius as possible."""
-    x, y, r = v[:n], v[n:2 * n], v[2 * n:]
-    q = Decimal(10) ** -20
-    for eps in [Decimal("1e-15"), Decimal("1e-14"), Decimal("1e-13"), Decimal("1e-12"), Decimal("1e-11"), Decimal("1e-10")]:
-        circles = []
+    """Decimal strings that pass the exact check, shrinking each radius only by the overlap it
+    actually has (computed in 50-digit decimals), so the total loses as little as possible."""
+    q = Decimal(10) ** -30
+    X = [Decimal(repr(float(t))).quantize(q) for t in v[:n]]
+    Y = [Decimal(repr(float(t))).quantize(q) for t in v[n:2 * n]]
+    R = [Decimal(repr(float(t))).quantize(q) for t in v[2 * n:]]
+    tiny = Decimal(10) ** -28
+    for _ in range(50):
         for i in range(n):
-            xi, yi = Decimal(repr(float(x[i]))).quantize(q), Decimal(repr(float(y[i]))).quantize(q)
-            ri = (Decimal(repr(float(r[i]))) - eps).quantize(q)
-            ri = min(ri, xi, 1 - xi, yi, 1 - yi)
-            circles.append([str(xi), str(yi), str(ri)])
+            R[i] = min(R[i], X[i], 1 - X[i], Y[i], 1 - Y[i])
+        changed = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = ((X[i] - X[j]) ** 2 + (Y[i] - Y[j]) ** 2).sqrt()
+                over = R[i] + R[j] - d
+                if over > 0:
+                    cut = over / 2 + tiny
+                    R[i] -= cut; R[j] -= cut; changed = True
+        R = [r.quantize(q, rounding="ROUND_FLOOR") for r in R]
+        circles = [[str(X[i]), str(Y[i]), str(R[i])] for i in range(n)]
+        if not changed and exact_ok(circles):
+            return circles, sum(R)
         if exact_ok(circles):
-            return circles, sum(Decimal(c[2]) for c in circles)
+            return circles, sum(R)
     return None, Decimal(0)
 
 
@@ -101,7 +113,7 @@ def main():
         if bv is None or rng.random() < 0.25:
             v = np.r_[rng.random(2 * n), np.full(n, 0.02)]
         else:
-            v = bv.copy(); k = int(rng.integers(1, 4)); idx = rng.choice(n, k, replace=False)
+            v = bv.copy(); k = int(rng.integers(1, min(4, n + 1))); idx = rng.choice(n, k, replace=False)
             v[idx] = rng.random(k); v[n + idx] = rng.random(k); v[2 * n + idx] = 0.01
             v[:2 * n] += rng.normal(0, 0.01 * rng.random(), 2 * n); v = np.clip(v, 0, 1)
         s, x = run(v)
