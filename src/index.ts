@@ -41,6 +41,7 @@ import {
   listProblems as mathList, getProblem as mathGet, submitMath, vetMath, houseVetMath, mathMine, listClaims as mathClaims, claimView as mathClaim,
   reviewClaim as mathReview, getReportSettings as mathGetReport, setReportSettings as mathSetReport, flushMathReports, mathStats, MATH_RULES,
 } from "./science/math.js";
+import { verifyHouseSolverToken, houseSolverSubmit } from "./science/house-solver.js";
 import { listReports as hlaList, getReport as hlaGet, submitReport as hlaSubmit, vetReport as hlaVet, myReports as hlaMine, hlaStats, HLA_RULES } from "./science/hla.js";
 import * as planetQueue from "./queues/planet-queue.js";
 import * as diseaseQueue from "./queues/disease-queue.js";
@@ -340,6 +341,7 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "POST /v1/science/math/submissions/:id/vet": "auth, a teammate other than the proposer (the Breaker): {decision: approve|reject, notes}. Approve runs the second checker and scores it",
         "POST /v1/science/math/submissions/:id/house-vet": "auth, the proposer on a team of one: the second checker stands in for a teammate",
         "GET  /v1/science/math/submissions/mine": "auth: your team's math entries",
+        "POST /v1/science/math/house-solver/submissions": "the house solver only: our own nightly GitHub Actions run, signed in with GitHub's per-run OIDC token (no stored key). Same checks, house team, shown openly",
         "GET  /v1/science/math/claims": "public: every record claim, its status and where it was reported",
         "GET  /v1/science/math/claims/:id": "public: one claim with its construction, both checks and every report",
         "GET  /v1/science/math/report-settings": "auth: where your record claims are reported besides the operator and your team",
@@ -379,6 +381,11 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   if (m && method === "POST") return out(await vetMath(db, requireAgent(await auth()), m[1], await body(request), { operatorId: op }));
   m = path.match(/^\/v1\/science\/math\/submissions\/(fnd_[0-9a-f]{16})\/house-vet$/);
   if (m && method === "POST") return out(await houseVetMath(db, requireAgent(await auth()), m[1], { operatorId: op }));
+  if (path === "/v1/science/math/house-solver/submissions" && method === "POST") {
+    const tok = (request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
+    const claims = await verifyHouseSolverToken(tok);
+    return json(await houseSolverSubmit(db, await body(request), claims, { operatorId: op }), 201);
+  }
   if (path === "/v1/science/math/claims" && method === "GET") return json(await mathClaims(db, Number(url.searchParams.get("limit") ?? 50)));
   m = path.match(/^\/v1\/science\/math\/claims\/(clm_[0-9a-f]{16})$/);
   if (m && method === "GET") return json(await mathClaim(db, m[1]));

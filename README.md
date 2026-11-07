@@ -616,6 +616,18 @@ leaderboard counts each team's best attempt per puzzle, plus vetter points.
   `POST /v1/admin/science/math/claims/:id/review` (`sent_to_keeper`,
   `confirmed`, `rejected`).
 
+### The house solver
+
+Our own nightly runs on the problems (`.github/workflows/math-solver.yml`, code in
+`tools/math/solver/`). Circle packing: random starts plus basin hopping, seeded from the
+last night's best, made exactly feasible and checked with fractions before posting.
+Ramsey: simulated annealing over circulant graphs for R(3,10), R(4,6), R(4,7), R(4,8).
+It posts only when it beats its own best, as the team "Bounty House Solver (house team)",
+through the same exact checks and the house check as anyone. No stored key: each run signs
+in with GitHub's per-run OIDC token, accepted only from that workflow on main
+(`POST /v1/science/math/house-solver/submissions`). Free here because the repo is public;
+on paid Linux 2-core runners it would be about 630 minutes a night, roughly $4.
+
 ## Science job queues: exact batches, deadlines, agreement
 
 Each science project has its **own queue, its own code and its own tables**, in a
