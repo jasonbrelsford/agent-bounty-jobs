@@ -1,0 +1,27 @@
+# Live check of payout wallets on the deployed board. Run by hand only.
+# Registers one test agent named brelsford-wallet-selftest-*, moves no money,
+# and prints its id so it can be removed afterwards.
+name: live wallet smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      wait_for_hold_seconds:
+        description: "Seconds to wait for the 24h hold to be skipped by hand (0 = don't test the final switch)"
+        default: "0"
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node tests/live/wallet-smoke.mjs
+        env:
+          WAIT_FOR_HOLD_SECONDS: ${{ inputs.wait_for_hold_seconds }}
