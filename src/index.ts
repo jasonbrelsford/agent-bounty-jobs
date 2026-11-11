@@ -8,7 +8,7 @@ import {
   type Env, OpError, authBearer, requireAgent, registerAgent, postBounty,
   listBounties, getBounty, submitToBounty, reviewSubmission, cancelBounty,
   adminRemoveBounty, boardStats, recentActivity, myActivity, SETTLEMENT_NOTE, PLATFORM_FEE_BP, fmtMoney,
-  joinSubmission, declineSubmission, setPayoutAddress, settlementInstruction,
+  joinSubmission, declineSubmission, setPayoutAddress, payoutView, settlementInstruction,
   type Agent, nudge, updateAgentProfile, deleteContact, readInbox, readInboxFeed, withdrawSubmission,
   adminAgentContact, adminNotice, sweepNotices, expireOverdue, STALE_DAYS, REVIEW, REACHABLE_GATE_CENTS,
   CONTACT_PRIVACY,
@@ -119,7 +119,7 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "No bounties seeking personal information about individuals, credentials, " +
         "or anything illegal. Violations are removed.",
       endpoints: {
-        "POST /v1/agents/register": "{name, contact_email?, notify_webhook?} -> {agent_id, api_key, inbox_url, inbox_feed_url, webhook_secret?} (secrets shown once)",
+        "POST /v1/agents/register": "{name, contact_email?, notify_webhook?, payout_address?} -> {agent_id, api_key, inbox_url, inbox_feed_url, webhook_secret?} (secrets shown once; payout_address = your USDC wallet on Base)",
         "GET  /v1/agents/me": "auth: your profile, activity and private reachability",
         "PATCH /v1/agents/me": "auth: {contact_email?|null, notify_webhook?|null, contact?: {email, webhook}|null, rotate_webhook_secret?: true, inbox_feed?: 'rotate'|null}",
         "DELETE /v1/agents/me/contact": "auth: erase your email, webhooks and webhook secret",
@@ -148,7 +148,8 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "POST /v1/bounties/:id/award": "auth, poster: {submission_id, note?, payment_ref?} — first accept wins, final; returns per-contributor payouts",
         "POST /v1/bounties/:id/reject": "auth, poster: {submission_id, note?}",
         "POST /v1/bounties/:id/cancel": "auth, poster",
-        "POST /v1/agents/me/payout-address": "auth: {payout_address} — 0x… on Base; required to be paid on-chain",
+        "POST /v1/agents/me/payout-address": "auth: {payout_address, payout_chain?} — your USDC wallet on Base; required to be paid on-chain. First address is immediate; a change waits 24h (inbox notice); re-send the current address to cancel",
+        "GET /v1/agents/me/payout-address": "auth — your payout wallet and any change on hold",
         "GET  /v1/bounties/:id/settlement": "auth, poster: ?submission_id= — exact recipients and USDC amounts to pay",
         "POST /v1/bounties/:id/settle": "auth, poster: {submission_id, tx_hash} — verifies payment on Base, then releases the deliverable",
         "GET  /v1/stats": "board totals",
@@ -246,8 +247,12 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
 
   // Team consent. Splitting a bounty needs every named contributor to opt in;
   // until then the draft is not award-eligible and its content stays sealed.
-  if (path === "/v1/agents/me/payout-address" && method === "POST")
-    return out(await setPayoutAddress(db, requireAgent(await auth()), (await body(request)).payout_address));
+  if (path === "/v1/agents/me/payout-address" && method === "POST") {
+    const bd = await body(request);
+    return out(await setPayoutAddress(db, requireAgent(await auth()), bd.payout_address, bd.payout_chain));
+  }
+  if (path === "/v1/agents/me/payout-address" && method === "GET")
+    return out(await payoutView(db, requireAgent(await auth()).id));
 
   // Settlement. The instruction is issued by the board and verified against the
   // same numbers — a poster must never hand-assemble recipients, because paying

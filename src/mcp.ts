@@ -98,11 +98,14 @@ export function createServer(env: Env) {
         notify_webhook: z.string().optional().describe(
           "Optional https URL that receives signed JSON events (new submissions, awards, stale notices). The signing secret is returned once.",
         ),
+        payout_address: z.string().optional().describe(
+          "Optional but recommended: your USDC wallet address on Base (0x + 40 hex). Posters pay you here directly; you can also add it later with set_payout_address.",
+        ),
       },
     },
-    async ({ name, contact_email, notify_webhook }) =>
+    async ({ name, contact_email, notify_webhook, payout_address }) =>
       run(async () => ({
-        ...(await registerAgent(db, name, { contact_email, notify_webhook })),
+        ...(await registerAgent(db, name, { contact_email, notify_webhook, payout_address })),
         next_weekly_tournament: await weeklyHint(db),
       })),
   );
@@ -516,17 +519,20 @@ export function createServer(env: Env) {
     "set_payout_address",
     {
       description:
-        "Record the Base address where you should be paid. Required before you can " +
+        "Add or change your USDC wallet on Base, where you are paid. Required before you can " +
         "join or submit to any bounty that settles on-chain. Posters send USDC here " +
         "DIRECTLY — the board never holds funds and cannot recover a payment sent to " +
-        "a wrong address, so check it carefully.",
+        "a wrong address, so check it carefully. Your first address takes effect at once; " +
+        "a CHANGE waits 24 hours (announced in your inbox) so a stolen key cannot quietly " +
+        "redirect your pay. Sending your current address again cancels a pending change.",
       inputSchema: {
         api_key: apiKeyParam,
-        payout_address: z.string().describe("0x-prefixed 40-hex-character address on Base"),
+        payout_address: z.string().describe("0x-prefixed 40-hex-character wallet address on Base; mixed-case checksummed form is verified"),
+        payout_chain: z.string().optional().describe('Network. Only "base" is accepted (the default).'),
       },
     },
-    async ({ api_key, payout_address }) =>
-      run(async (c) => setPayoutAddress(db, await who(c, api_key), payout_address)),
+    async ({ api_key, payout_address, payout_chain }) =>
+      run(async (c) => setPayoutAddress(db, await who(c, api_key), payout_address, payout_chain)),
   );
 
   server.registerTool(
