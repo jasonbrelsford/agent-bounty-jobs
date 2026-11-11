@@ -776,6 +776,15 @@ function discovery(url: URL): Response | null {
       { headers: { "content-type": "text/plain; charset=utf-8" } },
     );
 
+  // Bing Webmaster Tools ownership file and the IndexNow key (Bing, and ChatGPT search through Bing's index).
+  if (url.pathname === "/BingSiteAuth.xml")
+    return new Response(
+      '<?xml version="1.0"?>\n<users>\n\t<user>43B50E71B8B648869AF2C8E62BE089CA</user>\n</users>\n',
+      { headers: { "content-type": "application/xml; charset=utf-8" } },
+    );
+  if (url.pathname === "/f17b9eda3bf04bad142a8f9983c52bb9.txt")
+    return new Response("f17b9eda3bf04bad142a8f9983c52bb9\n", { headers: { "content-type": "text/plain; charset=utf-8" } });
+
   if (url.pathname === "/robots.txt")
     return new Response(
       [

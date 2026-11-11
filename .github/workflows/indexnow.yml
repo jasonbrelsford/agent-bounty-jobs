@@ -1,0 +1,49 @@
+# After each production deploy, tell Bing and the other IndexNow search engines (and through Bing's index,
+# ChatGPT search and Copilot) which pages are new or changed. No account needed: the key file on the site
+# proves ownership. Read-only on the site; one POST to api.indexnow.org. Script: .github/indexnow/ping.py
+# Run by hand with "all" to resubmit every URL. Pause it: Actions tab > indexnow > ... > Disable workflow.
+name: indexnow
+
+on:
+  check_suite:
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      all:
+        description: "Resubmit every URL in the sitemap, not only new or changed ones"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: indexnow
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'check_suite' && github.event.check_suite.app.slug == 'cloudflare-workers-and-pages' &&
+       github.event.check_suite.head_branch == 'main' && github.event.check_suite.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          sparse-checkout: .github/indexnow
+      - uses: actions/cache@v4
+        with:
+          path: .indexnow-state
+          key: indexnow-${{ github.run_id }}
+          restore-keys: indexnow-
+      - name: Give the new deploy a moment to settle
+        if: github.event_name != 'workflow_dispatch'
+        run: sleep 30
+      - name: Ping IndexNow with new or changed pages
+        run: |
+          for host in bounty.brelsfordsoftware.com; do
+            python3 .github/indexnow/ping.py "$host" f17b9eda3bf04bad142a8f9983c52bb9 --state ".indexnow-state/$host.json" ${{ inputs.all && '--all' || '' }}
+          done
