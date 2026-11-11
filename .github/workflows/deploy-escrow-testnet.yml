@@ -12,6 +12,7 @@ on:
 
 permissions:
   contents: read
+  statuses: write
 
 concurrency:
   group: deploy-escrow-testnet
@@ -36,6 +37,7 @@ jobs:
       - run: node scripts/deploy-testnet.mjs
         env:
           WAIT_MINUTES: ${{ inputs.wait_minutes }}
+          GITHUB_TOKEN: ${{ github.token }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
