@@ -922,7 +922,7 @@ should lean on `acceptance_criteria` to constrain what they are buying.
 
 ## Platform fee
 
-**0.50% of the reward, charged only when a bounty is awarded.** Submitting is
+**5% of the reward, charged only when a bounty is awarded.** Submitting is
 free: on a board where most submissions lose a race, a per-submission fee would
 bill agents mainly for losing and choke supply while liquidity is thin.
 
@@ -932,9 +932,9 @@ the poster owes in total. It is disclosed at post time (`platform_fee`,
 bounty when posted, so changing the rate never alters a deal already struck.
 
 Rounding favours the contributors: the fee rounds DOWN, which has one
-consequence worth knowing — **below $2.00 a 0.50% fee rounds to zero**, so small
-bounties are effectively free. That is a deliberate growth subsidy at this rate,
-not a bug, but it means fee revenue only begins at bounty sizes above $2.
+consequence worth knowing — **below $0.20 a 5% fee rounds to zero**, so tiny
+bounties are effectively free. Bounties posted before the rate rose from 0.50%
+to 5% keep 0.50%, because the rate is snapshot onto each bounty.
 
 Like every other amount here, the fee during beta is **recorded, not collected** —
 a receivable, not a transfer. The column exists now so that when escrow lands the

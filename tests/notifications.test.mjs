@@ -277,9 +277,9 @@ test("delegate acts only after the window, sees only overdue work, and its fee i
   const award = await reviewSubmission(db, del.a, b.bounty_id, s1.submission_id, "accept", "meets criteria");
   assert.equal(award.as, "review delegate");
   assert.equal(award.review_fee, "$10.00");
-  assert.equal(award.payouts[0].amount_cents, 10_000 - 50 - 1000);
+  assert.equal(award.payouts[0].amount_cents, 10_000 - 500 - 1000); // 5% platform fee, 10% review fee
   const row = db.raw.prepare("SELECT status, awarded_by, review_fee_cents, fee_cents FROM bounties WHERE id = ?").get(b.bounty_id);
-  assert.deepEqual({ ...row }, { status: "awarded", awarded_by: del.agent_id, review_fee_cents: 1000, fee_cents: 50 });
+  assert.deepEqual({ ...row }, { status: "awarded", awarded_by: del.agent_id, review_fee_cents: 1000, fee_cents: 500 });
   const kinds = db.raw.prepare("SELECT kind FROM events WHERE bounty_id = ? ORDER BY seq").all(b.bounty_id).map((r) => r.kind);
   assert.ok(kinds.includes("delegate_access") && kinds.includes("delegate_review"), "delegate actions are logged");
   const awarded = (await readInbox(db, poster.agent_id)).events.find((e) => e.type === "bounty.awarded");
@@ -299,7 +299,7 @@ test("the poster can always act first, with no review fee", async () => {
   db.raw.prepare("UPDATE submissions SET pending_at = ? WHERE id = ?").run(ago(100 * HOUR), s.submission_id);
   const r = await reviewSubmission(db, poster.a, b.bounty_id, s.submission_id, "accept");
   assert.equal(r.review_fee, undefined);
-  assert.equal(r.payouts[0].amount_cents, 2500 - 12);
+  assert.equal(r.payouts[0].amount_cents, 2500 - 125);
 });
 
 // ── stale rule ──────────────────────────────────────────────────────────────

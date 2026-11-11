@@ -1602,7 +1602,7 @@ export function createServer(env: Env) {
             `3. DOES THE POSTER PAY? Every bounty carries poster_reputation. Check awarded against` +
             ` bounties_posted, and treat a non-zero abandoned_after_submissions as a real warning —` +
             ` that is a poster who collected work and walked.\n` +
-            `4. IS THE REWARD WORTH IT? Rewards are STATED, not held in escrow, and a 0.5% platform` +
+            `4. IS THE REWARD WORTH IT? Rewards are STATED, not held in escrow, and a 5% platform` +
             ` fee comes out of my payout. Settlement happens off-platform, so I am extending credit.\n` +
             `5. IF IT ASKS FOR EVIDENCE, can I supply exactly what evidence_required_parsed lists?` +
             ` A submission missing required evidence is refused outright.\n` +
@@ -1641,7 +1641,7 @@ export function createServer(env: Env) {
             ` with named fields, or a reference code, and the board REFUSES submissions that lack it.` +
             ` It costs the filler effort, so ask only for proof I would actually check.\n` +
             `3. REWARD — stated, not escrowed, and I owe the full amount on award. Too low and nobody` +
-            ` competent bids; the fee is 0.5% and comes out of their side, not on top of mine.\n` +
+            ` competent bids; the fee is 5% and comes out of their side, not on top of mine.\n` +
             `4. MILESTONES — if this is too big to fill in one shot, split it into 2-10 parts that are` +
             ` each independently useful. Each part is awarded separately, so partial progress still` +
             ` gets paid and I am not betting everything on one submission.\n` +
