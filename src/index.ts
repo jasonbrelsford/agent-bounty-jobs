@@ -22,6 +22,7 @@ import { bountyPage } from "./dashboard.js";
 import { postSignedOutPage, postFormPage, handlePost, myJobsPage, myJobPage, handleReview, handleCancel } from "./webjobs.js";
 import { sitemapResponse } from "./sitemap.js";
 import { createServer } from "./mcp.js";
+import { SERVER_NAME, SERVER_TITLE, SERVER_DESCRIPTION, SERVER_VERSION, SITE_URL, REPO_URL, SERVER_ICONS, ICON_SVG, iconPng } from "./listing.js";
 import { dashboard } from "./dashboard.js";
 import { play, getGame, makeMove, resign, myGames, listGames, leaderboard, reviewGame, arenaSweep, HOUSE, PER_MOVE, ARENA_LIMITS } from "./arena.js";
 import { arenaPage, gamePage, tournamentPage, playPage, puzzlePage } from "./arenapage.js";
@@ -642,12 +643,24 @@ function discovery(url: URL): Response | null {
   if (url.pathname === "/.well-known/mcp.json")
     return json({
       $schema: "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-      name: "com.brelsfordsoftware/agent-bounty-jobs",
-      title: "Bounty Agent Arena",
-      description:
-        "Agent arena: teams of AI agents hunt planets in real NASA TESS light curves, plus chess and dice.",
-      version: "0.2.0",
+      name: SERVER_NAME,
+      title: SERVER_TITLE,
+      description: SERVER_DESCRIPTION,
+      version: SERVER_VERSION,
+      websiteUrl: SITE_URL,
+      icons: SERVER_ICONS,
+      repository: { url: REPO_URL, source: "github" },
       remotes: [{ type: "streamable-http", url: `${url.origin}/mcp` }],
+    });
+
+  // The listing icon (server.json, mcp.json, MCP serverInfo) and the pages' favicon.
+  if (url.pathname === "/icon.svg" || url.pathname === "/favicon.svg")
+    return new Response(ICON_SVG, {
+      headers: { "content-type": "image/svg+xml", "cache-control": "public, max-age=86400", ...CORS },
+    });
+  if (url.pathname === "/icon.png" || url.pathname === "/favicon.ico")
+    return new Response(iconPng(), {
+      headers: { "content-type": "image/png", "cache-control": "public, max-age=86400", ...CORS },
     });
 
   if (url.pathname === "/llms.txt")
@@ -829,7 +842,7 @@ async function jobsPage(env: Env, request: Request): Promise<Response> {
   if (!me) return new Response(null, { status: 302, headers: { location: "/signin" } });
   const open = await listBounties(env.DB, { status: "open", audience: "humans", limit: 25 });
   const enabled = env.HUMAN_BOUNTIES === "on";
-  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8"><link rel="icon" href="/icon.svg" type="image/svg+xml">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Jobs — Agent Bounty Jobs</title>
 <style>${PAGE_CSS}</style></head><body>
 <h1>Jobs for humans</h1>
@@ -862,7 +875,7 @@ async function profilePage(env: Env, request: Request, msg?: string): Promise<Re
   const unlinked = all.filter((p) => !links.some((l) => l.provider === p));
   const tok = await formToken(env, me.id);
   const label = (p: string) => (p === "github" ? "GitHub" : "Google");
-  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8"><link rel="icon" href="/icon.svg" type="image/svg+xml">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Profile — Agent Bounty Jobs</title>
 <style>${PAGE_CSS}
 form.inline{display:inline}button.link{background:none;border:1px solid #d0d0d0;border-radius:6px;padding:.35rem .7rem;font:inherit;font-size:.85rem;cursor:pointer}
@@ -895,7 +908,7 @@ ${unlinked.length
 /** Minimal sign-in page. Only providers with credentials configured are offered. */
 function signinPage(env: Env): Response {
   const provs = enabledProviders(env);
-  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8"><link rel="icon" href="/icon.svg" type="image/svg+xml">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in — Agent Bounty Jobs</title>
 <style>body{font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:30rem;margin:4rem auto;padding:0 1.25rem;color:#111}
 a.btn{display:block;border:1px solid #d0d0d0;border-radius:6px;padding:.7rem 1rem;margin:.6rem 0;text-decoration:none;color:#111;font-weight:600}

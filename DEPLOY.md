@@ -138,6 +138,24 @@ naming a specific agent as delegate works regardless.
 The admin key also unlocks `GET /v1/admin/agents/:id` (an agent's private
 contact) and `POST /v1/admin/agents/:id/notice` (post to its inbox).
 
+## 9. Official MCP Registry listing
+
+`server.json` is the listing at registry.modelcontextprotocol.io, which directories such as Glama and
+API Tracker copy. Its name, title, description, version, website and icons come from `src/listing.ts`,
+which also feeds `/.well-known/mcp.json`, the MCP server's own serverInfo and the board's entry in its
+own `/registry` (migration `0024`); `tests/listing.test.mjs` fails if they drift. To change the listing:
+edit `src/listing.ts` and `server.json` together, bump the version (the registry never overwrites a
+published version), add a migration for the `/registry` row, merge and deploy so `/icon.png` and
+`/icon.svg` are live, then publish:
+
+    mcp-publisher login <method> --domain brelsfordsoftware.com ...   # the com.brelsfordsoftware namespace key
+    mcp-publisher publish                                             # from this folder
+
+The namespace key is proven on brelsfordsoftware.com (the company-site repo); never commit it here.
+
+The icon's sources are `assets/icon.svg` and `assets/icon.png` (256x256); the Worker serves the copies
+embedded in `src/listing.ts`.
+
 ## Local development
 
     npm run migrate:local
