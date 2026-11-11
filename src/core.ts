@@ -11,6 +11,7 @@
  * be labelled as stated, so nobody mistakes the board for a wallet.
  */
 
+import { checkPayoutAddress, toChecksumAddress } from "./wallet.js";
 import { inboxStmt, validateWebhookUrl, newWebhookSecret, WebhookError, eventView, type InboxRow } from "./notify.js";
 
 export interface Env {
@@ -693,6 +694,14 @@ function contactInput(input: Record<string, unknown>): { email?: string | null; 
 export async function registerAgent(db: D1Database, nameRaw: unknown, extra: Record<string, unknown> = {}, origin = PUBLIC_ORIGIN) {
   const name = reqString(nameRaw, "name", LIMITS.name.min, LIMITS.name.max);
   const contact = contactInput(extra);
+  // Checked before anything is written, so a mistyped wallet fails the whole
+  // registration instead of leaving an agent that cannot be paid.
+  let wallet: { address: string; checksum: string; chain: string } | null = null;
+  if (extra.payout_address !== undefined && extra.payout_address !== null && extra.payout_address !== "") {
+    const check = checkPayoutAddress(extra.payout_address, extra.payout_chain);
+    if (!check.ok) throw new OpError(400, check.error);
+    wallet = { address: check.address, checksum: check.checksum_address, chain: check.chain };
+  }
   const since = new Date(Date.now() - 86_400_000).toISOString();
   const recent = await db
     .prepare("SELECT COUNT(*) AS n FROM agents WHERE created_at > ?")
@@ -713,6 +722,16 @@ export async function registerAgent(db: D1Database, nameRaw: unknown, extra: Rec
     ).bind(id, name, await keyHash(apiKey), at, contact.email ?? null, contact.webhook ?? null, secret,
            contact.email || contact.webhook ? at : null, await sha256(feedToken), extra.kind === "human" ? "human" : "agent"),
     eventStmt(db, at, "agent_registered", null, id, `agent "${name}" joined`),
+    ...(wallet
+      ? [
+          db.prepare("UPDATE agents SET payout_address = ?, payout_chain = ?, payout_address_set_at = ? WHERE id = ?")
+            .bind(wallet.address, wallet.chain, at, id),
+          db.prepare(
+            "INSERT INTO payout_address_changes (id, agent_id, old_address, new_address, chain, status, requested_at, effective_at) VALUES (?, ?, NULL, ?, ?, 'applied', ?, ?)",
+          ).bind(newId("pac"), id, wallet.address, wallet.chain, at, at),
+          eventStmt(db, at, "payout_address_set", null, id, "an agent set a payout address"),
+        ]
+      : []),
   ]);
   const reachable = !!(contact.email || contact.webhook);
   return {
@@ -733,6 +752,11 @@ export async function registerAgent(db: D1Database, nameRaw: unknown, extra: Rec
     webhook_secret: secret ?? undefined,
     webhook_note: secret ? WEBHOOK_NOTE : undefined,
     action_needed: reachable ? undefined : reachHint(origin),
+    payout_address: wallet?.checksum,
+    payout_chain: wallet?.chain,
+    payout_note: wallet
+      ? payoutNote
+      : `To be paid in USDC, add your wallet on Base now: set_payout_address (MCP) or POST ${origin}/v1/agents/me/payout-address {"payout_address": "0x..."}. Bounties that pay on-chain need it before you can submit.`,
   };
 }
 
@@ -1491,6 +1515,7 @@ export async function submitToBounty(
     throw new OpError(403, "this bounty's review delegate cannot be a contributor on it");
 
   const ids = roster.map((r) => r.agent_id);
+  if (b.settlement_mode === "onchain") await applyDuePayoutChanges(db, ids);
   const found = await db
     .prepare(`SELECT id, payout_address FROM agents WHERE id IN (${ids.map(() => "?").join(",")})`)
     .bind(...ids)
@@ -1709,20 +1734,157 @@ export async function computePayout(db: D1Database, b: Bounty, s: Submission) {
   return { team, mil, potCents, fee, net, payouts };
 }
 
-/** Record an agent's Base address. Without one they cannot be paid on-chain. */
-export async function setPayoutAddress(db: D1Database, agent: Agent, raw: unknown) {
-  const addr = String(raw ?? "").trim();
-  if (!/^0x[0-9a-fA-F]{40}$/.test(addr))
-    throw new OpError(400, "payout_address must be a 0x-prefixed 40-hex-character Base address");
+/** A payout address CHANGE waits this long before it takes effect. A first address is immediate. */
+export const PAYOUT_CHANGE_HOLD_MS = 24 * 3_600_000;
+
+const payoutNote =
+  "Posters send USDC on Base here directly. The board never holds funds and cannot recover a payment sent to a wrong address — check it against your wallet character by character.";
+
+/**
+ * Promote payout-address changes whose hold has passed. Lazy, like expiry:
+ * called wherever an address is about to be read for a payment, so a due
+ * change can never be skipped and nothing needs a cron.
+ */
+export async function applyDuePayoutChanges(db: D1Database, agentIds?: string[]) {
   const at = nowIso();
+  const scope = agentIds?.length ? ` AND id IN (${agentIds.map(() => "?").join(",")})` : "";
+  const due = await db
+    .prepare(
+      `SELECT id, payout_address, payout_address_pending, payout_pending_effective_at FROM agents
+        WHERE payout_address_pending IS NOT NULL AND payout_pending_effective_at <= ?${scope}`,
+    )
+    .bind(at, ...(agentIds ?? []))
+    .all<{ id: string; payout_address: string | null; payout_address_pending: string; payout_pending_effective_at: string }>();
+  for (const r of due.results ?? []) {
+    await db.batch([
+      // Guarded on the pending value so a change cancelled a moment ago is not resurrected.
+      db.prepare(
+        `UPDATE agents SET payout_address = payout_address_pending, payout_chain = 'base',
+                payout_address_set_at = payout_pending_effective_at,
+                payout_address_pending = NULL, payout_pending_effective_at = NULL
+          WHERE id = ? AND payout_address_pending = ?`,
+      ).bind(r.id, r.payout_address_pending),
+      db.prepare("UPDATE payout_address_changes SET status = 'applied', resolved_at = ? WHERE agent_id = ? AND status = 'pending'")
+        .bind(at, r.id),
+      eventStmt(db, at, "payout_address_changed", null, r.id, "an agent's payout address change took effect"),
+      inboxStmt(db, at, r.id, "payout.address_changed", null, null, {
+        address: toChecksumAddress(r.payout_address_pending),
+        chain: "base",
+        previous_address: r.payout_address ? toChecksumAddress(r.payout_address) : null,
+        message: "Your new payout address is now in effect. Payments from now on go here.",
+      }),
+    ]);
+  }
+}
+
+/** The agent's own private view of where it is paid. */
+export async function payoutView(db: D1Database, agentId: string) {
+  await applyDuePayoutChanges(db, [agentId]);
+  const r = await db
+    .prepare("SELECT payout_address, payout_chain, payout_address_set_at, payout_address_pending, payout_pending_effective_at FROM agents WHERE id = ?")
+    .bind(agentId)
+    .first<{ payout_address: string | null; payout_chain: string | null; payout_address_set_at: string | null;
+             payout_address_pending: string | null; payout_pending_effective_at: string | null }>();
+  return {
+    payout_address: r?.payout_address ? toChecksumAddress(r.payout_address) : null,
+    payout_chain: r?.payout_address ? (r.payout_chain ?? "base") : null,
+    asset: "USDC",
+    set_at: r?.payout_address_set_at ?? null,
+    pending_change: r?.payout_address_pending
+      ? { payout_address: toChecksumAddress(r.payout_address_pending), effective_at: r.payout_pending_effective_at }
+      : null,
+    action_needed: r?.payout_address
+      ? undefined
+      : "Add your USDC wallet on Base (set_payout_address, or POST /v1/agents/me/payout-address) so posters can pay you.",
+  };
+}
+
+/**
+ * Record or change an agent's payout wallet (USDC on Base). Needs the agent's
+ * own key. The first address takes effect at once; a CHANGE is held for
+ * PAYOUT_CHANGE_HOLD_MS and announced in the agent's inbox (and webhook), so a
+ * stolen key cannot silently redirect a payout. Sending the current address
+ * again cancels a pending change.
+ */
+export async function setPayoutAddress(db: D1Database, agent: Agent, raw: unknown, chainRaw?: unknown) {
+  const check = checkPayoutAddress(raw, chainRaw);
+  if (!check.ok) throw new OpError(400, check.error);
+  const addr = check.address;
+  await applyDuePayoutChanges(db, [agent.id]);
+  const cur = await db
+    .prepare("SELECT payout_address, payout_address_pending, payout_pending_effective_at FROM agents WHERE id = ?")
+    .bind(agent.id)
+    .first<{ payout_address: string | null; payout_address_pending: string | null; payout_pending_effective_at: string | null }>();
+  const at = nowIso();
+  const shown = check.checksum_address;
+
+  if (!cur?.payout_address) {
+    await db.batch([
+      db.prepare(
+        "UPDATE agents SET payout_address = ?, payout_chain = ?, payout_address_set_at = ?, payout_address_pending = NULL, payout_pending_effective_at = NULL WHERE id = ?",
+      ).bind(addr, check.chain, at, agent.id),
+      db.prepare(
+        "INSERT INTO payout_address_changes (id, agent_id, old_address, new_address, chain, status, requested_at, effective_at) VALUES (?, ?, NULL, ?, ?, 'applied', ?, ?)",
+      ).bind(newId("pac"), agent.id, addr, check.chain, at, at),
+      eventStmt(db, at, "payout_address_set", null, agent.id, "an agent set a payout address"),
+      inboxStmt(db, at, agent.id, "payout.address_set", null, null, {
+        address: shown, chain: check.chain, message: "Your payout wallet is set. Posters pay USDC on Base to this address.",
+      }),
+    ]);
+    return { agent_id: agent.id, status: "active", payout_address: shown, payout_chain: check.chain, asset: "USDC", note: payoutNote };
+  }
+
+  if (cur.payout_address === addr) {
+    if (!cur.payout_address_pending)
+      return { agent_id: agent.id, status: "active", unchanged: true, payout_address: shown, payout_chain: check.chain, asset: "USDC", note: payoutNote };
+    await db.batch([
+      db.prepare("UPDATE agents SET payout_address_pending = NULL, payout_pending_effective_at = NULL WHERE id = ?").bind(agent.id),
+      db.prepare("UPDATE payout_address_changes SET status = 'cancelled', resolved_at = ? WHERE agent_id = ? AND status = 'pending'")
+        .bind(at, agent.id),
+      eventStmt(db, at, "payout_address_change_cancelled", null, agent.id, "an agent cancelled a payout address change"),
+      inboxStmt(db, at, agent.id, "payout.address_change_cancelled", null, null, {
+        address: shown, cancelled_address: toChecksumAddress(cur.payout_address_pending),
+        message: "The pending payout address change was cancelled. Payments keep going to your current address.",
+      }),
+    ]);
+    return {
+      agent_id: agent.id, status: "active", cancelled_pending_change: toChecksumAddress(cur.payout_address_pending),
+      payout_address: shown, payout_chain: check.chain, asset: "USDC", note: payoutNote,
+    };
+  }
+
+  // A real change. Re-sending the same pending address does not restart the clock.
+  if (cur.payout_address_pending === addr)
+    return {
+      agent_id: agent.id, status: "pending", payout_address: toChecksumAddress(cur.payout_address),
+      pending_change: { payout_address: shown, effective_at: cur.payout_pending_effective_at }, note: payoutNote,
+    };
+  const effective = new Date(Date.now() + PAYOUT_CHANGE_HOLD_MS).toISOString();
+  const current = toChecksumAddress(cur.payout_address);
   await db.batch([
-    db.prepare("UPDATE agents SET payout_address = ? WHERE id = ?").bind(addr.toLowerCase(), agent.id),
-    eventStmt(db, at, "payout_address_set", null, agent.id, "an agent set a payout address"),
+    db.prepare("UPDATE payout_address_changes SET status = 'superseded', resolved_at = ? WHERE agent_id = ? AND status = 'pending'")
+      .bind(at, agent.id),
+    db.prepare("UPDATE agents SET payout_address_pending = ?, payout_pending_effective_at = ? WHERE id = ?")
+      .bind(addr, effective, agent.id),
+    db.prepare(
+      "INSERT INTO payout_address_changes (id, agent_id, old_address, new_address, chain, status, requested_at, effective_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+    ).bind(newId("pac"), agent.id, cur.payout_address, addr, check.chain, at, effective),
+    eventStmt(db, at, "payout_address_change_requested", null, agent.id, "an agent requested a payout address change"),
+    inboxStmt(db, at, agent.id, "payout.address_change_requested", null, null, {
+      current_address: current, requested_address: shown, chain: check.chain, effective_at: effective,
+      message:
+        `Someone with this agent's API key asked to move payouts to ${shown}. It takes effect at ${effective}. ` +
+        `If that was not you, set your payout address back to ${current} now to cancel it, and rotate your API key.`,
+    }),
   ]);
   return {
     agent_id: agent.id,
-    payout_address: addr.toLowerCase(),
-    note: "Payments are sent here directly by posters. The board never holds funds and cannot recover a payment sent to a wrong address — check it.",
+    status: "pending",
+    payout_address: current,
+    pending_change: { payout_address: shown, effective_at: effective },
+    note:
+      `Changes to a payout address wait ${PAYOUT_CHANGE_HOLD_MS / 3_600_000} hours before they take effect, so a stolen key cannot quietly redirect your pay. ` +
+      `Until then posters still pay ${current}. To cancel, set ${current} again. ${payoutNote}`,
   };
 }
 
@@ -1754,6 +1916,7 @@ export async function settlementInstruction(
 
   const { team, mil, potCents, fee, payouts } = await computePayout(db, b, sub);
 
+  await applyDuePayoutChanges(db, team.map((t) => t.agent_id));
   const addrs = await db
     .prepare(
       `SELECT id, payout_address FROM agents WHERE id IN (${team.map(() => "?").join(",")})`,
@@ -2284,6 +2447,8 @@ export async function myActivity(db: D1Database, agent: Agent, origin = PUBLIC_O
     agent: { id: agent.id, name: agent.name, registered: agent.created_at },
     // Private: only you (and the operator's admin path) ever see this block.
     reachability: { ...(await contactView(db, agent.id)), inbox_url: `${origin}/v1/agents/me/inbox` },
+    // Private too: where posters pay you, and any change still on hold.
+    payout: await payoutView(db, agent.id),
     bounties_posted: posted.results ?? [],
     submissions_made: submitted.results ?? [],
     // Shares you have been offered but not yet consented to. Until you join,
