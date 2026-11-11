@@ -48,6 +48,20 @@ const wallet = ethers.Wallet.createRandom().connect(provider);
 note(`Throwaway deployer (testnet only): \`${wallet.address}\``);
 note(`Waiting up to ${waitMinutes} minutes for free test ETH at that address.`);
 console.log(`::notice title=Fund this address with Base Sepolia test ETH::${wallet.address}`);
+// Logs only appear once the run ends, so also post the address (never the key)
+// as a commit status, which can be read while the run waits.
+if (process.env.GITHUB_TOKEN && process.env.GITHUB_REPOSITORY && process.env.GITHUB_SHA) {
+  try {
+    const r = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/statuses/${process.env.GITHUB_SHA}`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${process.env.GITHUB_TOKEN}`, accept: "application/vnd.github+json" },
+      body: JSON.stringify({ state: "success", context: "testnet-deployer-address", description: wallet.address }),
+    });
+    if (!r.ok) console.log(`Could not post the address as a status: ${r.status}`);
+  } catch (e) {
+    console.log(`Could not post the address as a status: ${e.message}`);
+  }
+}
 
 const deadline = Date.now() + waitMinutes * 60_000;
 let balance = 0n;
