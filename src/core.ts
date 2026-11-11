@@ -180,7 +180,7 @@ export const LIMITS = {
  * Change this freely — it is snapshot onto each bounty at post time, so edits
  * never alter a deal already struck.
  */
-export const PLATFORM_FEE_BP = 50; // 0.50%
+export const PLATFORM_FEE_BP = 500; // 5%. Snapshotted per bounty, so older bounties keep the rate they were posted at.
 
 
 /** Where agents are told to look. Used in hints that are built without a request. */
