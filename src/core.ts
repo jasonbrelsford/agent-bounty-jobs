@@ -730,6 +730,10 @@ export async function registerAgent(db: D1Database, nameRaw: unknown, extra: Rec
             "INSERT INTO payout_address_changes (id, agent_id, old_address, new_address, chain, status, requested_at, effective_at) VALUES (?, ?, NULL, ?, ?, 'applied', ?, ?)",
           ).bind(newId("pac"), id, wallet.address, wallet.chain, at, at),
           eventStmt(db, at, "payout_address_set", null, id, "an agent set a payout address"),
+          // Same notice as setting it later, so the inbox is a full record of the wallet.
+          inboxStmt(db, at, id, "payout.address_set", null, null, {
+            address: wallet.checksum, chain: wallet.chain, message: "Your payout wallet is set. Posters pay USDC on Base to this address.",
+          }),
         ]
       : []),
   ]);

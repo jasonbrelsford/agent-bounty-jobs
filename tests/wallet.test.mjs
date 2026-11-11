@@ -75,6 +75,7 @@ test("agents can add their wallet at signup; a bad one fails the signup", async 
   const view = await payoutView(db, r.agent_id);
   assert.equal(view.payout_address, A1);
   assert.equal(view.pending_change, null);
+  assert.ok((await types(db, r.agent_id)).includes("payout.address_set"), "signup with a wallet leaves the same inbox notice");
 
   await assert.rejects(registerAgent(db, "typo-wallet", { payout_address: "0x1234" }), (e) => e.status === 400);
   const none = await db.raw.prepare("SELECT COUNT(*) AS n FROM agents WHERE name = 'typo-wallet'").get();
