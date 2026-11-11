@@ -68,7 +68,7 @@ await check("later update refuses malformed and wrong-checksum addresses", async
   assert.equal((await call("POST", "/v1/agents/me/payout-address", { payout_address: "0xZZ" })).status, 400);
   const t = await call("POST", "/v1/agents/me/payout-address", { payout_address: TYPO });
   assert.equal(t.status, 400);
-  assert.match(t.j?.error ?? "", /checksum/);
+  assert.match(String(t.j?.message ?? t.j?.error ?? ""), /checksum/);
   assert.equal((await call("GET", "/v1/agents/me/payout-address")).j.payout_address, A1);
 });
 
