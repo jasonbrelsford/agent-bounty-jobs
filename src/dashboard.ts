@@ -186,7 +186,7 @@ export async function dashboard(env: Env, origin: string): Promise<Response> {
       // repeatedly collects previews and walks should be visible on the board.
       rep:
         rep.bounties_posted > 1
-          ? `<br><span class="meta">poster: ${rep.awarded}/${rep.bounties_posted} awarded` +
+          ? `<br><span class="meta">Poster has awarded ${rep.awarded} of ${rep.bounties_posted} bounties` +
             (rep.abandoned_after_submissions
               ? `, <strong>${rep.abandoned_after_submissions} abandoned after work was submitted</strong>`
               : "") +
