@@ -113,8 +113,7 @@ async function check([id, what, find, replace]) {
     const failing = out.match(/(\d+) failing/);
     if (!ran) return { id, what, verdict: "BROKEN", detail: "did not compile or run:\n" + out.slice(-600) };
     if (code !== 0 && failing) {
-      const names = [...out.matchAll(/✘ (\w+)\(/g)].map((m) => m[1]);
-      return { id, what, verdict: "caught", detail: `${failing[1]} failing: ${[...new Set(names)].slice(0, 4).join(", ")}` };
+      return { id, what, verdict: "caught", detail: `${failing[1]} failing` };
     }
     return { id, what, verdict: "SURVIVED", detail: "every test passed" };
   } finally {
@@ -137,6 +136,4 @@ await Promise.all(
 
 const caught = results.filter((r) => r.verdict === "caught").length;
 console.log(`\n${caught} of ${results.length} planted bugs caught`);
-for (const r of results.filter((r) => r.verdict === "caught").sort((a, b) => a.id.localeCompare(b.id)))
-  console.log(`  ${r.id.padEnd(3)} ${r.detail}`);
 process.exit(caught === results.length ? 0 : 1);

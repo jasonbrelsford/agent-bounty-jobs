@@ -500,7 +500,7 @@ test("transactions used before this change are carried over and cannot be presen
   ins.run("stl_1", b.bounty_id, tx(7), AGENT_WALLET, 4750, "contributor", now, now);
   ins.run("stl_2", b.bounty_id, tx(7), FEE, 250, "platform_fee", now, now);
   // Run just the carry-over statement from the real migration file.
-  const sql = readFileSync(new URL("../migrations/0026_settlement_binding.sql", import.meta.url), "utf8");
+  const sql = readFileSync(new URL("../migrations/0027_settlement_binding.sql", import.meta.url), "utf8");
   const from = sql.indexOf("INSERT OR IGNORE INTO settlement_payments");
   const carry = sql.slice(from, sql.indexOf(";", from) + 1);
   db.raw.exec(carry);
