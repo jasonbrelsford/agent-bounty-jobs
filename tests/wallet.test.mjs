@@ -108,7 +108,7 @@ test("first address is immediate; a change is held 24h and posters keep paying t
   assert.ok(notice, "the owner is told about the change");
 
   // During the hold the settlement instruction still pays the old address.
-  let ins = await settlementInstruction(db, ENV, poster.a, b.bounty_id, s.submission_id, A3);
+  let ins = await settlementInstruction(db, ENV, poster.a, b.bounty_id, s.submission_id);
   assert.equal(ins.recipients.find((x) => x.role === "contributor").address, A1.toLowerCase());
 
   // Re-sending the same pending address does not restart the clock.

@@ -7,31 +7,37 @@
  * problem entirely: nothing needs to attest that an award happened, and nobody
  * holds a release key. The board reads the chain and updates its own records.
  *
- * Two rules decide whether a transaction counts:
+ * What makes a transfer count:
  *
- *  - It is the poster's own. Only USDC that left a wallet the poster registered
- *    before the block was produced is counted. A payment is public, so without
- *    this any poster could present someone else's payment to the same agent.
- *  - It is used once. A transaction hash is recorded against one submission and
- *    can never count toward another.
+ *  - It pays one leg exactly. Every recipient of a settlement is a leg with an
+ *    exact amount that no other open leg shares (see freezeLegs in core.ts). A
+ *    transfer of exactly that amount to that address is the payment for that
+ *    leg and nothing else. "At least this much to this address" is NOT enough:
+ *    payments are public, and that rule let any poster present someone else's.
+ *  - It was made after the leg was issued.
+ *  - It is used once. The transfer (transaction and log index) is recorded and
+ *    can never pay a second leg.
  *
- * A settlement may be paid across several transactions. Each verified one is
- * recorded as it is presented and the amounts are added up; the deliverable is
- * released when every recipient is covered.
+ * Who sent it does not matter, so batch contracts, smart wallets and exchange
+ * withdrawals all work. Legs may be paid in one transaction or several; each
+ * matched transfer is recorded when presented and the deliverable is released
+ * when every leg is paid.
  */
 import {
-  type Env, type Agent, type Bounty, OpError,
-  settlementInstruction, reviewSubmission, payerWallets, nowIso, newId, UNITS_PER_CENT,
+  type Env, type Agent, type Bounty, type SettlementLeg, OpError,
+  settlementInstruction, reviewSubmission, openLegs, unitsToUsdc, nowIso, newId,
 } from "./core.js";
-import { usdcTransfers, coversPayouts, isTxHash, type TxRead } from "./chain.js";
+import { usdcTransfers, isTxHash, type TxRead } from "./chain.js";
 
 /** Most hashes accepted in one call. Each costs three RPC requests. */
 export const MAX_TX_HASHES = 10;
 
-type PaymentRow = { tx_hash: string; submission_id: string; transfers: string };
-type Counted = { to: string; units: bigint };
-
-const usd = (cents: number) => `$${(cents / 100).toFixed(2)}`;
+/**
+ * A leg can only be paid by a block produced after the leg was issued. The
+ * allowance covers the gap between this server's clock and the chain's; the
+ * rule exists to stop old transfers being dug up, not to time anyone to the second.
+ */
+export const LEG_CLOCK_ALLOWANCE_S = 600;
 
 function normaliseHashes(raw: unknown): string[] {
   const list = Array.isArray(raw) ? raw : [raw];
@@ -46,10 +52,7 @@ function normaliseHashes(raw: unknown): string[] {
   return out;
 }
 
-function parseCounted(json: string): Counted[] {
-  const arr = JSON.parse(json) as { to: string; units: string }[];
-  return arr.map((t) => ({ to: String(t.to).toLowerCase(), units: BigInt(t.units) }));
-}
+const describe = (l: SettlementLeg) => `${unitsToUsdc(BigInt(l.units))} USDC to ${l.address}`;
 
 export async function settleBounty(
   env: Env,
@@ -67,52 +70,54 @@ export async function settleBounty(
   if (!b || b.status === "removed") throw new OpError(404, `no bounty ${bountyId}`);
   if (b.poster_id !== agent.id) throw new OpError(403, "only the bounty poster can settle it");
 
-  // What do we already know about these hashes? A hash recorded against any
-  // other submission is refused outright, whoever presents it.
-  const known = new Map<string, PaymentRow>();
-  for (const h of hashes) {
-    const row = await db
-      .prepare("SELECT tx_hash, submission_id, transfers FROM settlement_payments WHERE tx_hash = ?")
-      .bind(h)
-      .first<PaymentRow>();
-    if (!row) continue;
-    if (row.submission_id !== submissionId)
-      throw new OpError(409, `transaction ${h} was already used to settle a different submission; a transaction counts once`);
-    known.set(h, row);
-  }
-  const fresh = hashes.filter((h) => !known.has(h));
-
   // Idempotent: a poster who paid and then lost the response can re-present the
   // same hash. The payment is public and irreversible, so recovery must never
-  // depend on them having received our reply.
-  const done = await db
-    .prepare("SELECT COUNT(*) AS n FROM settlements WHERE submission_id = ?")
-    .bind(submissionId)
-    .first<{ n: number }>();
-  if ((done?.n ?? 0) > 0) {
-    if (fresh.length)
+  // depend on them having received our reply. "Settled" means the submission
+  // was actually awarded, not merely that rows exist.
+  const sub = await db
+    .prepare("SELECT status FROM submissions WHERE id = ? AND bounty_id = ?")
+    .bind(submissionId, bountyId)
+    .first<{ status: string }>();
+  if (sub?.status === "accepted") {
+    const used = await db
+      .prepare("SELECT DISTINCT tx_hash FROM settlement_payments WHERE submission_id = ?")
+      .bind(submissionId)
+      .all<{ tx_hash: string }>();
+    const mine = new Set((used.results ?? []).map((r) => r.tx_hash));
+    const extra = hashes.filter((h) => !mine.has(h));
+    if (extra.length)
       throw new OpError(
         409,
-        `this submission is already settled, so ${fresh.join(", ")} was not needed and has not been recorded. Nothing further is owed.`,
+        `this submission is already settled, so ${extra.join(", ")} was not needed and has not been recorded. Nothing further is owed.`,
       );
-    const sub = await db.prepare("SELECT status FROM submissions WHERE id = ?").bind(submissionId).first<{ status: string }>();
     return {
       bounty_id: bountyId,
       submission_id: submissionId,
       tx_hash: hashes[hashes.length - 1],
       tx_hashes: hashes,
       already_settled: true,
-      submission_status: sub?.status ?? "unknown",
+      submission_status: "accepted",
       note: "This payment was already verified and applied. Nothing was charged twice.",
     };
   }
 
-  // Recomputed, never taken from the caller: the instruction the board verifies
-  // against must be the one the board issued.
-  const instruction = await settlementInstruction(db, env, agent, bountyId, submissionId);
-  const wallets = await payerWallets(db, agent.id);
+  // A transaction used before per-transfer records existed is spent as a whole.
+  for (const h of hashes) {
+    const legacy = await db
+      .prepare("SELECT submission_id FROM settlement_payments WHERE tx_hash = ? AND log_index = -1")
+      .bind(h)
+      .first<{ submission_id: string }>();
+    if (legacy) throw new OpError(409, `transaction ${h} was already used to settle a submission; a transaction counts once`);
+  }
 
-  if (fresh.length) {
+  // Issues the legs if they do not exist yet, and refuses if the submission can
+  // no longer be awarded. Never taken from the caller.
+  await settlementInstruction(db, env, agent, bountyId, submissionId);
+  let legs = await openLegs(db, submissionId);
+  const unpaidBefore = legs.filter((l) => !l.paid_tx);
+
+  let newlyPaid: SettlementLeg[] = [];
+  if (unpaidBefore.length) {
     // No default endpoint. The public mainnet.base.org rate-limits and blocks
     // hard enough to be unusable (429 from the Worker, 403 from a laptop), so
     // falling back to it would turn a missing configuration into a confusing
@@ -122,100 +127,127 @@ export async function settleBounty(
       throw new OpError(503, "no Base RPC endpoint is configured on this board, so payments cannot be verified");
     const readTx = opts.readTx ?? ((h: string) => usdcTransfers(rpcUrl!, h));
 
-    // Verify every new hash before recording any, so a bad one records nothing.
-    const verified: { hash: string; blockTime: number; counted: Counted[] }[] = [];
-    for (const h of fresh) {
+    // Read every presented transaction before recording anything.
+    const candidates: { hash: string; logIndex: number; to: string; units: bigint; blockTime: number }[] = [];
+    for (const h of hashes) {
       const { transfers, blockTime } = await readTx(h);
-      if (!transfers.length)
-        throw new OpError(
-          400,
-          `transaction ${h} contains no USDC transfers on Base. Check you paid in native USDC (not bridged USDbC) on the right network.`,
-        );
-      // Count only what left one of the poster's wallets, and only if that
-      // wallet was registered before the block. Registering after the fact
-      // would let someone claim a payment they watched go by.
-      const eligible = new Set(
-        wallets.filter((w) => Math.floor(Date.parse(w.registered_at) / 1000) <= blockTime).map((w) => w.address),
-      );
-      const counted = transfers
-        .filter((t) => eligible.has(t.from.toLowerCase()))
-        .map((t) => ({ to: t.to.toLowerCase(), units: t.units }));
-      if (!counted.length)
-        throw new OpError(
-          400,
-          `none of the USDC in transaction ${h} was sent from a wallet you registered before paying (${wallets.map((w) => w.address).join(", ")}). ` +
-            "The board only counts payments from your own registered wallet, so that nobody else can present your payment as theirs. Nothing has been recorded or released.",
-        );
-      verified.push({ hash: h, blockTime, counted });
+      for (const t of transfers) {
+        if (t.units <= 0n) continue;
+        const spent = await db
+          .prepare("SELECT 1 AS x FROM settlement_payments WHERE tx_hash = ? AND log_index = ?")
+          .bind(h, t.logIndex)
+          .first<{ x: number }>();
+        if (!spent) candidates.push({ hash: h, logIndex: t.logIndex, to: t.to.toLowerCase(), units: t.units, blockTime });
+      }
     }
 
-    const at = nowIso();
-    try {
-      await db.batch(
-        verified.map((v) =>
-          db.prepare(
-            "INSERT INTO settlement_payments (tx_hash, bounty_id, submission_id, poster_id, block_time, transfers, verified_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-          ).bind(
-            v.hash, bountyId, submissionId, agent.id, v.blockTime,
-            JSON.stringify(v.counted.map((c) => ({ to: c.to, units: c.units.toString() }))), at,
-          ),
-        ),
+    // Each unpaid leg takes the first unused transfer of exactly its amount to
+    // its address, made after the leg was issued.
+    const taken = new Set<string>();
+    const matches: { leg: SettlementLeg; hash: string; logIndex: number }[] = [];
+    for (const leg of unpaidBefore) {
+      const issued = Math.floor(Date.parse(leg.created_at) / 1000) - LEG_CLOCK_ALLOWANCE_S;
+      const hit = candidates.find(
+        (c) =>
+          !taken.has(`${c.hash}:${c.logIndex}`) &&
+          c.to === leg.address &&
+          c.units === BigInt(leg.units) &&
+          c.blockTime >= issued,
       );
-    } catch {
-      // The primary key on tx_hash refused a row: another request recorded one
-      // of these hashes between our check and our insert.
-      throw new OpError(409, "one of these transactions was recorded by another request just now. Present the hashes again.");
+      if (!hit) continue;
+      taken.add(`${hit.hash}:${hit.logIndex}`);
+      matches.push({ leg, hash: hit.hash, logIndex: hit.logIndex });
     }
+
+    if (matches.length) {
+      const at = nowIso();
+      try {
+        // One step. The primary key refuses a transfer another request just
+        // recorded, and the whole batch is then undone.
+        await db.batch(
+          matches.flatMap((m) => [
+            db.prepare(
+              "INSERT INTO settlement_payments (tx_hash, log_index, leg_id, bounty_id, submission_id, verified_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ).bind(m.hash, m.logIndex, m.leg.id, bountyId, submissionId, at),
+            db.prepare("UPDATE settlement_legs SET paid_tx = ?, paid_log = ?, paid_at = ? WHERE id = ? AND paid_tx IS NULL AND open = 1")
+              .bind(m.hash, m.logIndex, at, m.leg.id),
+          ]),
+        );
+      } catch {
+        throw new OpError(409, "one of these payments was being recorded by another request. Present the hashes again.");
+      }
+      newlyPaid = matches.map((m) => m.leg);
+    }
+    legs = await openLegs(db, submissionId);
   }
 
-  // Add up everything recorded for this submission, not just what was presented
-  // in this call: earlier partial payments count.
-  const rows = await db
-    .prepare("SELECT tx_hash, submission_id, transfers FROM settlement_payments WHERE submission_id = ? ORDER BY verified_at, tx_hash")
-    .bind(submissionId)
-    .all<PaymentRow>();
-  const all = (rows.results ?? []).flatMap((r) => parseCounted(r.transfers));
-  const check = coversPayouts(all, instruction.recipients);
-  if (!check.ok) {
-    const shortfall = check.missing
-      .map((m) => {
-        const paid = all.filter((t) => t.to === m.address.toLowerCase()).reduce((a, t) => a + t.units, 0n);
-        const owed = BigInt(m.owed_cents) * UNITS_PER_CENT;
-        const stillCents = Number((owed - paid + UNITS_PER_CENT - 1n) / UNITS_PER_CENT);
-        return `${m.address} is owed ${usd(m.owed_cents)}, has ${usd(m.paid_cents)}, needs ${usd(stillCents)} more`;
-      })
-      .join("; ");
+  const unpaid = legs.filter((l) => !l.paid_tx);
+  if (unpaid.length) {
+    const paid = legs.filter((l) => l.paid_tx);
     throw new OpError(
       400,
-      `payment so far does not cover the settlement: ${shortfall}. ` +
-        (fresh.length
-          ? "What you have paid is recorded and will count. "
-          : "") +
-        "Nothing has been released. Send ONLY the amounts still needed, from your registered wallet, and present that transaction's hash. Do not pay the full amounts again.",
+      (newlyPaid.length
+        ? `recorded: ${newlyPaid.map(describe).join("; ")}. `
+        : "no transfer in what you presented matches an unpaid amount of this settlement. ") +
+        `Still to pay, each as ONE transfer of EXACTLY this amount: ${unpaid.map(describe).join("; ")}. ` +
+        (paid.length ? `Already paid and not to be sent again: ${paid.map(describe).join("; ")}. ` : "") +
+        "Nothing has been released. Amounts must match to six decimal places; a rounded or different amount is not recognised. " +
+        "If you already sent a different amount, do not send it again: contact the operator with the transaction hash.",
     );
   }
 
-  // The hash recorded on the award: the one that completed the payment.
-  const txHash = fresh.length ? fresh[fresh.length - 1] : hashes[hashes.length - 1];
+  // Every leg is paid. The hash recorded on the award is the one that paid last.
+  const txHash = [...legs].sort((x, y) => (x.paid_at ?? "").localeCompare(y.paid_at ?? "")).pop()!.paid_tx!;
+  // One settlement row per recipient and role, even if two legs share an address.
+  const rowsByRecipient = new Map<string, { address: string; role: string; cents: number; tx: string; milestone: string | null }>();
+  for (const l of legs) {
+    const k = `${l.address}|${l.role}`;
+    const r = rowsByRecipient.get(k);
+    if (r) r.cents += l.amount_cents;
+    else rowsByRecipient.set(k, { address: l.address, role: l.role, cents: l.amount_cents, tx: l.paid_tx!, milestone: l.milestone_id });
+  }
   const at = nowIso();
-  await db.batch(
-    instruction.recipients.map((r) =>
-      db.prepare(
-        "INSERT INTO settlements (id, bounty_id, milestone_id, submission_id, tx_hash, recipient, amount_cents, role, verified_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      ).bind(newId("stl"), bountyId, instruction.milestone_id, submissionId, txHash, r.address, r.amount_cents, r.role, at, at),
-    ),
-  );
+  try {
+    await db.batch(
+      [...rowsByRecipient.values()].map((r) =>
+        db.prepare(
+          "INSERT INTO settlements (id, bounty_id, milestone_id, submission_id, tx_hash, recipient, amount_cents, role, verified_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ).bind(newId("stl"), bountyId, r.milestone, submissionId, r.tx, r.address, r.cents, r.role, at, at),
+      ),
+    );
+  } catch {
+    // The unique index on (submission, recipient, role) refused: another request
+    // is settling this submission right now.
+    throw new OpError(409, "this submission is being settled by another request. Present the hash again in a moment.");
+  }
 
   // Only now — payment verified and recorded — does the deliverable come out.
-  const award = await reviewSubmission(db, agent, bountyId, submissionId, "accept", undefined, txHash, true);
-  await db.prepare("UPDATE bounties SET settled_tx = ? WHERE id = ?").bind(txHash, bountyId).run();
+  // If the award cannot be made, take the settlement rows back out so the
+  // records never say "settled" for work that was not released. The payments
+  // stay recorded against their legs: the money did move.
+  let award;
+  try {
+    award = await reviewSubmission(db, agent, bountyId, submissionId, "accept", undefined, txHash, true);
+  } catch (e) {
+    await db.prepare("DELETE FROM settlements WHERE submission_id = ? AND created_at = ?").bind(submissionId, at).run();
+    if (e instanceof OpError)
+      throw new OpError(
+        e.status,
+        `your payment is verified and recorded, but the award could not be made: ${e.message}. Nothing has been released. Do not pay again; contact the operator with the transaction hash.`,
+      );
+    throw e;
+  }
+  await db.batch([
+    db.prepare("UPDATE bounties SET settled_tx = ? WHERE id = ?").bind(txHash, bountyId),
+    db.prepare("UPDATE settlement_legs SET open = 0 WHERE submission_id = ?").bind(submissionId),
+  ]);
 
   return {
     ...award,
     settled: true,
     tx_hash: txHash,
-    tx_hashes: (rows.results ?? []).map((r) => r.tx_hash),
-    verified_recipients: instruction.recipients.length,
+    tx_hashes: [...new Set(legs.map((l) => l.paid_tx!))],
+    verified_recipients: legs.length,
     settlement: "Payment verified on Base. The deliverable is now released to you.",
   };
 }

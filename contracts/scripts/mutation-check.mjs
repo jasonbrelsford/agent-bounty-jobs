@@ -6,6 +6,11 @@
 //   npm run test:mutants -- A D     only the named ones
 //
 // Works in a temporary copy; the repo's files are never changed.
+//
+// The random-sequence (invariant) tests are left out of these runs. When one of
+// them fails, the runner spends a very long time shrinking the failing sequence,
+// and the point here is that a NAMED test pins each rule, not that random
+// sequences stumble on it. Each run also has a time limit.
 import { cpSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { tmpdir, availableParallelism } from "node:os";
@@ -67,13 +72,21 @@ const original = readFileSync(join(ROOT, SRC), "utf8");
 const only = process.argv.slice(2);
 const chosen = MUTANTS.filter(([id]) => !only.length || only.includes(id));
 
+const TIME_LIMIT_MS = 8 * 60_000;
+
 function run(dir) {
   return new Promise((resolve) => {
-    const p = spawn("npx", ["hardhat", "test", "solidity"], { cwd: dir });
+    // Its own process group, so a run that overstays can be stopped with its children.
+    const p = spawn("npx", ["hardhat", "test", "solidity"], { cwd: dir, detached: true });
     let out = "";
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { process.kill(-p.pid, "SIGKILL"); } catch { /* already gone */ }
+    }, TIME_LIMIT_MS);
     p.stdout.on("data", (d) => (out += d));
     p.stderr.on("data", (d) => (out += d));
-    p.on("close", (code) => resolve({ code, out }));
+    p.on("close", (code) => { clearTimeout(timer); resolve({ code, out, timedOut }); });
   });
 }
 
@@ -86,6 +99,7 @@ function workdir(source) {
   const cfg = readFileSync(join(dir, "hardhat.config.ts"), "utf8").replace(/runs: \d+/, "runs: 50");
   writeFileSync(join(dir, "hardhat.config.ts"), cfg);
   writeFileSync(join(dir, SRC), source);
+  rmSync(join(dir, "test", "BountyEscrow.invariant.t.sol"), { force: true });
   return dir;
 }
 
@@ -93,7 +107,8 @@ async function check([id, what, find, replace]) {
   if (original.split(find).length !== 2) return { id, what, verdict: "BROKEN", detail: "text to replace not found exactly once" };
   const dir = workdir(original.replace(find, replace));
   try {
-    const { code, out } = await run(dir);
+    const { code, out, timedOut } = await run(dir);
+    if (timedOut) return { id, what, verdict: "BROKEN", detail: "ran past the time limit" };
     const ran = /Running Solidity tests/.test(out);
     const failing = out.match(/(\d+) failing/);
     if (!ran) return { id, what, verdict: "BROKEN", detail: "did not compile or run:\n" + out.slice(-600) };
@@ -109,7 +124,7 @@ async function check([id, what, find, replace]) {
 
 const results = [];
 const queue = [...chosen];
-const workers = Math.max(1, Math.min(4, Math.floor(availableParallelism() / 2)));
+const workers = Math.max(1, Math.min(3, Math.floor(availableParallelism() / 3)));
 await Promise.all(
   Array.from({ length: workers }, async () => {
     for (let m; (m = queue.shift()); ) {

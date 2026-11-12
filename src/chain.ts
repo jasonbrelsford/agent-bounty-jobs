@@ -9,7 +9,8 @@ import { OpError, USDC_BASE, UNITS_PER_CENT, MIN_CONFIRMATIONS } from "./core.js
 /** keccak256("Transfer(address,address,uint256)") */
 const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
-export type Transfer = { from: string; to: string; units: bigint };
+export type Transfer = { from: string; to: string; units: bigint; logIndex: number };
+export type TxRead = { transfers: Transfer[]; blockTime: number };
 
 async function rpc(url: string, method: string, params: unknown[]): Promise<unknown> {
   const res = await fetch(url, {
@@ -41,11 +42,9 @@ export function isTxHash(v: unknown): v is string {
  * a list back knows the transaction succeeded, is buried deep enough, and that
  * these transfers were emitted by the real USDC contract.
  */
-export type TxRead = { transfers: Transfer[]; blockTime: number };
-
 export async function usdcTransfers(rpcUrl: string, txHash: string): Promise<TxRead> {
   const receipt = (await rpc(rpcUrl, "eth_getTransactionReceipt", [txHash])) as {
-    status?: string; blockNumber?: string; logs?: { address: string; topics: string[]; data: string }[];
+    status?: string; blockNumber?: string; logs?: { address: string; topics: string[]; data: string; logIndex?: string }[];
   } | null;
   if (!receipt) throw new OpError(404, "transaction not found on Base — is it mined, and is the hash right?");
   if (receipt.status !== "0x1") throw new OpError(400, "that transaction reverted on-chain; nothing was transferred");
@@ -59,8 +58,8 @@ export async function usdcTransfers(rpcUrl: string, txHash: string): Promise<TxR
       `transaction has ${confirmations} confirmation(s); ${MIN_CONFIRMATIONS} required before the deliverable is released. Try again shortly.`,
     );
 
-  // When the block was produced. A payment only counts if the paying wallet was
-  // registered before it, so a missing or unreadable timestamp is a refusal.
+  // When the block was produced. A payment made before its instruction existed
+  // cannot be the payment for it, so an unreadable timestamp is a refusal.
   const block = (await rpc(rpcUrl, "eth_getBlockByNumber", [receipt.blockNumber, false])) as { timestamp?: string } | null;
   const blockTime = block?.timestamp ? Number(hexToBigInt(block.timestamp)) : NaN;
   if (!Number.isSafeInteger(blockTime) || blockTime <= 0)
@@ -78,9 +77,12 @@ export async function usdcTransfers(rpcUrl: string, txHash: string): Promise<TxR
  * any other token, or any other event, is not a payment we accept.
  */
 export function parseTransferLogs(
-  logs: { address: string; topics: string[]; data: string }[],
+  logs: { address: string; topics: string[]; data: string; logIndex?: string }[],
 ): Transfer[] {
   return logs
+    // The position in the block identifies one transfer for good. Receipts from a
+    // node carry it; without it (hand-built logs) the position in the list stands in.
+    .map((l, i) => ({ ...l, logIndex: l.logIndex ? Number(hexToBigInt(l.logIndex)) : i }))
     .filter(
       (l) =>
         l.address.toLowerCase() === USDC_BASE &&
@@ -91,6 +93,7 @@ export function parseTransferLogs(
       from: topicToAddress(l.topics[1]),
       to: topicToAddress(l.topics[2]),
       units: hexToBigInt(l.data),
+      logIndex: l.logIndex,
     }));
 }
 
@@ -101,22 +104,13 @@ export function parseTransferLogs(
  * than `==`: overpaying is the payer's business, underpaying is the board's.
  * Extra recipients are ignored — a batched transaction that also settles
  * something unrelated is still a valid settlement of this bounty.
- *
- * `payers`, when given, is the set of lower-case addresses the money must have
- * come FROM. Transfers from anyone else are not counted at all. Settlement always
- * passes it: without it, anybody's payment to the same recipients would pass.
  */
 export function coversPayouts(
-  transfers: { from?: string; to: string; units: bigint }[],
+  transfers: Transfer[],
   required: { address: string; amount_cents: number }[],
-  payers?: ReadonlySet<string>,
 ): { ok: true } | { ok: false; missing: { address: string; owed_cents: number; paid_cents: number }[] } {
   const paid = new Map<string, bigint>();
-  for (const t of transfers) {
-    if (payers && !(t.from && payers.has(t.from.toLowerCase()))) continue;
-    const to = t.to.toLowerCase();
-    paid.set(to, (paid.get(to) ?? 0n) + t.units);
-  }
+  for (const t of transfers) paid.set(t.to, (paid.get(t.to) ?? 0n) + t.units);
   const missing = required
     .map((r) => {
       const got = paid.get(r.address.toLowerCase()) ?? 0n;

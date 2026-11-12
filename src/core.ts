@@ -1892,72 +1892,116 @@ export async function setPayoutAddress(db: D1Database, agent: Agent, raw: unknow
   };
 }
 
-/** How many paying wallets one account may register. Keeps squatting on other people's addresses bounded. */
-export const MAX_PAYER_WALLETS = 5;
+/** One recipient of a settlement, with the exact amount that identifies the payment. */
+export type SettlementLeg = {
+  id: string; bounty_id: string; submission_id: string; milestone_id: string | null;
+  role: "contributor" | "platform_fee"; agent_id: string; address: string;
+  amount_cents: number; units: string; open: number; created_at: string;
+  paid_tx: string | null; paid_log: number | null; paid_at: string | null;
+};
 
-export type PayerWallet = { address: string; agent_id: string; registered_at: string };
+/** The tag added to each amount is 1 to this many USDC units: always under one cent. */
+export const LEG_TAG_MAX = Number(UNITS_PER_CENT) - 1;
 
-export async function payerWallets(db: D1Database, agentId: string): Promise<PayerWallet[]> {
+/** USDC units as a 6-decimal string, e.g. 47503917n -> "47.503917". */
+export function unitsToUsdc(units: bigint): string {
+  const s = units.toString().padStart(7, "0");
+  return `${s.slice(0, -6)}.${s.slice(-6)}`;
+}
+
+export async function openLegs(db: D1Database, submissionId: string): Promise<SettlementLeg[]> {
   const r = await db
-    .prepare("SELECT address, agent_id, registered_at FROM payer_wallets WHERE agent_id = ? ORDER BY registered_at")
-    .bind(agentId)
-    .all<PayerWallet>();
+    .prepare("SELECT * FROM settlement_legs WHERE submission_id = ? AND open = 1 ORDER BY role, agent_id")
+    .bind(submissionId)
+    .all<SettlementLeg>();
   return r.results ?? [];
 }
 
+function randomTag(): number {
+  const buf = new Uint32Array(1);
+  crypto.getRandomValues(buf);
+  return 1 + (buf[0] % LEG_TAG_MAX);
+}
+
 /**
- * Name the wallet a poster will pay from. Must happen BEFORE the payment.
+ * Fix the legs of a settlement: one per recipient, each with an exact amount.
  *
- * This is what ties a payment to the poster who made it. The board cannot see
- * who "owns" a transaction, only which address the USDC left. So each address
- * belongs to one account, and only transfers that left it after registration
- * are counted. Without this, any poster could present someone else's public
- * payment to the same agent and take that agent's sealed work for free.
+ * This is what ties a payment to a submission. The board cannot see who "owns"
+ * a transaction, and a payment is public, so matching on recipient and "at
+ * least this much" let any poster present someone else's payment to the same
+ * agent. Instead each leg's amount is what is owed plus a tag under one cent,
+ * chosen so that no two open legs anywhere have the same recipient and amount.
+ * A transfer of exactly that amount to that address is then the payment for
+ * that leg and no other, whoever sent it and however it was sent.
  *
- * Not proof of control: there is no signature. The first account to register
- * an address holds it. That cannot be used to take anyone's money or work —
- * the real owner is simply told the address is taken, before they pay.
+ * Once issued, legs stay as they are while the recipients are unchanged. If
+ * the recipients change (a payout address change comes due) and nothing has
+ * been paid, they are replaced. If anything has been paid they are kept, so
+ * money already sent is never stranded by a later change.
  */
-export async function registerPayerWallet(
+async function freezeLegs(
   db: D1Database,
-  env: Pick<Env, "PLATFORM_FEE_ADDRESS">,
-  agent: Agent,
-  raw: unknown,
-): Promise<PayerWallet> {
-  const chk = checkPayoutAddress(raw, "base");
-  if (!chk.ok) throw new OpError(400, chk.error.replace(/payout_address/g, "pay_from"));
-  if (env.PLATFORM_FEE_ADDRESS && chk.address === env.PLATFORM_FEE_ADDRESS.toLowerCase())
-    throw new OpError(400, "pay_from cannot be the platform fee address");
-  const existing = await db
-    .prepare("SELECT address, agent_id, registered_at FROM payer_wallets WHERE address = ?")
-    .bind(chk.address)
-    .first<PayerWallet>();
-  if (existing) {
-    if (existing.agent_id === agent.id) return existing;
-    throw new OpError(
-      409,
-      "that wallet is already registered as another account's paying wallet. Do NOT pay from it: the payment would not count for you. Use a different wallet, or contact the operator if the address is yours.",
-    );
+  b: Bounty,
+  sub: Submission,
+  milestoneId: string | null,
+  want: { role: "contributor" | "platform_fee"; agent_id: string | null; address: string; amount_cents: number }[],
+): Promise<SettlementLeg[]> {
+  // Legs of submissions that can no longer be awarded release their amounts.
+  await db
+    .prepare(
+      "UPDATE settlement_legs SET open = 0 WHERE open = 1 AND submission_id IN (SELECT id FROM submissions WHERE status != 'pending')",
+    )
+    .run();
+
+  const key = (l: { role: string; agent_id: string | null; address: string; amount_cents: number }) =>
+    `${l.role}|${l.agent_id ?? ""}|${l.address.toLowerCase()}|${l.amount_cents}`;
+  const wanted = want.map(key).sort().join(",");
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const have = await openLegs(db, sub.id);
+    if (have.length) {
+      if (have.map(key).sort().join(",") === wanted) return have;
+      if (have.some((l) => l.paid_tx)) return have;
+    }
+    // Pick a tag for each recipient that no other open leg is using.
+    const at = nowIso();
+    const rows: SettlementLeg[] = [];
+    for (const w of want) {
+      const address = w.address.toLowerCase();
+      let units = "";
+      for (let i = 0; i < 40 && !units; i++) {
+        const candidate = (BigInt(w.amount_cents) * UNITS_PER_CENT + BigInt(randomTag())).toString();
+        const taken = await db
+          .prepare("SELECT 1 AS x FROM settlement_legs WHERE open = 1 AND address = ? AND units = ?")
+          .bind(address, candidate)
+          .first<{ x: number }>();
+        if (!taken && !rows.some((r) => r.address === address && r.units === candidate)) units = candidate;
+      }
+      if (!units)
+        throw new OpError(503, "could not allocate a unique payment amount for this settlement; try again shortly");
+      rows.push({
+        id: newId("leg"), bounty_id: b.id, submission_id: sub.id, milestone_id: milestoneId,
+        role: w.role, agent_id: w.agent_id ?? "", address, amount_cents: w.amount_cents, units,
+        open: 1, created_at: at, paid_tx: null, paid_log: null, paid_at: null,
+      });
+    }
+    try {
+      // One step: retire the old set (only if still unpaid) and issue the new one.
+      // The unique indexes refuse it if another request got there first.
+      await db.batch([
+        db.prepare("UPDATE settlement_legs SET open = 0 WHERE submission_id = ? AND open = 1 AND paid_tx IS NULL").bind(sub.id),
+        ...rows.map((r) =>
+          db.prepare(
+            "INSERT INTO settlement_legs (id, bounty_id, submission_id, milestone_id, role, agent_id, address, amount_cents, units, open, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+          ).bind(r.id, r.bounty_id, r.submission_id, r.milestone_id, r.role, r.agent_id, r.address, r.amount_cents, r.units, r.created_at),
+        ),
+      ]);
+      return rows;
+    } catch {
+      // Lost a race for an amount or for this submission's legs: look again.
+    }
   }
-  const mine = await payerWallets(db, agent.id);
-  if (mine.length >= MAX_PAYER_WALLETS)
-    throw new OpError(409, `you already have ${MAX_PAYER_WALLETS} paying wallets registered; pay from one of them: ${mine.map((w) => w.address).join(", ")}`);
-  const row: PayerWallet = { address: chk.address, agent_id: agent.id, registered_at: nowIso() };
-  try {
-    await db
-      .prepare("INSERT INTO payer_wallets (address, agent_id, registered_at) VALUES (?, ?, ?)")
-      .bind(row.address, row.agent_id, row.registered_at)
-      .run();
-  } catch {
-    // Lost a race for the same address: whoever got there first holds it.
-    const now = await db
-      .prepare("SELECT address, agent_id, registered_at FROM payer_wallets WHERE address = ?")
-      .bind(chk.address)
-      .first<PayerWallet>();
-    if (now && now.agent_id === agent.id) return now;
-    throw new OpError(409, "that wallet was just registered by another account. Do NOT pay from it; use a different wallet.");
-  }
-  return row;
+  throw new OpError(503, "could not issue the settlement instruction; try again shortly");
 }
 
 /**
@@ -1973,7 +2017,6 @@ export async function settlementInstruction(
   agent: Agent,
   bountyId: string,
   submissionId: string,
-  payFrom?: unknown,
 ) {
   const b = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(bountyId).first<Bounty>();
   if (!b || b.status === "removed") throw new OpError(404, `no bounty ${bountyId}`);
@@ -2004,52 +2047,54 @@ export async function settlementInstruction(
       `cannot settle: ${unpaid.length} contributor(s) have no payout_address — ${unpaid.map((u) => u.agent_id).join(", ")}. They must call set_payout_address first.`,
     );
 
-  const recipients = [
+  const base = [
     ...team.map((t, i) => ({
       role: "contributor" as const,
-      agent_id: t.agent_id,
+      agent_id: t.agent_id as string | null,
       address: byId.get(t.agent_id)!,
       amount_cents: payouts[i],
-      amount_usdc: (payouts[i] / 100).toFixed(2),
     })),
     {
       role: "platform_fee" as const,
-      agent_id: null,
+      agent_id: null as string | null,
       address: env.PLATFORM_FEE_ADDRESS.toLowerCase(),
       amount_cents: fee,
-      amount_usdc: (fee / 100).toFixed(2),
     },
   ].filter((r) => r.amount_cents > 0);
 
-  // Only now, with everything else valid, record the paying wallet.
-  if (payFrom !== undefined && payFrom !== null && payFrom !== "") await registerPayerWallet(db, env, agent, payFrom);
-  const wallets = await payerWallets(db, agent.id);
-  if (!wallets.length)
-    throw new OpError(
-      400,
-      "say which wallet you will pay from: pass pay_from (your 0x… wallet address on Base). The board only counts USDC sent from a wallet you registered BEFORE paying, so nobody else can present your payment as theirs. Do not pay until this call succeeds.",
-    );
+  const legs = await freezeLegs(db, b, sub, mil?.id ?? null, base);
+  const recipients = legs.map((l) => ({
+    role: l.role,
+    agent_id: l.agent_id || null,
+    address: l.address,
+    checksum_address: toChecksumAddress(l.address),
+    amount_cents: l.amount_cents,
+    // The amount to send. Exact: not rounded, not more, not less.
+    amount_units: l.units,
+    amount_usdc: unitsToUsdc(BigInt(l.units)),
+    paid: l.paid_tx != null,
+    paid_tx: l.paid_tx,
+  }));
+  const totalUnits = legs.reduce((a, l) => a + BigInt(l.units), 0n);
 
   return {
     bounty_id: bountyId,
     submission_id: submissionId,
-    milestone_id: mil?.id ?? null,
-    pay_from: wallets.map((w) => ({
-      address: w.address,
-      checksum_address: toChecksumAddress(w.address),
-      registered_at: w.registered_at,
-    })),
+    milestone_id: legs[0]?.milestone_id ?? mil?.id ?? null,
     chain: "base",
     asset: "USDC",
     token_contract: USDC_BASE,
     recipients,
-    total_cents: recipients.reduce((a, r) => a + r.amount_cents, 0),
-    total_usdc: (recipients.reduce((a, r) => a + r.amount_cents, 0) / 100).toFixed(2),
+    legs,
+    total_cents: legs.reduce((a, l) => a + l.amount_cents, 0),
+    total_usdc: unitsToUsdc(totalUnits),
     confirmations_required: MIN_CONFIRMATIONS,
     note:
-      "Send these USDC amounts on Base FROM one of the pay_from wallets. Transfers from any other address, or mined before that wallet was registered, are not counted. " +
-      "One transaction paying every recipient is simplest. Separate transactions also work: call settle_bounty with each hash (or all of them at once); each verified payment is recorded and the amounts are added up. " +
-      "The deliverable is released only once every recipient is covered, and paying a wrong address is irreversible.",
+      "Send each recipient EXACTLY its amount_usdc in native USDC on Base, to six decimal places (amount_units is the same number in raw token units). " +
+      "The last four digits are a tag under one cent that identifies your payment: a rounded, larger or smaller amount is not recognised and cannot be matched automatically. " +
+      "One transfer per recipient. They may be in one transaction or in separate ones, from any wallet. " +
+      "Then call settle_bounty with the transaction hash, or all the hashes; each matched transfer is recorded as it is presented. " +
+      "The deliverable is released only once every recipient is paid, and paying a wrong address is irreversible.",
   };
 }
 
