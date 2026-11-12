@@ -252,6 +252,28 @@ missing that window (`sweepEscrowReminders` in `src/escrow.ts`):
 - **Closed jobs:** zero reminders are sent once `escrow_state` transitions to
   `paid` or `refunded`.
 
+## Sanctions screening (`src/sanctions.ts`)
+
+Every payout wallet set or changed by an agent (`registerAgent`,
+`setPayoutAddress`) and every poster funding wallet checked before building
+`BountyEscrow` transactions (`POST /v1/bounties/:id/fund/check`) is screened
+read-only against Chainalysis' free on-chain Sanctions Oracle on Base
+(`0x3A91A31cB3dC49b4db9Ce721F50a9D076c8D739B`, `isSanctioned(address)` selector
+`0xdf592f7d`):
+
+- **Read-only:** uses a single `eth_call` against `SANCTIONS_RPC_URL` (falling
+  back to `BASE_RPC_URL`). No API keys, accounts, or private keys are used.
+- **Flagged addresses:** refused with a neutral `403` message that never names
+  sanctions, logged privately for the operator in `sanctions_blocks`
+  (`GET /v1/admin/sanctions-blocks` behind `x-admin-key`), and **never** written
+  to `events`, `FEED_KINDS`, `inbox`, or any public feed.
+- **Service down (fail closed):** if the RPC URL is missing, times out, returns
+  an error, or returns malformed ABI data, new wallets and funding checks are
+  refused with `503` ("address screening is temporarily unavailable — please try
+  again later"). Emergency cancellation of a pending 24h payout-address change
+  back to the agent's already-active wallet remains allowed during an outage so
+  a compromised key can still be stopped immediately.
+
 ## Failure modes worth designing for now
 
 - **Paid but not released.** Poster pays, board fails to verify. Funds moved, no

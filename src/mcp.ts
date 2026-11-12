@@ -106,7 +106,7 @@ export function createServer(env: Env) {
     },
     async ({ name, contact_email, notify_webhook, payout_address }) =>
       run(async () => ({
-        ...(await registerAgent(db, name, { contact_email, notify_webhook, payout_address })),
+        ...(await registerAgent(db, name, { contact_email, notify_webhook, payout_address }, undefined, env)),
         next_weekly_tournament: await weeklyHint(db),
       })),
   );
@@ -533,7 +533,7 @@ export function createServer(env: Env) {
       },
     },
     async ({ api_key, payout_address, payout_chain }) =>
-      run(async (c) => setPayoutAddress(db, await who(c, api_key), payout_address, payout_chain)),
+      run(async (c) => setPayoutAddress(db, await who(c, api_key), payout_address, payout_chain, env)),
   );
 
   server.registerTool(

@@ -17,6 +17,7 @@ import {
   bountyEscrowRef, canPosterReadDeliverable, sweepEscrowReminders, finalizePaidEscrowSubmission,
   escrowAddressOf, escrowSourcifyUrl, BASE_SEPOLIA_CHAIN_ID, type EscrowState,
 } from "./escrow.js";
+import { enforceAddressScreening, type ScreenFn } from "./sanctions.js";
 
 export interface Env {
   DB: D1Database;
@@ -51,6 +52,9 @@ export interface Env {
   /** Base Sepolia BountyEscrow deployment (testnet only) and read-only RPC URL. */
   ESCROW_ADDRESS_BASE_SEPOLIA?: string;
   BASE_SEPOLIA_RPC_URL?: string;
+  /** Read-only Base RPC + Chainalysis Sanctions Oracle address for wallet screening (#51). */
+  SANCTIONS_RPC_URL?: string;
+  SANCTIONS_ORACLE_ADDRESS?: string;
   /** wrangler secret. Absent = admin endpoints disabled, which is fail-closed. */
   ADMIN_KEY?: string;
   /** Optional free keys for the registry safety scan (Worker secrets). */
@@ -763,15 +767,23 @@ function contactInput(input: Record<string, unknown>): { email?: string | null; 
   return out;
 }
 
-export async function registerAgent(db: D1Database, nameRaw: unknown, extra: Record<string, unknown> = {}, origin = PUBLIC_ORIGIN) {
+export async function registerAgent(
+  db: D1Database,
+  nameRaw: unknown,
+  extra: Record<string, unknown> = {},
+  origin = PUBLIC_ORIGIN,
+  env?: Pick<Env, "SANCTIONS_RPC_URL" | "BASE_RPC_URL" | "SANCTIONS_ORACLE_ADDRESS">,
+  opts?: { screen?: ScreenFn },
+) {
   const name = reqString(nameRaw, "name", LIMITS.name.min, LIMITS.name.max);
   const contact = contactInput(extra);
-  // Checked before anything is written, so a mistyped wallet fails the whole
-  // registration instead of leaving an agent that cannot be paid.
+  // Checked before anything is written, so a mistyped or sanctioned wallet fails
+  // the whole registration instead of leaving an agent that cannot be paid.
   let wallet: { address: string; checksum: string; chain: string } | null = null;
   if (extra.payout_address !== undefined && extra.payout_address !== null && extra.payout_address !== "") {
     const check = checkPayoutAddress(extra.payout_address, extra.payout_chain);
     if (!check.ok) throw new OpError(400, check.error);
+    await enforceAddressScreening(db, env, check.address, "payout_signup", {}, opts);
     wallet = { address: check.address, checksum: check.checksum_address, chain: check.chain };
   }
   const since = new Date(Date.now() - 86_400_000).toISOString();
@@ -2078,7 +2090,14 @@ export async function payoutView(db: D1Database, agentId: string) {
  * stolen key cannot silently redirect a payout. Sending the current address
  * again cancels a pending change.
  */
-export async function setPayoutAddress(db: D1Database, agent: Agent, raw: unknown, chainRaw?: unknown) {
+export async function setPayoutAddress(
+  db: D1Database,
+  agent: Agent,
+  raw: unknown,
+  chainRaw?: unknown,
+  env?: Pick<Env, "SANCTIONS_RPC_URL" | "BASE_RPC_URL" | "SANCTIONS_ORACLE_ADDRESS">,
+  opts?: { screen?: ScreenFn },
+) {
   const check = checkPayoutAddress(raw, chainRaw);
   if (!check.ok) throw new OpError(400, check.error);
   const addr = check.address;
@@ -2087,6 +2106,13 @@ export async function setPayoutAddress(db: D1Database, agent: Agent, raw: unknow
     .prepare("SELECT payout_address, payout_address_pending, payout_pending_effective_at FROM agents WHERE id = ?")
     .bind(agent.id)
     .first<{ payout_address: string | null; payout_address_pending: string | null; payout_pending_effective_at: string | null }>();
+
+  const isEmergencyCancel = cur?.payout_address === addr && cur.payout_address_pending != null;
+  if (!isEmergencyCancel) {
+    const ctx = cur?.payout_address && cur.payout_address !== addr ? "payout_change" : "payout_set";
+    await enforceAddressScreening(db, env, addr, ctx, { agentId: agent.id }, opts);
+  }
+
   const at = nowIso();
   const shown = check.checksum_address;
 

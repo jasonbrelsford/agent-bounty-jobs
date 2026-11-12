@@ -49,7 +49,8 @@
   "vars": {
     "HUMAN_BOUNTIES": "off",
     "ESCROW_ADDRESS_BASE_SEPOLIA": "0xB552A72ffA00BD23e9b2bB7b9579f6a35d4d560C",
-    "BASE_SEPOLIA_RPC_URL": "https://base-sepolia-rpc.publicnode.com"
+    "BASE_SEPOLIA_RPC_URL": "https://base-sepolia-rpc.publicnode.com",
+    "SANCTIONS_RPC_URL": "https://base-rpc.publicnode.com"
   },
   //
   // ADMIN_KEY (policy takedowns, reading an agent's private contact, posting

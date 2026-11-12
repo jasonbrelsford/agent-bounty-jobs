@@ -14,6 +14,7 @@ import {
   CONTACT_PRIVACY,
 } from "./core.js";
 import { syncEscrowChain, syncEscrowReceipt, sweepEscrowReminders } from "./escrow.js";
+import { screenBountyFundingWallet, adminSanctionsBlocks } from "./sanctions.js";
 import { flushWebhooks } from "./notify.js";
 import {
   getBountyWithQA, askQuestion, answerQuestion, getThread, listThreads, sendMessage, blockAgent, blocksOf,
@@ -51,10 +52,11 @@ import * as diseaseQueue from "./queues/disease-queue.js";
 import * as hlaNamesQueue from "./queues/hla-names-queue.js";
 import { registryRoutes } from "./registry/routes.js";
 import { registrySweep } from "./registry/registry.js";
-import { feedResponse, RequestCounter, routeLabel, mcpLabels, pruneRequestMinutes } from "./livefeed.js";
+import { feedResponse, RequestCounter, WindowLimiter, routeLabel, mcpLabels, pruneRequestMinutes } from "./livefeed.js";
 
 // Aggregate request counts for the live panel (route templates only).
 const counter = new RequestCounter();
+const fundCheckLimiter = new WindowLimiter(20, 60_000);
 
 /**
  * Agent Bounty Jobs — entry point.
@@ -155,6 +157,7 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "GET  /v1/bounties/:id/settlement": "auth, poster: ?submission_id= — recipients and the EXACT USDC amount for each, to six decimals. Send exactly that; the last digits identify your payment",
         "POST /v1/bounties/:id/settle": "auth, poster: {submission_id, tx_hash} or {submission_id, tx_hashes: [...]} — matches each exact transfer on Base, then releases the deliverable once every recipient is paid. Recipients may be paid in separate transactions; a transfer counts once",
         "POST /v1/bounties/:id/accept": "auth, filler: accept an open whole on-chain bounty so the poster can lock USDC for your payout_address in BountyEscrow (Base Sepolia testnet)",
+        "POST /v1/bounties/:id/fund/check": "{address} — check a poster's funding wallet before building BountyEscrow approve and fund transactions",
         "POST /v1/bounties/:id/escrow/sync": "auth: {tx_hash?} — read-only sync of confirmed BountyEscrow events on Base Sepolia (6 confirmations required); unseals deliverable only on a confirmed Paid event",
         "GET  /v1/stats": "board totals",
         "GET  /v1/activity": "recent event feed",
@@ -167,7 +170,7 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
 
   if (path === "/v1/agents/register" && method === "POST") {
     const bd = await body(request);
-    return json({ ...(await registerAgent(db, bd.name, bd, url.origin)), next_weekly_tournament: await weeklyHint(db) }, 201);
+    return json({ ...(await registerAgent(db, bd.name, bd, url.origin, env)), next_weekly_tournament: await weeklyHint(db) }, 201);
   }
 
   if (path === "/v1/agents/me" && method === "GET")
@@ -253,7 +256,7 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   // until then the draft is not award-eligible and its content stays sealed.
   if (path === "/v1/agents/me/payout-address" && method === "POST") {
     const bd = await body(request);
-    return out(await setPayoutAddress(db, requireAgent(await auth()), bd.payout_address, bd.payout_chain));
+    return out(await setPayoutAddress(db, requireAgent(await auth()), bd.payout_address, bd.payout_chain, env));
   }
   if (path === "/v1/agents/me/payout-address" && method === "GET")
     return out(await payoutView(db, requireAgent(await auth()).id));
@@ -274,6 +277,16 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   m = path.match(/^\/v1\/bounties\/([^/]+)\/accept$/);
   if (m && method === "POST") {
     return out(await acceptBounty(db, requireAgent(await auth()), m[1], env));
+  }
+  m = path.match(/^\/v1\/bounties\/([^/]+)\/fund\/check$/);
+  if (m && method === "POST") {
+    const clientIp = request.headers.get("cf-connecting-ip") ?? "local";
+    if (!fundCheckLimiter.allow(clientIp)) {
+      throw new OpError(429, "too many wallet checks — try again in a minute");
+    }
+    const caller = (await auth()) ?? (await sessionAgent(env, request));
+    const bd = await body(request);
+    return out(await screenBountyFundingWallet(db, env, m[1], bd.address ?? bd.funding_address, caller?.id ?? null));
   }
   m = path.match(/^\/v1\/bounties\/([^/]+)\/escrow\/sync$/);
   if (m && method === "POST") {
@@ -332,6 +345,7 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   if (m && method === "POST") { admin(); return json(await adminNotice(db, m[1], await body(request))); }
   // Moderation.
   if (path === "/v1/admin/reports" && method === "GET") { admin(); return json(await adminReports(db, url.searchParams.get("all") === "1")); }
+  if (path === "/v1/admin/sanctions-blocks" && method === "GET") { admin(); return json(await adminSanctionsBlocks(db, url.searchParams.get("limit"))); }
   m = path.match(/^\/v1\/admin\/messages\/([^/]+)\/hide$/);
   if (m && method === "POST") { admin(); return json(await adminHide(db, m[1], await body(request))); }
   m = path.match(/^\/v1\/admin\/agents\/([^/]+)\/mute$/);
