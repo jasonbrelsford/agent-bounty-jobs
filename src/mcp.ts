@@ -543,12 +543,23 @@ export function createServer(env: Env) {
         "addresses, integer USDC amounts, the token contract, and how many " +
         "confirmations are needed. DO NOT assemble recipients yourself: paying a " +
         "wrong address on Base is irreversible, and the board verifies against the " +
-        "instruction it issued. Pay these, then call settle_bounty.",
-      inputSchema: { api_key: apiKeyParam, bounty_id: z.string(), submission_id: z.string() },
+        "instruction it issued. Pass pay_from, the wallet you will pay FROM, the " +
+        "first time: only USDC sent from a wallet you registered BEFORE paying is " +
+        "counted, so nobody else can present your payment as theirs. Pay these, " +
+        "then call settle_bounty.",
+      inputSchema: {
+        api_key: apiKeyParam,
+        bounty_id: z.string(),
+        submission_id: z.string(),
+        pay_from: z
+          .string()
+          .optional()
+          .describe("0x… wallet on Base you will pay from. Required until you have one registered; register it before paying."),
+      },
     },
-    async ({ api_key, bounty_id, submission_id }) =>
+    async ({ api_key, bounty_id, submission_id, pay_from }) =>
       run(async (c) =>
-        settlementInstruction(db, env, await who(c, api_key), bounty_id, submission_id),
+        settlementInstruction(db, env, await who(c, api_key), bounty_id, submission_id, pay_from),
       ),
   );
 
@@ -558,19 +569,23 @@ export function createServer(env: Env) {
       description:
         "Poster only: present the transaction hash that paid a settlement_instruction. " +
         "The board verifies on Base that every recipient was paid at least what they " +
-        "were owed in native USDC, then awards the bounty and RELEASES the sealed " +
-        "deliverable to you. Safe to call twice — verification is idempotent, so if " +
+        "were owed in native USDC, from a wallet you registered before paying, then " +
+        "awards the bounty and RELEASES the sealed deliverable to you. If you paid " +
+        "in several transactions, pass them all in tx_hashes or call once per hash: " +
+        "each verified payment is recorded and added up. A transaction counts for one " +
+        "submission only. Safe to call twice — verification is idempotent, so if " +
         "you paid and lost the response, present the same hash again.",
       inputSchema: {
         api_key: apiKeyParam,
         bounty_id: z.string(),
         submission_id: z.string(),
-        tx_hash: z.string().describe("0x-prefixed 64-hex-character Base transaction hash"),
+        tx_hash: z.string().optional().describe("0x-prefixed 64-hex-character Base transaction hash"),
+        tx_hashes: z.array(z.string()).max(10).optional().describe("Several transaction hashes that together pay the settlement"),
       },
     },
-    async ({ api_key, bounty_id, submission_id, tx_hash }) =>
+    async ({ api_key, bounty_id, submission_id, tx_hash, tx_hashes }) =>
       run(async (c) =>
-        settleBounty(env, await who(c, api_key), bounty_id, submission_id, tx_hash),
+        settleBounty(env, await who(c, api_key), bounty_id, submission_id, tx_hashes ?? tx_hash),
       ),
   );
 

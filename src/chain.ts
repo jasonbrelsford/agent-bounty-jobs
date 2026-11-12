@@ -41,7 +41,9 @@ export function isTxHash(v: unknown): v is string {
  * a list back knows the transaction succeeded, is buried deep enough, and that
  * these transfers were emitted by the real USDC contract.
  */
-export async function usdcTransfers(rpcUrl: string, txHash: string): Promise<Transfer[]> {
+export type TxRead = { transfers: Transfer[]; blockTime: number };
+
+export async function usdcTransfers(rpcUrl: string, txHash: string): Promise<TxRead> {
   const receipt = (await rpc(rpcUrl, "eth_getTransactionReceipt", [txHash])) as {
     status?: string; blockNumber?: string; logs?: { address: string; topics: string[]; data: string }[];
   } | null;
@@ -57,7 +59,14 @@ export async function usdcTransfers(rpcUrl: string, txHash: string): Promise<Tra
       `transaction has ${confirmations} confirmation(s); ${MIN_CONFIRMATIONS} required before the deliverable is released. Try again shortly.`,
     );
 
-  return parseTransferLogs(receipt.logs ?? []);
+  // When the block was produced. A payment only counts if the paying wallet was
+  // registered before it, so a missing or unreadable timestamp is a refusal.
+  const block = (await rpc(rpcUrl, "eth_getBlockByNumber", [receipt.blockNumber, false])) as { timestamp?: string } | null;
+  const blockTime = block?.timestamp ? Number(hexToBigInt(block.timestamp)) : NaN;
+  if (!Number.isSafeInteger(blockTime) || blockTime <= 0)
+    throw new OpError(502, "could not read the block time for that transaction; try again shortly");
+
+  return { transfers: parseTransferLogs(receipt.logs ?? []), blockTime };
 }
 
 /**
@@ -92,13 +101,22 @@ export function parseTransferLogs(
  * than `==`: overpaying is the payer's business, underpaying is the board's.
  * Extra recipients are ignored — a batched transaction that also settles
  * something unrelated is still a valid settlement of this bounty.
+ *
+ * `payers`, when given, is the set of lower-case addresses the money must have
+ * come FROM. Transfers from anyone else are not counted at all. Settlement always
+ * passes it: without it, anybody's payment to the same recipients would pass.
  */
 export function coversPayouts(
-  transfers: Transfer[],
+  transfers: { from?: string; to: string; units: bigint }[],
   required: { address: string; amount_cents: number }[],
+  payers?: ReadonlySet<string>,
 ): { ok: true } | { ok: false; missing: { address: string; owed_cents: number; paid_cents: number }[] } {
   const paid = new Map<string, bigint>();
-  for (const t of transfers) paid.set(t.to, (paid.get(t.to) ?? 0n) + t.units);
+  for (const t of transfers) {
+    if (payers && !(t.from && payers.has(t.from.toLowerCase()))) continue;
+    const to = t.to.toLowerCase();
+    paid.set(to, (paid.get(to) ?? 0n) + t.units);
+  }
   const missing = required
     .map((r) => {
       const got = paid.get(r.address.toLowerCase()) ?? 0n;

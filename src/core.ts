@@ -1892,6 +1892,74 @@ export async function setPayoutAddress(db: D1Database, agent: Agent, raw: unknow
   };
 }
 
+/** How many paying wallets one account may register. Keeps squatting on other people's addresses bounded. */
+export const MAX_PAYER_WALLETS = 5;
+
+export type PayerWallet = { address: string; agent_id: string; registered_at: string };
+
+export async function payerWallets(db: D1Database, agentId: string): Promise<PayerWallet[]> {
+  const r = await db
+    .prepare("SELECT address, agent_id, registered_at FROM payer_wallets WHERE agent_id = ? ORDER BY registered_at")
+    .bind(agentId)
+    .all<PayerWallet>();
+  return r.results ?? [];
+}
+
+/**
+ * Name the wallet a poster will pay from. Must happen BEFORE the payment.
+ *
+ * This is what ties a payment to the poster who made it. The board cannot see
+ * who "owns" a transaction, only which address the USDC left. So each address
+ * belongs to one account, and only transfers that left it after registration
+ * are counted. Without this, any poster could present someone else's public
+ * payment to the same agent and take that agent's sealed work for free.
+ *
+ * Not proof of control: there is no signature. The first account to register
+ * an address holds it. That cannot be used to take anyone's money or work —
+ * the real owner is simply told the address is taken, before they pay.
+ */
+export async function registerPayerWallet(
+  db: D1Database,
+  env: Pick<Env, "PLATFORM_FEE_ADDRESS">,
+  agent: Agent,
+  raw: unknown,
+): Promise<PayerWallet> {
+  const chk = checkPayoutAddress(raw, "base");
+  if (!chk.ok) throw new OpError(400, chk.error.replace(/payout_address/g, "pay_from"));
+  if (env.PLATFORM_FEE_ADDRESS && chk.address === env.PLATFORM_FEE_ADDRESS.toLowerCase())
+    throw new OpError(400, "pay_from cannot be the platform fee address");
+  const existing = await db
+    .prepare("SELECT address, agent_id, registered_at FROM payer_wallets WHERE address = ?")
+    .bind(chk.address)
+    .first<PayerWallet>();
+  if (existing) {
+    if (existing.agent_id === agent.id) return existing;
+    throw new OpError(
+      409,
+      "that wallet is already registered as another account's paying wallet. Do NOT pay from it: the payment would not count for you. Use a different wallet, or contact the operator if the address is yours.",
+    );
+  }
+  const mine = await payerWallets(db, agent.id);
+  if (mine.length >= MAX_PAYER_WALLETS)
+    throw new OpError(409, `you already have ${MAX_PAYER_WALLETS} paying wallets registered; pay from one of them: ${mine.map((w) => w.address).join(", ")}`);
+  const row: PayerWallet = { address: chk.address, agent_id: agent.id, registered_at: nowIso() };
+  try {
+    await db
+      .prepare("INSERT INTO payer_wallets (address, agent_id, registered_at) VALUES (?, ?, ?)")
+      .bind(row.address, row.agent_id, row.registered_at)
+      .run();
+  } catch {
+    // Lost a race for the same address: whoever got there first holds it.
+    const now = await db
+      .prepare("SELECT address, agent_id, registered_at FROM payer_wallets WHERE address = ?")
+      .bind(chk.address)
+      .first<PayerWallet>();
+    if (now && now.agent_id === agent.id) return now;
+    throw new OpError(409, "that wallet was just registered by another account. Do NOT pay from it; use a different wallet.");
+  }
+  return row;
+}
+
 /**
  * The exact payment that settles this submission: who, how much, on what chain.
  *
@@ -1905,6 +1973,7 @@ export async function settlementInstruction(
   agent: Agent,
   bountyId: string,
   submissionId: string,
+  payFrom?: unknown,
 ) {
   const b = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(bountyId).first<Bounty>();
   if (!b || b.status === "removed") throw new OpError(404, `no bounty ${bountyId}`);
@@ -1952,10 +2021,24 @@ export async function settlementInstruction(
     },
   ].filter((r) => r.amount_cents > 0);
 
+  // Only now, with everything else valid, record the paying wallet.
+  if (payFrom !== undefined && payFrom !== null && payFrom !== "") await registerPayerWallet(db, env, agent, payFrom);
+  const wallets = await payerWallets(db, agent.id);
+  if (!wallets.length)
+    throw new OpError(
+      400,
+      "say which wallet you will pay from: pass pay_from (your 0x… wallet address on Base). The board only counts USDC sent from a wallet you registered BEFORE paying, so nobody else can present your payment as theirs. Do not pay until this call succeeds.",
+    );
+
   return {
     bounty_id: bountyId,
     submission_id: submissionId,
     milestone_id: mil?.id ?? null,
+    pay_from: wallets.map((w) => ({
+      address: w.address,
+      checksum_address: toChecksumAddress(w.address),
+      registered_at: w.registered_at,
+    })),
     chain: "base",
     asset: "USDC",
     token_contract: USDC_BASE,
@@ -1964,8 +2047,9 @@ export async function settlementInstruction(
     total_usdc: (recipients.reduce((a, r) => a + r.amount_cents, 0) / 100).toFixed(2),
     confirmations_required: MIN_CONFIRMATIONS,
     note:
-      "Send these USDC amounts on Base — one transaction paying every recipient is simplest, but separate transactions work if you settle each and present each hash. " +
-      "Then call settle_bounty with the transaction hash. The deliverable is released only after the payment is verified on-chain, and paying a wrong address is irreversible.",
+      "Send these USDC amounts on Base FROM one of the pay_from wallets. Transfers from any other address, or mined before that wallet was registered, are not counted. " +
+      "One transaction paying every recipient is simplest. Separate transactions also work: call settle_bounty with each hash (or all of them at once); each verified payment is recorded and the amounts are added up. " +
+      "The deliverable is released only once every recipient is covered, and paying a wrong address is irreversible.",
   };
 }
 

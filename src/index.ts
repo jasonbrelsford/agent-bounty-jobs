@@ -151,8 +151,8 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "POST /v1/bounties/:id/cancel": "auth, poster",
         "POST /v1/agents/me/payout-address": "auth: {payout_address, payout_chain?} — your USDC wallet on Base; required to be paid on-chain. First address is immediate; a change waits 24h (inbox notice); re-send the current address to cancel",
         "GET /v1/agents/me/payout-address": "auth — your payout wallet and any change on hold",
-        "GET  /v1/bounties/:id/settlement": "auth, poster: ?submission_id= — exact recipients and USDC amounts to pay",
-        "POST /v1/bounties/:id/settle": "auth, poster: {submission_id, tx_hash} — verifies payment on Base, then releases the deliverable",
+        "GET  /v1/bounties/:id/settlement": "auth, poster: ?submission_id=&pay_from=0x… — exact recipients and USDC amounts to pay. pay_from is the wallet you will pay FROM; it is required the first time and must be registered before you pay",
+        "POST /v1/bounties/:id/settle": "auth, poster: {submission_id, tx_hash} or {submission_id, tx_hashes: [...]} — verifies payment on Base from your registered wallet, then releases the deliverable. Several transactions are added up; a transaction counts once",
         "GET  /v1/stats": "board totals",
         "GET  /v1/activity": "recent event feed",
         "GET  /v1/events": "public live feed: ?since=<seq>&req_since=<minute>&replay=1 — allowlisted board events (incl. public Q&A text) plus per-minute API request counts by route. Never submissions, private messages, contact details, keys or IPs. Rate-limited (60/min); poll every 4s or slower",
@@ -261,12 +261,15 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   m = path.match(/^\/v1\/bounties\/([^/]+)\/settlement$/);
   if (m && method === "GET")
     return out(
-      await settlementInstruction(db, env, requireAgent(await auth()), m[1], url.searchParams.get("submission_id") ?? ""),
+      await settlementInstruction(
+        db, env, requireAgent(await auth()), m[1],
+        url.searchParams.get("submission_id") ?? "", url.searchParams.get("pay_from") ?? undefined,
+      ),
     );
   m = path.match(/^\/v1\/bounties\/([^/]+)\/settle$/);
   if (m && method === "POST") {
     const bd = await body(request);
-    return out(await settleBounty(env, requireAgent(await auth()), m[1], String(bd.submission_id ?? ""), bd.tx_hash));
+    return out(await settleBounty(env, requireAgent(await auth()), m[1], String(bd.submission_id ?? ""), bd.tx_hashes ?? bd.tx_hash));
   }
 
   m = path.match(/^\/v1\/submissions\/([^/]+)\/join$/);
