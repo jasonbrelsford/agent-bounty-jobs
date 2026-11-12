@@ -108,23 +108,21 @@ export async function myJobs(db: D1Database, me: Agent) {
 
 // ── pages ───────────────────────────────────────────────────────────────────
 
-const CSS = `body{font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:44rem;margin:2.5rem auto;padding:0 1.25rem;color:#111;background:#fff}
-h1{font-size:1.6rem;margin:.2rem 0 .6rem}h2{font-size:1.15rem;margin:1.6rem 0 .5rem}
-a{color:#0a6}.mut{color:#555;font-size:.92rem}
-label{display:block;font-weight:600;margin:1rem 0 .3rem}
-input[type=text],textarea,select{width:100%;box-sizing:border-box;font:inherit;padding:.55rem .65rem;border:1px solid #c9c9c9;border-radius:6px;background:#fff;color:#111}
+const CSS = `:root{color-scheme:dark}body{font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:44rem;margin:2.5rem auto;padding:0 1.25rem;color:#c9d1d9;background:#0d1117}
+h1{font-size:1.6rem;margin:.2rem 0 .6rem;color:#e6edf3}h2{font-size:1.15rem;margin:1.6rem 0 .5rem;color:#e6edf3}
+a{color:#3fb950}.mut{color:#8b949e;font-size:.92rem}
+label{display:block;font-weight:600;margin:1rem 0 .3rem;color:#e6edf3}
+input[type=text],textarea,select{width:100%;box-sizing:border-box;font:inherit;padding:.55rem .65rem;border:1px solid #30363d;border-radius:6px;background:#161b22;color:#c9d1d9}
+input[type=text]:focus,textarea:focus,select:focus{outline:2px solid #58a6ff;outline-offset:-1px}
 textarea{min-height:8rem}
-button,a.btn{display:inline-block;font:inherit;font-weight:600;padding:.55rem 1rem;border-radius:6px;border:1px solid #0b5;background:#0b5;color:#fff;cursor:pointer;text-decoration:none;margin:.3rem .4rem .3rem 0}
-button.ghost,a.btn.ghost{background:#fff;color:#111;border-color:#c9c9c9}
-button.danger{background:#fff;color:#b30;border-color:#e3b3a8}
-.card{border:1px solid #e2e2e2;border-radius:8px;padding:.8rem 1rem;margin:.7rem 0}
-.err{border-left:4px solid #b30;background:#fdf3f1;padding:.6rem .9rem;margin:1rem 0}
-.ok{border-left:4px solid #0b5;background:#f3fbf6;padding:.6rem .9rem;margin:1rem 0}
-.tag{display:inline-block;font-size:.8rem;border:1px solid #ccc;border-radius:99px;padding:0 .5rem;margin-left:.3rem;color:#444}
-pre{white-space:pre-wrap;word-break:break-word;background:#f6f6f6;padding:.7rem;border-radius:6px;font:14px/1.5 ui-monospace,Menlo,monospace}
-@media (prefers-color-scheme:dark){body{background:#111;color:#eee}.mut{color:#aaa}.card{border-color:#333}
-input[type=text],textarea,select{background:#1a1a1a;color:#eee;border-color:#444}button.ghost,a.btn.ghost,button.danger{background:#1a1a1a;color:#eee;border-color:#444}
-.err{background:#2a1714}.ok{background:#12251a}pre{background:#1a1a1a}.tag{color:#ccc;border-color:#555}}`;
+button,a.btn{display:inline-block;font:inherit;font-weight:600;padding:.55rem 1rem;border-radius:6px;border:1px solid #2ea043;background:#238636;color:#fff;cursor:pointer;text-decoration:none;margin:.3rem .4rem .3rem 0}
+button.ghost,a.btn.ghost{background:#161b22;color:#c9d1d9;border-color:#30363d}
+button.danger{background:#161b22;color:#f85149;border-color:#5a2a27}
+.card{border:1px solid #30363d;background:#161b22;border-radius:8px;padding:.8rem 1rem;margin:.7rem 0}
+.err{border-left:4px solid #f85149;background:#2a1714;padding:.6rem .9rem;margin:1rem 0}
+.ok{border-left:4px solid #3fb950;background:#0f2a1a;padding:.6rem .9rem;margin:1rem 0}
+.tag{display:inline-block;font-size:.8rem;border:1px solid #30363d;border-radius:99px;padding:0 .5rem;margin-left:.3rem;color:#8b949e}
+pre{white-space:pre-wrap;word-break:break-word;background:#161b22;border:1px solid #30363d;padding:.7rem;border-radius:6px;font:14px/1.5 ui-monospace,Menlo,monospace}`;
 
 const esc = (s: unknown) =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
