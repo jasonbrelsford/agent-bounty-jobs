@@ -183,57 +183,15 @@ test("fee plus payouts always equals the pot, per milestone", () => {
   assert.equal(feed, feeSplit(total, bp).fee, "total fee equals the whole-bounty fee");
 });
 
-import { coversPayouts, isAddress, isTxHash } from "../.test-build/chain.js";
+import { isAddress, isTxHash } from "../.test-build/chain.js";
 import { UNITS_PER_CENT } from "../.test-build/core.js";
 
-const t = (to, cents) => ({ from: "0xdead", to: to.toLowerCase(), units: BigInt(cents) * UNITS_PER_CENT });
 const A = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const B = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const FEE = "0xffffffffffffffffffffffffffffffffffffffff";
 
-test("exact payment settles", () => {
-  const req = [{ address: A, amount_cents: 299 }, { address: FEE, amount_cents: 1 }];
-  assert.equal(coversPayouts([t(A, 299), t(FEE, 1)], req).ok, true);
-});
-
-test("underpayment is refused and names the shortfall", () => {
-  const req = [{ address: A, amount_cents: 299 }, { address: FEE, amount_cents: 1 }];
-  const r = coversPayouts([t(A, 298), t(FEE, 1)], req);
-  assert.equal(r.ok, false);
-  assert.equal(r.missing.length, 1);
-  assert.equal(r.missing[0].owed_cents, 299);
-  assert.equal(r.missing[0].paid_cents, 298);
-});
-
-test("a missing recipient entirely is refused", () => {
-  const req = [{ address: A, amount_cents: 100 }, { address: FEE, amount_cents: 1 }];
-  const r = coversPayouts([t(A, 100)], req);
-  assert.equal(r.ok, false);
-  assert.equal(r.missing[0].address, FEE);
-});
-
-test("overpayment settles — that is the payer's business, not ours", () => {
-  assert.equal(coversPayouts([t(A, 500)], [{ address: A, amount_cents: 299 }]).ok, true);
-});
-
-test("split transfers to one address are summed", () => {
-  // A poster paying in two chunks still paid. Treating each transfer separately
-  // would reject a legitimate settlement.
-  assert.equal(coversPayouts([t(A, 100), t(A, 199)], [{ address: A, amount_cents: 299 }]).ok, true);
-});
-
-test("unrelated extra recipients are ignored", () => {
-  const r = coversPayouts([t(A, 299), t(FEE, 1), t(B, 5000)], [{ address: A, amount_cents: 299 }, { address: FEE, amount_cents: 1 }]);
-  assert.equal(r.ok, true);
-});
-
-test("address comparison is case-insensitive", () => {
-  assert.equal(coversPayouts([t(A.toUpperCase(), 100)], [{ address: A.toUpperCase(), amount_cents: 100 }]).ok, true);
-});
-
-test("zero-fee settlements need no fee transfer", () => {
-  assert.equal(coversPayouts([t(A, 100)], [{ address: A, amount_cents: 100 }]).ok, true);
-});
+// How a payment is matched to a settlement (exact amount per recipient, each
+// transfer counted once) is tested in settle.test.mjs.
 
 test("address and tx-hash shapes are validated", () => {
   assert.ok(isAddress(A));

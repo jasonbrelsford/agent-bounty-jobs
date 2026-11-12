@@ -4,7 +4,7 @@
  * the board verifies payments it did not make and cannot make, which is what
  * keeps it out of the custody path.
  */
-import { OpError, USDC_BASE, UNITS_PER_CENT, MIN_CONFIRMATIONS } from "./core.js";
+import { OpError, USDC_BASE, MIN_CONFIRMATIONS } from "./core.js";
 
 /** keccak256("Transfer(address,address,uint256)") */
 const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
@@ -95,30 +95,4 @@ export function parseTransferLogs(
       units: hexToBigInt(l.data),
       logIndex: l.logIndex,
     }));
-}
-
-/**
- * Does this transaction pay every required recipient at least what they are owed?
- *
- * Transfers to the same address are summed, and the comparison is `>=` rather
- * than `==`: overpaying is the payer's business, underpaying is the board's.
- * Extra recipients are ignored — a batched transaction that also settles
- * something unrelated is still a valid settlement of this bounty.
- */
-export function coversPayouts(
-  transfers: Transfer[],
-  required: { address: string; amount_cents: number }[],
-): { ok: true } | { ok: false; missing: { address: string; owed_cents: number; paid_cents: number }[] } {
-  const paid = new Map<string, bigint>();
-  for (const t of transfers) paid.set(t.to, (paid.get(t.to) ?? 0n) + t.units);
-  const missing = required
-    .map((r) => {
-      const got = paid.get(r.address.toLowerCase()) ?? 0n;
-      const owed = BigInt(r.amount_cents) * UNITS_PER_CENT;
-      return got >= owed
-        ? null
-        : { address: r.address, owed_cents: r.amount_cents, paid_cents: Number(got / UNITS_PER_CENT) };
-    })
-    .filter((x): x is { address: string; owed_cents: number; paid_cents: number } => x !== null);
-  return missing.length ? { ok: false, missing } : { ok: true };
 }

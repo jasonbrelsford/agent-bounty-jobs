@@ -12,7 +12,7 @@
 --     accepted one hash that had to pay everyone. A poster with an ordinary
 --     wallet (one transfer per transaction) could not settle.
 --
--- How: each recipient of a settlement is a "leg" with an EXACT amount. The
+-- How: each recipient of a settlement has a "leg" with an EXACT amount. The
 -- amount is what is owed plus a tiny tag (under one cent) chosen so that no two
 -- open legs anywhere share the same recipient and amount. A transfer of exactly
 -- that amount to that address can therefore only be the payment for that leg,
@@ -28,7 +28,7 @@ CREATE TABLE settlement_legs (
   address       TEXT NOT NULL,             -- lower-case recipient
   amount_cents  INTEGER NOT NULL,          -- what is owed
   units         TEXT NOT NULL,             -- exact USDC units to send: owed + tag
-  open          INTEGER NOT NULL DEFAULT 1,-- 0 once settled or replaced
+  open          INTEGER NOT NULL DEFAULT 1,-- 1 while it can be paid; 0 after
   created_at    TEXT NOT NULL,
   paid_tx       TEXT,                      -- transaction that paid this leg
   paid_log      INTEGER,                   -- log index of the transfer inside it
@@ -36,8 +36,8 @@ CREATE TABLE settlement_legs (
 );
 -- Load-bearing: among open legs, a recipient and exact amount identify one leg.
 CREATE UNIQUE INDEX idx_legs_amount ON settlement_legs (address, units) WHERE open = 1;
--- One open set of legs per submission.
-CREATE UNIQUE INDEX idx_legs_recipient ON settlement_legs (submission_id, role, agent_id) WHERE open = 1;
+-- A recipient of a submission is paid once, whichever of its legs is paid.
+CREATE UNIQUE INDEX idx_legs_paid_once ON settlement_legs (submission_id, role, agent_id) WHERE paid_tx IS NOT NULL;
 CREATE INDEX idx_legs_submission ON settlement_legs (submission_id);
 
 -- Every transfer the board has counted. The primary key is the transfer itself
@@ -68,6 +68,3 @@ GROUP BY tx_hash;
 -- whose payments share a transaction (a bundle) both pay the fee address in it.
 DROP INDEX idx_settlement_tx;
 CREATE INDEX idx_settlement_tx ON settlements (tx_hash);
-
--- A submission is settled once. Stops two racing requests both writing rows.
-CREATE UNIQUE INDEX idx_settlement_once ON settlements (submission_id, recipient, role);

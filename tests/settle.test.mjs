@@ -6,10 +6,11 @@ import { readFileSync } from "node:fs";
 import { makeD1 } from "./d1shim.mjs";
 import {
   registerAgent, authByKey, postBounty, submitToBounty, settlementInstruction, setPayoutAddress,
-  getBounty, expireOverdue, unitsToUsdc, LEG_TAG_MAX, UNITS_PER_CENT,
+  getBounty, expireOverdue, unitsToUsdc, randomTag, withdrawSubmission, reviewSubmission, joinSubmission,
+  LEG_TAG_MAX, UNITS_PER_CENT, HALF_AWARD_RETRY_MS,
 } from "../.test-build/core.js";
 import { settleBounty, MAX_TX_HASHES, LEG_CLOCK_ALLOWANCE_S } from "../.test-build/settle.js";
-import { parseTransferLogs } from "../.test-build/chain.js";
+import { parseTransferLogs, usdcTransfers } from "../.test-build/chain.js";
 
 // Addresses and hashes carry hex letters so that case handling is really tested.
 const addr = (c) => "0x" + c.repeat(20);
@@ -87,6 +88,7 @@ test("each recipient gets an exact amount: what is owed plus a tag under one cen
   const again = await settlementInstruction(db, ENV, poster.a, b.bounty_id, s.submission_id);
   assert.deepEqual(again.recipients.map((r) => r.amount_units), ins.recipients.map((r) => r.amount_units), "asking twice does not change the amounts");
   assert.equal(count(db, "settlement_legs"), 2);
+  assert.equal(ins.total_usdc, unitsToUsdc(ins.recipients.reduce((a, r) => a + BigInt(r.amount_units), 0n)));
 });
 
 test("unitsToUsdc prints six decimals for any size", () => {
@@ -358,7 +360,6 @@ test("H2: a team of two plus the fee, paid in three transactions", async () => {
   const lead = await agent(db, "lead", { payout_address: AGENT_WALLET });
   const mate = await agent(db, "mate", { payout_address: AGENT2_WALLET });
   const b = await postBounty(db, poster.a, ENV, BOUNTY);
-  const { joinSubmission } = await import("../.test-build/core.js");
   const s = await submitToBounty(db, lead.a, b.bounty_id, SUB[0], [{ agent_id: lead.agent_id, share_bp: 6000 }, { agent_id: mate.agent_id, share_bp: 4000 }], SUB[2]);
   await joinSubmission(db, mate.a, s.submission_id);
   const ins = await settlementInstruction(db, ENV, poster.a, b.bounty_id, s.submission_id);
@@ -390,7 +391,27 @@ test("a payout address change after part is paid does not strand the money alrea
   assert.equal((await settleBounty(env(db), poster.a, b.bounty_id, s.submission_id, tx(2), c)).settled, true);
 });
 
-test("a payout address change before anything is paid moves the instruction to the new address", async () => {
+test("a payout address change that comes due after the poster paid, but before they present the hash, still settles", async () => {
+  const db = makeD1();
+  const { poster, filler, b } = await setup(db);
+  const s = await submitToBounty(db, filler.a, b.bounty_id, ...SUB);
+  await setPayoutAddress(db, filler.a, NEW_WALLET);
+  const first = await owed(db, poster, b, s); // told to pay the current (old) address
+  const c = chain({ [tx(1)]: { transfers: [[PAYER, AGENT_WALLET, first.agentUnits], [PAYER, FEE, first.feeUnits]] } });
+  // The poster pays exactly that. While it confirms, the hold lapses, and they even look at the instruction again.
+  db.raw.prepare("UPDATE agents SET payout_pending_effective_at = ? WHERE id = ?").run(new Date(Date.now() - 1000).toISOString(), filler.agent_id);
+  const second = await owed(db, poster, b, s);
+  assert.equal(second.by.contributor.address, NEW_WALLET, "someone who has not paid yet is now sent to the new address");
+  assert.notEqual(second.agentUnits, first.agentUnits);
+  assert.equal(second.feeUnits, first.feeUnits, "the fee leg did not change, so it was not reissued");
+  // The payment already made is honoured.
+  const r = await settleBounty(env(db), poster.a, b.bounty_id, s.submission_id, tx(1), c);
+  assert.equal(r.settled, true);
+  assert.equal(await content(db, b, poster, s), SUB[0]);
+  assert.equal(count(db, "settlement_legs", "open = 1"), 0);
+});
+
+test("after an address change either the old or the new amount pays the agent, but only once", async () => {
   const db = makeD1();
   const { poster, filler, b } = await setup(db);
   const s = await submitToBounty(db, filler.a, b.bounty_id, ...SUB);
@@ -398,15 +419,237 @@ test("a payout address change before anything is paid moves the instruction to t
   const first = await owed(db, poster, b, s);
   db.raw.prepare("UPDATE agents SET payout_pending_effective_at = ? WHERE id = ?").run(new Date(Date.now() - 1000).toISOString(), filler.agent_id);
   const second = await owed(db, poster, b, s);
-  assert.equal(second.by.contributor.address, NEW_WALLET);
-  assert.equal(count(db, "settlement_legs", "open = 1"), 2, "the old legs were retired");
-  // Paying the retired amounts to the old address settles nothing.
   const c = chain({
-    [tx(1)]: { transfers: [[PAYER, AGENT_WALLET, first.agentUnits], [PAYER, FEE, first.feeUnits]] },
-    [tx(2)]: { transfers: [[PAYER, NEW_WALLET, second.agentUnits], [PAYER, FEE, second.feeUnits]] },
+    [tx(1)]: { transfers: [[PAYER, NEW_WALLET, second.agentUnits]] },
+    [tx(2)]: { transfers: [[PAYER, AGENT_WALLET, first.agentUnits]] },
+    [tx(3)]: { transfers: [[PAYER, FEE, second.feeUnits]] },
   });
-  await assert.rejects(settleBounty(env(db), poster.a, b.bounty_id, s.submission_id, tx(1), c), status(400, /no transfer/));
+  await assert.rejects(settleBounty(env(db), poster.a, b.bounty_id, s.submission_id, tx(1), c), status(400, /^recorded/));
+  assert.equal(count(db, "settlement_legs", "open = 1 AND role = 'contributor' AND paid_tx IS NULL"), 0, "the agent's other amount is closed once one is paid");
+  // The old amount no longer counts for anything.
+  await assert.rejects(settleBounty(env(db), poster.a, b.bounty_id, s.submission_id, tx(2), c), status(400, /no transfer in what you presented matches/));
+  assert.equal(count(db, "settlement_payments"), 1);
+  assert.equal((await settleBounty(env(db), poster.a, b.bounty_id, s.submission_id, tx(3), c)).settled, true);
+  const rows = db.raw.prepare("SELECT recipient FROM settlements WHERE submission_id = ? AND role = 'contributor'").all(s.submission_id);
+  assert.deepEqual(rows.map((r) => r.recipient), [NEW_WALLET]);
+  // The database itself refuses a second paid leg for one recipient.
+  assert.throws(() => db.raw.prepare("UPDATE settlement_legs SET paid_tx = 'x', paid_log = 1 WHERE submission_id = ? AND role = 'contributor' AND paid_tx IS NULL").run(s.submission_id));
+});
+
+test("two instruction requests at the same moment both hand out amounts that work", async () => {
+  const db = makeD1();
+  const { poster, filler, b } = await setup(db);
+  const s = await submitToBounty(db, filler.a, b.bounty_id, ...SUB);
+  const [one, two] = await Promise.all([owed(db, poster, b, s), owed(db, poster, b, s)]);
+  // Whether or not they were given the same amounts, a mix of the two sets settles.
+  const c = chain({ [tx(1)]: { transfers: [[PAYER, AGENT_WALLET, two.agentUnits], [PAYER, FEE, one.feeUnits]] } });
+  assert.equal((await settleBounty(env(db), poster.a, b.bounty_id, s.submission_id, tx(1), c)).settled, true);
+});
+
+test("once the poster has started paying, the agent cannot withdraw the submission", async () => {
+  const db = makeD1();
+  const { poster, filler, b } = await setup(db);
+  const s = await submitToBounty(db, filler.a, b.bounty_id, ...SUB);
+  const { agentUnits, feeUnits } = await owed(db, poster, b, s);
+  db.raw.prepare("UPDATE submissions SET pending_at = ?, created_at = ? WHERE id = ?").run(new Date(Date.now() - 40 * 86400_000).toISOString(), new Date(Date.now() - 40 * 86400_000).toISOString(), s.submission_id);
+  const c = chain({ [tx(1)]: { transfers: [[PAYER, AGENT_WALLET, agentUnits]] }, [tx(2)]: { transfers: [[PAYER, FEE, feeUnits]] } });
+  await assert.rejects(settleBounty(env(db), poster.a, b.bounty_id, s.submission_id, tx(1), c), status(400, /^recorded/));
+  await assert.rejects(withdrawSubmission(db, filler.a, s.submission_id), status(409, /started paying/));
   assert.equal((await settleBounty(env(db), poster.a, b.bounty_id, s.submission_id, tx(2), c)).settled, true);
+  // Without a payment, a stale submission can still be withdrawn as before.
+  const b2 = await postBounty(db, poster.a, ENV, BOUNTY);
+  const s2 = await submitToBounty(db, filler.a, b2.bounty_id, ...SUB);
+  await owed(db, poster, b2, s2);
+  db.raw.prepare("UPDATE submissions SET pending_at = ?, created_at = ? WHERE id = ?").run(new Date(Date.now() - 40 * 86400_000).toISOString(), new Date(Date.now() - 40 * 86400_000).toISOString(), s2.submission_id);
+  assert.equal((await withdrawSubmission(db, filler.a, s2.submission_id)).status, "withdrawn");
+  await assert.rejects(settlementInstruction(db, ENV, poster.a, b2.bounty_id, s2.submission_id), status(409));
+  const b3 = await postBounty(db, poster.a, ENV, BOUNTY);
+  const s3 = await submitToBounty(db, filler.a, b3.bounty_id, ...SUB);
+  await owed(db, poster, b3, s3);
+  assert.equal(count(db, "settlement_legs", "open = 1 AND submission_id = ?", s2.submission_id), 0, "a dead submission's amounts are released");
+});
+
+test("a request that dies after paying but before the award is finished by presenting the hash again", async () => {
+  const db = makeD1();
+  const { poster, filler, b } = await setup(db);
+  const s = await submitToBounty(db, filler.a, b.bounty_id, ...SUB);
+  const { agentUnits, feeUnits } = await owed(db, poster, b, s);
+  const c = chain({ [tx(1)]: { transfers: [[PAYER, AGENT_WALLET, agentUnits], [PAYER, FEE, feeUnits]] } });
+  // The award fails once with a database error, after the payments were recorded.
+  const real = db.prepare;
+  let armed = true;
+  db.prepare = (sql) => {
+    if (armed && /^UPDATE bounties SET status = 'awarded'/.test(sql.trim())) { armed = false; throw new Error("D1_ERROR: transient"); }
+    return real(sql);
+  };
+  await assert.rejects(settleBounty(env(db), poster.a, b.bounty_id, s.submission_id, tx(1), c), (e) => {
+    assert.equal(e.status, 503);
+    assert.match(e.message, /verified and recorded/);
+    assert.match(e.message, /Do not pay again\. Present the same hash again/);
+    return true;
+  });
+  db.prepare = real;
+  assert.equal(count(db, "settlements", "submission_id = ?", s.submission_id), 0, "nothing says settled");
+  assert.equal(await content(db, b, poster, s), null);
+  const r = await settleBounty(env(db), poster.a, b.bounty_id, s.submission_id, tx(1), c);
+  assert.equal(r.settled, true);
+  assert.equal(c.reads, 1, "the chain is not read again: the payment was already recorded");
+  assert.equal(await content(db, b, poster, s), SUB[0]);
+});
+
+test("an award that stopped half way (pot awarded, submission still pending) is finished on retry, but not while it may still be running", async () => {
+  const db = makeD1();
+  const { poster, filler, b } = await setup(db);
+  const s = await submitToBounty(db, filler.a, b.bounty_id, ...SUB);
+  const { agentUnits, feeUnits } = await owed(db, poster, b, s);
+  const c = chain({ [tx(1)]: { transfers: [[PAYER, AGENT_WALLET, agentUnits], [PAYER, FEE, feeUnits]] } });
+  // Fail the second step of the award: the bounty is already marked awarded.
+  const real = db.batch;
+  let armed = true;
+  db.batch = async (stmts) => {
+    if (armed && stmts.some((st) => /UPDATE submissions SET status = 'accepted'/.test(st.sql))) { armed = false; throw new Error("D1_ERROR: transient"); }
+    return real(stmts);
+  };
+  await assert.rejects(settleBounty(env(db), poster.a, b.bounty_id, s.submission_id, tx(1), c), status(409, /award is in progress\. Do not pay again/));
+  db.batch = real;
+  assert.equal(db.raw.prepare("SELECT status FROM bounties WHERE id = ?").get(b.bounty_id).status, "awarded");
+  assert.equal(db.raw.prepare("SELECT status FROM submissions WHERE id = ?").get(s.submission_id).status, "pending");
+  // Straight away: it could be another request still working, so it is not taken over.
+  await assert.rejects(settleBounty(env(db), poster.a, b.bounty_id, s.submission_id, tx(1), c), status(409, /in progress/));
+  // A minute later it is clearly dead, and the same submission finishes it.
+  assert.equal(HALF_AWARD_RETRY_MS, 60_000);
+  db.raw.prepare("UPDATE bounties SET awarded_at = ? WHERE id = ?").run(new Date(Date.now() - HALF_AWARD_RETRY_MS - 1000).toISOString(), b.bounty_id);
+  assert.equal((await settleBounty(env(db), poster.a, b.bounty_id, s.submission_id, tx(1), c)).settled, true);
+  assert.equal(await content(db, b, poster, s), SUB[0]);
+  assert.equal(count(db, "settlements", "submission_id = ?", s.submission_id), 2);
+});
+
+test("an award made by a request that died before writing its records gets them on the next call", async () => {
+  const db = makeD1();
+  const { poster, filler, b } = await setup(db);
+  const s = await submitToBounty(db, filler.a, b.bounty_id, ...SUB);
+  const { agentUnits, feeUnits } = await owed(db, poster, b, s);
+  const c = chain({ [tx(1)]: { transfers: [[PAYER, AGENT_WALLET, agentUnits], [PAYER, FEE, feeUnits]] } });
+  await settleBounty(env(db), poster.a, b.bounty_id, s.submission_id, tx(1), c);
+  db.raw.prepare("DELETE FROM settlements WHERE submission_id = ?").run(s.submission_id);
+  db.raw.prepare("UPDATE bounties SET settled_tx = NULL WHERE id = ?").run(b.bounty_id);
+  assert.equal((await settleBounty(env(db), poster.a, b.bounty_id, s.submission_id, tx(1), c)).already_settled, true);
+  assert.equal(count(db, "settlements", "submission_id = ?", s.submission_id), 2);
+  assert.equal(db.raw.prepare("SELECT settled_tx FROM bounties WHERE id = ?").get(b.bounty_id).settled_tx, tx(1));
+  // Leftover rows for a submission that was never awarded do not make it "already settled".
+  const b2 = await postBounty(db, poster.a, ENV, BOUNTY);
+  const s2 = await submitToBounty(db, filler.a, b2.bounty_id, ...SUB);
+  const o2 = await owed(db, poster, b2, s2);
+  const now = new Date().toISOString();
+  db.raw.prepare("INSERT INTO settlements (id, bounty_id, milestone_id, submission_id, tx_hash, recipient, amount_cents, role, verified_at, created_at) VALUES ('stl_left', ?, NULL, ?, ?, ?, 4750, 'contributor', ?, ?)").run(b2.bounty_id, s2.submission_id, tx(9), AGENT_WALLET, now, now);
+  const c2 = chain({ [tx(2)]: { transfers: [[PAYER, FEE, 1n]] }, [tx(3)]: { transfers: [[PAYER, AGENT_WALLET, o2.agentUnits], [PAYER, FEE, o2.feeUnits]] } });
+  await assert.rejects(settleBounty(env(db), poster.a, b2.bounty_id, s2.submission_id, tx(2), c2), status(400, /no transfer/));
+  assert.equal(await content(db, b2, poster, s2), null);
+  assert.equal((await settleBounty(env(db), poster.a, b2.bounty_id, s2.submission_id, tx(3), c2)).settled, true);
+});
+
+test("a milestone is settled on its own and its id is kept all the way through", async () => {
+  const db = makeD1();
+  const poster = await agent(db, "ms-poster");
+  const filler = await agent(db, "ms-filler", { payout_address: AGENT_WALLET });
+  const b = await postBounty(db, poster.a, ENV, {
+    ...BOUNTY, reward_amount_cents: undefined,
+    milestones: [{ title: "Part one", reward_amount_cents: 2000 }, { title: "Part two", reward_amount_cents: 3000 }],
+  });
+  const ms = db.raw.prepare("SELECT id, title FROM milestones WHERE bounty_id = ? ORDER BY rowid").all(b.bounty_id);
+  const s = await submitToBounty(db, filler.a, b.bounty_id, SUB[0], undefined, SUB[2], ms[0].id);
+  const ins = await settlementInstruction(db, ENV, poster.a, b.bounty_id, s.submission_id);
+  assert.equal(ins.milestone_id, ms[0].id);
+  assert.equal(ins.total_cents, 2000);
+  assert.equal(ins.total_usdc, unitsToUsdc(ins.recipients.reduce((a, r) => a + BigInt(r.amount_units), 0n)), "the total is the sum of the exact amounts");
+  const c = chain({ [tx(1)]: { transfers: ins.recipients.map((r) => [PAYER, r.address, r.amount_units]) } });
+  const r = await settleBounty(env(db), poster.a, b.bounty_id, s.submission_id, tx(1), c);
+  assert.equal(r.settled, true);
+  assert.equal(r.milestone_id, ms[0].id);
+  assert.deepEqual(db.raw.prepare("SELECT DISTINCT milestone_id FROM settlement_legs WHERE submission_id = ?").all(s.submission_id).map((x) => x.milestone_id), [ms[0].id]);
+  assert.deepEqual(db.raw.prepare("SELECT DISTINCT milestone_id FROM settlements WHERE submission_id = ?").all(s.submission_id).map((x) => x.milestone_id), [ms[0].id]);
+  assert.deepEqual(db.raw.prepare("SELECT status FROM milestones WHERE bounty_id = ? ORDER BY rowid").all(b.bounty_id).map((x) => x.status), ["awarded", "open"]);
+  assert.equal(db.raw.prepare("SELECT settled_tx FROM bounties WHERE id = ?").get(b.bounty_id).settled_tx, tx(1));
+});
+
+test("an on-chain bounty cannot be awarded without a verified payment", async () => {
+  const db = makeD1();
+  const { poster, filler, b } = await setup(db);
+  const s = await submitToBounty(db, filler.a, b.bounty_id, ...SUB);
+  await assert.rejects(reviewSubmission(db, poster.a, b.bounty_id, s.submission_id, "accept"), status(409));
+  await assert.rejects(reviewSubmission(db, poster.a, b.bounty_id, s.submission_id, "accept", undefined, tx(1)), status(409));
+  assert.equal(await content(db, b, poster, s), null);
+});
+
+test("the limits are what the documentation says", () => {
+  assert.equal(LEG_TAG_MAX, 9999, "a tag is always under one cent");
+  assert.equal(LEG_CLOCK_ALLOWANCE_S, 600);
+  assert.equal(MAX_TX_HASHES, 10);
+  assert.equal(UNITS_PER_CENT, 10000n);
+});
+
+test("tags run from 1 to 9999 and never 0, whatever the random source returns", () => {
+  const real = crypto.getRandomValues.bind(crypto);
+  const feed = (values) => { let i = 0; crypto.getRandomValues = (buf) => { buf[0] = values[i++ % values.length]; return buf; }; };
+  try {
+    feed([0]); assert.equal(randomTag(), 1);
+    feed([9998]); assert.equal(randomTag(), 9999);
+    feed([9999]); assert.equal(randomTag(), 1);
+    // Values at the very top of the range would make some tags likelier than others; they are redrawn.
+    feed([0xffffffff, 4]); assert.equal(randomTag(), 5);
+  } finally { crypto.getRandomValues = real; }
+  const seen = new Set();
+  for (let i = 0; i < 4000; i++) { const t = randomTag(); assert.ok(t >= 1 && t <= 9999); seen.add(t); }
+  assert.ok(seen.size > 3000, "tags are spread out, not drawn from a handful of values");
+});
+
+// ── Reading the chain ───────────────────────────────────────────────────
+
+/** A stand-in for the Base RPC endpoint. */
+function rpcStub({ receipt, head = "0x64", block = { timestamp: "0x65000000" } }) {
+  const calls = [];
+  const real = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    const { method, params } = JSON.parse(init.body);
+    calls.push(method);
+    const result = method === "eth_getTransactionReceipt" ? receipt
+      : method === "eth_blockNumber" ? head
+      : method === "eth_getBlockByNumber" ? (params[0] === receipt?.blockNumber ? block : null)
+      : undefined;
+    return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result }), { status: 200 });
+  };
+  return { calls, restore: () => { globalThis.fetch = real; } };
+}
+const USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+const TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const pad = (a) => "0x" + "0".repeat(24) + a.slice(2);
+const usdcLog = (to, units, logIndex) => ({ address: USDC, topics: [TOPIC, pad(PAYER), pad(to)], data: "0x" + BigInt(units).toString(16), logIndex });
+
+test("reading a transaction: transfers, log positions and the block's own time", async () => {
+  const receipt = { status: "0x1", blockNumber: "0x50", logs: [usdcLog(AGENT_WALLET, 47503917, "0x2b"), usdcLog(FEE, 2500142, "0x2c")] };
+  const stub = rpcStub({ receipt, head: "0x55", block: { timestamp: "0x65000000" } }); // 6 confirmations
+  try {
+    const r = await usdcTransfers("https://rpc.example", tx(1));
+    assert.equal(r.blockTime, 0x65000000, "the time comes from the block, not from this machine's clock");
+    assert.deepEqual(r.transfers.map((t) => [t.to, t.units, t.logIndex]), [[AGENT_WALLET, 47503917n, 43], [FEE, 2500142n, 44]]);
+    assert.deepEqual(stub.calls, ["eth_getTransactionReceipt", "eth_blockNumber", "eth_getBlockByNumber"]);
+  } finally { stub.restore(); }
+});
+
+test("reading a transaction refuses reverted, missing, shallow and untimed ones", async () => {
+  const logs = [usdcLog(AGENT_WALLET, 1, "0x0")];
+  const cases = [
+    [{ receipt: null }, 404],
+    [{ receipt: { status: "0x0", blockNumber: "0x50", logs } }, 400],
+    [{ receipt: { status: "0x1", blockNumber: "0x50", logs }, head: "0x54" }, 409],       // 5 confirmations
+    [{ receipt: { status: "0x1", blockNumber: "0x50", logs }, head: "0x55", block: null }, 502],
+    [{ receipt: { status: "0x1", blockNumber: "0x50", logs }, head: "0x55", block: { timestamp: "0x0" } }, 502],
+  ];
+  for (const [setup, code] of cases) {
+    const stub = rpcStub(setup);
+    try { await assert.rejects(usdcTransfers("https://rpc.example", tx(1)), (e) => e.status === code, `expected ${code}`); }
+    finally { stub.restore(); }
+  }
 });
 
 test("if the bounty expires while the payment is being read, nothing claims to be settled", async () => {
@@ -425,8 +668,9 @@ test("if the bounty expires while the payment is being read, nothing claims to b
   await assert.rejects(
     settleBounty(env(db), poster.a, b.bounty_id, s.submission_id, tx(1), c),
     (e) => {
+      assert.equal(e.status, 409);
       assert.match(e.message, /payment is verified and recorded, but the award could not be made/);
-      assert.match(e.message, /Do not pay again/);
+      assert.match(e.message, /Do not pay again\. Contact the operator/);
       return true;
     },
   );
@@ -434,10 +678,8 @@ test("if the bounty expires while the payment is being read, nothing claims to b
   assert.equal(count(db, "settlement_payments", "submission_id = ?", s.submission_id), 2, "the payment itself stays on record");
   // A retry does not say "already settled".
   c.readTx = inner;
-  await assert.rejects(settleBounty(env(db), poster.a, b.bounty_id, s.submission_id, tx(1), c), (e) => {
-    assert.ok(!/already verified and applied/.test(e.message));
-    return true;
-  });
+  await assert.rejects(settleBounty(env(db), poster.a, b.bounty_id, s.submission_id, tx(1), c), status(409, /submission is closed, not pending/));
+  assert.equal(count(db, "settlement_legs", "submission_id = ? AND paid_tx IS NOT NULL", s.submission_id), 2, "the paid legs stay on record for the operator");
 });
 
 test("two requests settling one submission at the same moment leave one settlement", async () => {
