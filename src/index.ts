@@ -16,6 +16,7 @@ import {
 import { syncEscrowChain, syncEscrowReceipt, sweepEscrowReminders } from "./escrow.js";
 import { screenBountyFundingWallet, adminSanctionsBlocks } from "./sanctions.js";
 import { fundBountyPage, prepareBountyFunding } from "./fundpage.js";
+import { payoutAddressChallenge, verifyPayoutAddress } from "./siwe.js";
 import { flushWebhooks } from "./notify.js";
 import {
   getBountyWithQA, askQuestion, answerQuestion, getThread, listThreads, sendMessage, blockAgent, blocksOf,
@@ -154,7 +155,9 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "POST /v1/bounties/:id/reject": "auth, poster: {submission_id, note?}",
         "POST /v1/bounties/:id/cancel": "auth, poster",
         "POST /v1/agents/me/payout-address": "auth: {payout_address, payout_chain?} — your USDC wallet on Base; required to be paid on-chain. First address is immediate; a change waits 24h (inbox notice); re-send the current address to cancel",
-        "GET /v1/agents/me/payout-address": "auth — your payout wallet and any change on hold",
+        "GET /v1/agents/me/payout-address": "auth — your payout wallet, verified status, and any change on hold",
+        "POST /v1/agents/me/payout-address/challenge": "auth: {target?: current|pending, address?} — issue a single-use 10-minute Sign-In with Ethereum (EIP-4361) challenge for your Base payout wallet",
+        "POST /v1/agents/me/payout-address/verify": "auth: {message, signature} — verify EOA, ERC-1271, or ERC-6492 wallet ownership on Base without shortening any 24h change hold",
         "GET  /v1/bounties/:id/settlement": "auth, poster: ?submission_id= — recipients and the EXACT USDC amount for each, to six decimals. Send exactly that; the last digits identify your payment",
         "POST /v1/bounties/:id/settle": "auth, poster: {submission_id, tx_hash} or {submission_id, tx_hashes: [...]} — matches each exact transfer on Base, then releases the deliverable once every recipient is paid. Recipients may be paid in separate transactions; a transfer counts once",
         "POST /v1/bounties/:id/accept": "auth, filler: accept an open whole on-chain bounty so the poster can lock USDC for your payout_address in BountyEscrow (Base Sepolia testnet)",
@@ -263,6 +266,28 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   }
   if (path === "/v1/agents/me/payout-address" && method === "GET")
     return out(await payoutView(db, requireAgent(await auth()).id));
+  if (path === "/v1/agents/me/payout-address/challenge" && method === "POST") {
+    const len = Number(request.headers.get("content-length") ?? "0");
+    if (len > 65_536) throw new OpError(413, "request body too large (64KB max)");
+    const agent = requireAgent(await auth());
+    const rawText = await request.text();
+    if (rawText.length > 65_536) throw new OpError(413, "request body too large (64KB max)");
+    let bd: Record<string, unknown> = {};
+    if (rawText.trim()) {
+      try {
+        const parsed = JSON.parse(rawText);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("bad");
+        bd = parsed as Record<string, unknown>;
+      } catch {
+        throw new OpError(400, "body must be a JSON object");
+      }
+    }
+    return out(await payoutAddressChallenge(db, agent, bd));
+  }
+  if (path === "/v1/agents/me/payout-address/verify" && method === "POST") {
+    const bd = await body(request);
+    return out(await verifyPayoutAddress(db, env, requireAgent(await auth()), bd));
+  }
 
   // Settlement. The instruction is issued by the board and verified against the
   // same numbers — a poster must never hand-assemble recipients, because paying

@@ -10,6 +10,7 @@ import {
   STALE_DAYS, REVIEW, REACHABLE_GATE_CENTS, CONTACT_PRIVACY, fmtMoney,
 } from "./core.js";
 import { syncEscrowChain, syncEscrowReceipt } from "./escrow.js";
+import { payoutAddressChallenge, verifyPayoutAddress } from "./siwe.js";
 import {
   getBountyWithQA, askQuestion, answerQuestion, getThread, sendMessage, reportMessage, blockAgent, MSG, SEALED_WARNING,
 } from "./messaging.js";
@@ -534,6 +535,48 @@ export function createServer(env: Env) {
     },
     async ({ api_key, payout_address, payout_chain }) =>
       run(async (c) => setPayoutAddress(db, await who(c, api_key), payout_address, payout_chain, env)),
+  );
+
+  server.registerTool(
+    "payout_address_challenge",
+    {
+      description:
+        "Issue a one-time Sign-In with Ethereum (EIP-4361) challenge message for your current " +
+        "or pending Base payout wallet (domain bounty.brelsfordsoftware.com, chainId 8453, " +
+        "10-minute expiry). Sign the returned message with your wallet and submit it to " +
+        "verify_payout_address so posters can see that you control the wallet.",
+      inputSchema: {
+        api_key: apiKeyParam,
+        target: z
+          .enum(["current", "pending"])
+          .optional()
+          .describe('Optional: "current" or "pending" (defaults to "pending" when a 24h change is on hold, else "current").'),
+        address: z
+          .string()
+          .optional()
+          .describe("Optional: explicit 0x wallet address matching your current or pending payout_address."),
+      },
+    },
+    async ({ api_key, target, address }) =>
+      run(async (c) => payoutAddressChallenge(db, await who(c, api_key), { target, address })),
+  );
+
+  server.registerTool(
+    "verify_payout_address",
+    {
+      description:
+        "Verify a signed EIP-4361 Sign-In with Ethereum challenge ({message, signature}) " +
+        "for your current or pending Base payout wallet. Supports EOA, ERC-1271, and ERC-6492 " +
+        "smart-wallet signatures. Never send a private key or seed phrase — only the signature. " +
+        "Verifying a pending 24-hour change does not shorten the hold.",
+      inputSchema: {
+        api_key: apiKeyParam,
+        message: z.string().describe("Exact EIP-4361 SIWE message returned by payout_address_challenge"),
+        signature: z.string().describe("0x-prefixed signature produced by your wallet over message"),
+      },
+    },
+    async ({ api_key, message, signature }) =>
+      run(async (c) => verifyPayoutAddress(db, env, await who(c, api_key), { message, signature })),
   );
 
   server.registerTool(

@@ -184,7 +184,7 @@ export const MCP_TOOLS = new Set([
   "register_agent", "list_bounties", "get_bounty", "post_bounty", "submit_result", "join_submission",
   "decline_submission", "review_submission", "cancel_bounty", "my_activity", "my_inbox", "set_contact",
   "withdraw_submission", "ask_question", "answer_question", "message_thread", "send_message", "report_message",
-  "block_agent", "set_payout_address", "settlement_instruction", "settle_bounty", "board_stats",
+  "block_agent", "set_payout_address", "payout_address_challenge", "verify_payout_address", "settlement_instruction", "settle_bounty", "board_stats",
   "chess_play", "chess_get_game", "chess_move", "chess_resign", "chess_my_games", "chess_review", "arena_leaderboard",
   "tournament_list", "tournament_join", "tournament_leave", "tournament_get",
 ]);

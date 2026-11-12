@@ -2058,7 +2058,9 @@ export async function applyDuePayoutChanges(db: D1Database, agentIds?: string[])
       db.prepare(
         `UPDATE agents SET payout_address = payout_address_pending, payout_chain = 'base',
                 payout_address_set_at = payout_pending_effective_at,
-                payout_address_pending = NULL, payout_pending_effective_at = NULL
+                payout_address_verified_at = payout_pending_verified_at,
+                payout_address_pending = NULL, payout_pending_effective_at = NULL,
+                payout_pending_verified_at = NULL
           WHERE id = ? AND payout_address_pending = ?`,
       ).bind(r.id, r.payout_address_pending),
       db.prepare("UPDATE payout_address_changes SET status = 'applied', resolved_at = ? WHERE agent_id = ? AND status = 'pending'")
@@ -2078,17 +2080,33 @@ export async function applyDuePayoutChanges(db: D1Database, agentIds?: string[])
 export async function payoutView(db: D1Database, agentId: string) {
   await applyDuePayoutChanges(db, [agentId]);
   const r = await db
-    .prepare("SELECT payout_address, payout_chain, payout_address_set_at, payout_address_pending, payout_pending_effective_at FROM agents WHERE id = ?")
+    .prepare(
+      "SELECT payout_address, payout_chain, payout_address_set_at, payout_address_verified_at, payout_address_pending, payout_pending_effective_at, payout_pending_verified_at FROM agents WHERE id = ?",
+    )
     .bind(agentId)
-    .first<{ payout_address: string | null; payout_chain: string | null; payout_address_set_at: string | null;
-             payout_address_pending: string | null; payout_pending_effective_at: string | null }>();
+    .first<{
+      payout_address: string | null;
+      payout_chain: string | null;
+      payout_address_set_at: string | null;
+      payout_address_verified_at: string | null;
+      payout_address_pending: string | null;
+      payout_pending_effective_at: string | null;
+      payout_pending_verified_at: string | null;
+    }>();
   return {
     payout_address: r?.payout_address ? toChecksumAddress(r.payout_address) : null,
     payout_chain: r?.payout_address ? (r.payout_chain ?? "base") : null,
     asset: "USDC",
     set_at: r?.payout_address_set_at ?? null,
+    verified: Boolean(r?.payout_address && r.payout_address_verified_at),
+    verified_at: r?.payout_address ? (r.payout_address_verified_at ?? null) : null,
     pending_change: r?.payout_address_pending
-      ? { payout_address: toChecksumAddress(r.payout_address_pending), effective_at: r.payout_pending_effective_at }
+      ? {
+          payout_address: toChecksumAddress(r.payout_address_pending),
+          effective_at: r.payout_pending_effective_at,
+          verified: Boolean(r.payout_pending_verified_at),
+          verified_at: r.payout_pending_verified_at ?? null,
+        }
       : null,
     action_needed: r?.payout_address
       ? undefined
@@ -2116,9 +2134,17 @@ export async function setPayoutAddress(
   const addr = check.address;
   await applyDuePayoutChanges(db, [agent.id]);
   const cur = await db
-    .prepare("SELECT payout_address, payout_address_pending, payout_pending_effective_at FROM agents WHERE id = ?")
+    .prepare(
+      "SELECT payout_address, payout_address_verified_at, payout_address_pending, payout_pending_effective_at, payout_pending_verified_at FROM agents WHERE id = ?",
+    )
     .bind(agent.id)
-    .first<{ payout_address: string | null; payout_address_pending: string | null; payout_pending_effective_at: string | null }>();
+    .first<{
+      payout_address: string | null;
+      payout_address_verified_at: string | null;
+      payout_address_pending: string | null;
+      payout_pending_effective_at: string | null;
+      payout_pending_verified_at: string | null;
+    }>();
 
   const isEmergencyCancel = cur?.payout_address === addr && cur.payout_address_pending != null;
   if (!isEmergencyCancel) {
@@ -2132,8 +2158,9 @@ export async function setPayoutAddress(
   if (!cur?.payout_address) {
     await db.batch([
       db.prepare(
-        "UPDATE agents SET payout_address = ?, payout_chain = ?, payout_address_set_at = ?, payout_address_pending = NULL, payout_pending_effective_at = NULL WHERE id = ?",
+        "UPDATE agents SET payout_address = ?, payout_chain = ?, payout_address_set_at = ?, payout_address_verified_at = NULL, payout_address_pending = NULL, payout_pending_effective_at = NULL, payout_pending_verified_at = NULL WHERE id = ?",
       ).bind(addr, check.chain, at, agent.id),
+      db.prepare("DELETE FROM payout_siwe_nonces WHERE agent_id = ? AND used_at IS NULL").bind(agent.id),
       db.prepare(
         "INSERT INTO payout_address_changes (id, agent_id, old_address, new_address, chain, status, requested_at, effective_at) VALUES (?, ?, NULL, ?, ?, 'applied', ?, ?)",
       ).bind(newId("pac"), agent.id, addr, check.chain, at, at),
@@ -2142,14 +2169,37 @@ export async function setPayoutAddress(
         address: shown, chain: check.chain, message: "Your payout wallet is set. Posters pay USDC on Base to this address.",
       }),
     ]);
-    return { agent_id: agent.id, status: "active", payout_address: shown, payout_chain: check.chain, asset: "USDC", note: payoutNote };
+    return {
+      agent_id: agent.id,
+      status: "active",
+      payout_address: shown,
+      payout_chain: check.chain,
+      asset: "USDC",
+      verified: false,
+      verified_at: null,
+      note: payoutNote,
+    };
   }
 
   if (cur.payout_address === addr) {
     if (!cur.payout_address_pending)
-      return { agent_id: agent.id, status: "active", unchanged: true, payout_address: shown, payout_chain: check.chain, asset: "USDC", note: payoutNote };
+      return {
+        agent_id: agent.id,
+        status: "active",
+        unchanged: true,
+        payout_address: shown,
+        payout_chain: check.chain,
+        asset: "USDC",
+        verified: Boolean(cur.payout_address_verified_at),
+        verified_at: cur.payout_address_verified_at ?? null,
+        note: payoutNote,
+      };
     await db.batch([
-      db.prepare("UPDATE agents SET payout_address_pending = NULL, payout_pending_effective_at = NULL WHERE id = ?").bind(agent.id),
+      db.prepare(
+        "UPDATE agents SET payout_address_pending = NULL, payout_pending_effective_at = NULL, payout_pending_verified_at = NULL WHERE id = ?",
+      ).bind(agent.id),
+      db.prepare("DELETE FROM payout_siwe_nonces WHERE agent_id = ? AND target = 'pending' AND used_at IS NULL")
+        .bind(agent.id),
       db.prepare("UPDATE payout_address_changes SET status = 'cancelled', resolved_at = ? WHERE agent_id = ? AND status = 'pending'")
         .bind(at, agent.id),
       eventStmt(db, at, "payout_address_change_cancelled", null, agent.id, "an agent cancelled a payout address change"),
@@ -2159,24 +2209,44 @@ export async function setPayoutAddress(
       }),
     ]);
     return {
-      agent_id: agent.id, status: "active", cancelled_pending_change: toChecksumAddress(cur.payout_address_pending),
-      payout_address: shown, payout_chain: check.chain, asset: "USDC", note: payoutNote,
+      agent_id: agent.id,
+      status: "active",
+      cancelled_pending_change: toChecksumAddress(cur.payout_address_pending),
+      payout_address: shown,
+      payout_chain: check.chain,
+      asset: "USDC",
+      verified: Boolean(cur.payout_address_verified_at),
+      verified_at: cur.payout_address_verified_at ?? null,
+      note: payoutNote,
     };
   }
 
   // A real change. Re-sending the same pending address does not restart the clock.
   if (cur.payout_address_pending === addr)
     return {
-      agent_id: agent.id, status: "pending", payout_address: toChecksumAddress(cur.payout_address),
-      pending_change: { payout_address: shown, effective_at: cur.payout_pending_effective_at }, note: payoutNote,
+      agent_id: agent.id,
+      status: "pending",
+      payout_address: toChecksumAddress(cur.payout_address),
+      verified: Boolean(cur.payout_address_verified_at),
+      verified_at: cur.payout_address_verified_at ?? null,
+      pending_change: {
+        payout_address: shown,
+        effective_at: cur.payout_pending_effective_at,
+        verified: Boolean(cur.payout_pending_verified_at),
+        verified_at: cur.payout_pending_verified_at ?? null,
+      },
+      note: payoutNote,
     };
   const effective = new Date(Date.now() + PAYOUT_CHANGE_HOLD_MS).toISOString();
   const current = toChecksumAddress(cur.payout_address);
   await db.batch([
     db.prepare("UPDATE payout_address_changes SET status = 'superseded', resolved_at = ? WHERE agent_id = ? AND status = 'pending'")
       .bind(at, agent.id),
-    db.prepare("UPDATE agents SET payout_address_pending = ?, payout_pending_effective_at = ? WHERE id = ?")
-      .bind(addr, effective, agent.id),
+    db.prepare(
+      "UPDATE agents SET payout_address_pending = ?, payout_pending_effective_at = ?, payout_pending_verified_at = NULL WHERE id = ?",
+    ).bind(addr, effective, agent.id),
+    db.prepare("DELETE FROM payout_siwe_nonces WHERE agent_id = ? AND target = 'pending' AND used_at IS NULL")
+      .bind(agent.id),
     db.prepare(
       "INSERT INTO payout_address_changes (id, agent_id, old_address, new_address, chain, status, requested_at, effective_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
     ).bind(newId("pac"), agent.id, cur.payout_address, addr, check.chain, at, effective),
@@ -2192,7 +2262,9 @@ export async function setPayoutAddress(
     agent_id: agent.id,
     status: "pending",
     payout_address: current,
-    pending_change: { payout_address: shown, effective_at: effective },
+    verified: Boolean(cur.payout_address_verified_at),
+    verified_at: cur.payout_address_verified_at ?? null,
+    pending_change: { payout_address: shown, effective_at: effective, verified: false, verified_at: null },
     note:
       `Changes to a payout address wait ${PAYOUT_CHANGE_HOLD_MS / 3_600_000} hours before they take effect, so a stolen key cannot quietly redirect your pay. ` +
       `Until then posters still pay ${current}. To cancel, set ${current} again. ${payoutNote}`,
@@ -2371,10 +2443,11 @@ export async function settlementInstruction(
   await applyDuePayoutChanges(db, team.map((t) => t.agent_id));
   const addrs = await db
     .prepare(
-      `SELECT id, payout_address FROM agents WHERE id IN (${team.map(() => "?").join(",")})`,
+      `SELECT id, payout_address, payout_address_verified_at FROM agents WHERE id IN (${team.map(() => "?").join(",")})`,
     )
     .bind(...team.map((t) => t.agent_id))
-    .all<{ id: string; payout_address: string | null }>();
+    .all<{ id: string; payout_address: string | null; payout_address_verified_at: string | null }>();
+  const rowById = new Map((addrs.results ?? []).map((r) => [r.id, r]));
   const byId = new Map((addrs.results ?? []).map((r) => [r.id, r.payout_address]));
   const unpaid = team.filter((t) => !byId.get(t.agent_id));
   if (unpaid.length)
@@ -2399,18 +2472,26 @@ export async function settlementInstruction(
   ].filter((r) => r.amount_cents > 0);
 
   const legs = await freezeLegs(db, b, sub, mil?.id ?? null, base);
-  const recipients = legs.map((l) => ({
-    role: l.role,
-    agent_id: l.agent_id || null,
-    address: l.address,
-    checksum_address: toChecksumAddress(l.address),
-    amount_cents: l.amount_cents,
-    // The amount to send. Exact: not rounded, not more, not less.
-    amount_units: l.units,
-    amount_usdc: unitsToUsdc(BigInt(l.units)),
-    paid: l.paid_tx != null,
-    paid_tx: l.paid_tx,
-  }));
+  const recipients = legs.map((l) => {
+    const ag = l.agent_id ? rowById.get(l.agent_id) : undefined;
+    const verified =
+      l.role === "platform_fee"
+        ? true
+        : Boolean(ag?.payout_address && ag.payout_address.toLowerCase() === l.address && ag.payout_address_verified_at);
+    return {
+      role: l.role,
+      agent_id: l.agent_id || null,
+      address: l.address,
+      checksum_address: toChecksumAddress(l.address),
+      verified,
+      amount_cents: l.amount_cents,
+      // The amount to send. Exact: not rounded, not more, not less.
+      amount_units: l.units,
+      amount_usdc: unitsToUsdc(BigInt(l.units)),
+      paid: l.paid_tx != null,
+      paid_tx: l.paid_tx,
+    };
+  });
   const totalUnits = legs.reduce((a, l) => a + BigInt(l.units), 0n);
 
   return {
