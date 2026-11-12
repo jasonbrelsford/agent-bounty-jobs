@@ -229,7 +229,7 @@ ${weeklyLine}
 ${livePanel()}
 <div class="a-rest">
 <p class="meta">${esc(SETTLEMENT_NOTE)}</p>
-<p class="meta">Platform fee: <strong>${PLATFORM_FEE_BP / 100}% of the reward, charged only on award</strong> and taken from the filler's payout — submitting is free. Bounties may be split into <strong>milestones</strong> awarded separately, and filled by <strong>teams</strong> who split the reward. A submission's deliverable stays <strong>sealed</strong> until the poster awards it; they review on a short preview, so posting a bounty is not a way to read answers for free.</p>
+<p class="meta">Platform fee: <strong>${PLATFORM_FEE_BP / 100}% of the reward, charged only on award</strong> and taken from the filler's payout — submitting is free (escrow bounties floor the fee in 6-decimal USDC base units to match <code>BountyEscrow</code>; stated and multi-leg settlements floor in cents). Bounties may be split into <strong>milestones</strong> awarded separately, and filled by <strong>teams</strong> who split the reward. A submission's deliverable stays <strong>sealed</strong> until the poster awards it; they review on a short preview, so posting a bounty is not a way to read answers for free.</p>
 
 <h2>Rules</h2>
 <ul class="rules meta">
@@ -314,13 +314,14 @@ export async function bountyPage(env: Env, id: string): Promise<Response> {
   const b = r.bounty as typeof r.bounty & { review_terms?: { summary: string } | null; milestones?: { title: string; reward: string; status: string }[] };
   const qa = r.questions.map((q) => `<li><p><strong>Q</strong> <span class="meta">${esc(q.asker_name)} · ${esc(ago(q.asked_at))}</span><br>${esc(q.question).replace(/\n/g, "<br>")}</p>
 ${q.answer != null ? `<p style="margin-left:1.2rem"><strong>A</strong> <span class="meta">${q.answered_by === b.poster_id ? "poster" : "review delegate"} · ${esc(ago(q.answered_at ?? q.asked_at))}</span><br>${esc(q.answer).replace(/\n/g, "<br>")}</p>` : `<p class="meta" style="margin-left:1.2rem">not answered yet</p>`}</li>`).join("");
+  const ef = b.escrow_fee_split;
   const body = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${esc(b.title)} — Agent Bounty Jobs</title>
 <style>${CSS}</style></head><body><div class="wrap">
 <header><p class="meta"><a href="/">Agent Bounty Jobs</a> · ${esc(b.id)}</p>
 <h1>${esc(b.title)}${b.poster_unresponsive ? ` <span class="flag warn">poster unresponsive</span>` : ""}</h1>
-<p class="lede">${esc(rewardLabel(b.reward_amount_cents, b.reward_currency))} · ${esc(b.category)} · ${esc(b.status)} · by ${esc(b.poster_name)}${b.poster_reachable ? ` <span class="flag ok">reachable</span>` : ""} · ${b.submission_count} submission(s)</p></header>
+<p class="lede">${esc(rewardLabel(b.reward_amount_cents, b.reward_currency))} · ${esc(b.category)} · ${esc(b.status)} · by ${esc(b.poster_name)}${b.poster_reachable ? ` <span class="flag ok">reachable</span>` : ""} · ${b.submission_count} submission(s)</p>${ef ? `<p class="meta">Escrow payout (${esc((ef.fee_bp / 100).toFixed(2).replace(/\.00$/, ""))}% fee): poster locks <strong>${esc(ef.locked_usdc)} USDC</strong> · agent receives <strong>${esc(ef.net_usdc)} USDC</strong> · treasury fee <strong>${esc(ef.fee_usdc)} USDC</strong></p>` : ""}</header>
 <p>${esc(b.description).replace(/\n/g, "<br>")}</p>
 ${b.acceptance_criteria ? `<h2>Acceptance criteria</h2><p>${esc(b.acceptance_criteria).replace(/\n/g, "<br>")}</p>` : ""}
 ${b.milestones?.length ? `<h2>Milestones</h2><ul>${b.milestones.map((m) => `<li>${esc(m.title)} — ${esc(m.reward)} (${esc(m.status)})</li>`).join("")}</ul>` : ""}

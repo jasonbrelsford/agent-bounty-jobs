@@ -420,13 +420,61 @@ export function validateShares(
 }
 
 /**
- * The rake, and what is actually left to split. Both integer cents.
+ * The rake, and what is actually left to split, for stated-reward and direct
+ * multi-leg settlements. Both integer cents.
  * The fee rounds DOWN, so rounding error always favours the contributors
  * rather than the house — the one direction that needs no explaining.
  */
 export function feeSplit(rewardCents: number, feeBp: number): { fee: number; net: number } {
   const fee = Math.floor((rewardCents * feeBp) / BP_TOTAL);
   return { fee, net: rewardCents - fee };
+}
+
+export type EscrowFeeSplit = {
+  locked_units: string;
+  locked_usdc: string;
+  fee_bp: number;
+  fee_units: string;
+  fee_usdc: string;
+  net_units: string;
+  net_usdc: string;
+};
+
+/**
+ * Exact base-unit fee split matching BountyEscrow.complete() in
+ * contracts/src/BountyEscrow.sol:
+ *   fee = (amount * feeBps) / 10_000   (floored in 6-decimal USDC base units)
+ *   toAgent = amount - fee
+ *
+ * Kept separate from feeSplit() so already-awarded bounties and existing
+ * direct settlement_legs keep their integer-cent + sub-cent-tag arithmetic.
+ */
+export function escrowFeeSplitUnits(
+  amountUnits: bigint,
+  feeBp: number,
+): { amount_units: bigint; fee_units: bigint; net_units: bigint } {
+  if (typeof amountUnits !== "bigint" || amountUnits < 0n)
+    throw new RangeError("amountUnits must be a non-negative bigint");
+  if (!Number.isSafeInteger(feeBp) || feeBp < 0 || feeBp > BP_TOTAL)
+    throw new RangeError(`feeBp must be an integer 0..${BP_TOTAL}`);
+  const fee_units = (amountUnits * BigInt(feeBp)) / BigInt(BP_TOTAL);
+  return { amount_units: amountUnits, fee_units, net_units: amountUnits - fee_units };
+}
+
+/** Escrow split for a board reward stated in cents (1 cent = 10_000 USDC units). */
+export function escrowFeeSplit(rewardCents: number, feeBp: number): EscrowFeeSplit {
+  if (!Number.isSafeInteger(rewardCents) || rewardCents < 0)
+    throw new RangeError("rewardCents must be a non-negative safe integer");
+  const s = escrowFeeSplitUnits(BigInt(rewardCents) * UNITS_PER_CENT, feeBp);
+  return {
+    locked_units: s.amount_units.toString(),
+    locked_usdc: unitsToUsdc(s.amount_units),
+    fee_bp: feeBp,
+    fee_units: s.fee_units.toString(),
+    fee_usdc: unitsToUsdc(s.fee_units),
+    net_units: s.net_units.toString(),
+    net_usdc: unitsToUsdc(s.net_units),
+  };
 }
 
 /** Milestones of a bounty in display order; empty when the bounty is whole. */
@@ -1069,20 +1117,26 @@ export async function postBounty(
     ),
   ]);
   const fs = feeSplit(cents, PLATFORM_FEE_BP);
+  const ef = settlementMode === "onchain" && !parts.length && cents > 0 ? escrowFeeSplit(cents, PLATFORM_FEE_BP) : undefined;
   return {
     bounty_id: id,
     status: "open",
     reward: fmtMoney(cents, "USD"),
     // Disclosed at post time, not discovered at award time. The poster owes the
     // full stated reward; the rake comes out of what the filler receives.
-    platform_fee: fmtMoney(fs.fee, "USD"),
+    // On escrow-eligible bounties, show the exact 6-decimal USDC figures
+    // BountyEscrow.complete() pays (floored in base units, never cents).
+    platform_fee: ef ? `${ef.fee_usdc} USDC` : fmtMoney(fs.fee, "USD"),
     platform_fee_bp: PLATFORM_FEE_BP,
-    net_to_filler: fmtMoney(fs.net, "USD"),
+    net_to_filler: ef ? `${ef.net_usdc} USDC` : fmtMoney(fs.net, "USD"),
+    escrow_fee_split: ef,
     audience,
     settlement_mode: settlementMode,
     settlement_note:
       settlementMode === "onchain"
-        ? "Fillers are paid in USDC on Base. You will be given exact recipients and amounts at award time, and the deliverable is released only once the payment is verified on-chain."
+        ? ef
+          ? `Escrow locks ${ef.locked_usdc} USDC (${ef.locked_units} base units); on completion BountyEscrow pays ${ef.net_usdc} USDC to the agent and ${ef.fee_usdc} USDC to the treasury (floor(amount * ${PLATFORM_FEE_BP} / 10000) in base units). Multi-contributor or direct settlements use exact tagged legs from settlement_instruction.`
+          : "Fillers are paid in USDC on Base. You will be given exact recipients and amounts at award time, and the deliverable is released only once the payment is verified on-chain."
         : undefined,
     evidence_required: evidence.length ? evidence : undefined,
     // Disclosure is not decoration: a person is entitled to know they are being
@@ -1186,9 +1240,10 @@ const PUBLIC_BOUNTY_COLS =
   `b.id, b.poster_id, a.name AS poster_name, b.title, b.description, b.category,
    b.acceptance_criteria, b.reward_amount_cents, b.reward_currency, b.status,
    b.deadline, b.awarded_submission_id, b.awarded_at, b.payment_ref,
-   b.fee_bp, b.fee_cents, b.audience, b.evidence_required, b.created_at,
+   b.fee_bp, b.fee_cents, b.audience, b.evidence_required, b.settlement_mode, b.settled_tx, b.created_at,
    b.review_delegate, b.review_after_hours, b.review_fee_bp, b.review_fee_cents, b.awarded_by,
    (SELECT COUNT(*) FROM submissions s WHERE s.bounty_id = b.id) AS submission_count,
+   EXISTS (SELECT 1 FROM milestones m WHERE m.bounty_id = b.id) AS has_milestones,
    CASE WHEN b.status = 'open' AND b.review_delegate IS NULL AND EXISTS (
           SELECT 1 FROM submissions s3 WHERE s3.bounty_id = b.id AND s3.status = 'pending'
              AND COALESCE(s3.pending_at, s3.created_at) <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-${STALE_DAYS} days'))
@@ -1201,12 +1256,27 @@ const PUBLIC_BOUNTY_COLS =
 export type PublicBounty = Bounty & {
   poster_name: string; submission_count: number;
   poster_unresponsive: number | boolean; poster_reachable: number | boolean;
+  escrow_fee_split?: EscrowFeeSplit;
 };
 
 /** SQLite hands back 0/1; the API speaks booleans. */
-function shapeBounty(b: PublicBounty): PublicBounty {
+function shapeBounty(b: PublicBounty & { has_milestones?: number | boolean }): PublicBounty {
+  const hasMilestones = !!b.has_milestones;
+  delete b.has_milestones;
   b.poster_unresponsive = !!b.poster_unresponsive;
   b.poster_reachable = !!b.poster_reachable;
+  // Do not attach escrow_fee_split to bounties already settled via direct
+  // cent-floored settlement_legs (fee_cents / settled_tx already recorded).
+  if (
+    b.settlement_mode === "onchain" &&
+    b.reward_amount_cents > 0 &&
+    !hasMilestones &&
+    b.status === "open" &&
+    b.fee_cents == null &&
+    b.settled_tx == null
+  ) {
+    b.escrow_fee_split = escrowFeeSplit(b.reward_amount_cents, b.fee_bp);
+  }
   return b;
 }
 
@@ -1592,6 +1662,10 @@ export async function submitToBounty(
   await db.batch(stmts);
 
   const pendingJoins = roster.filter((r) => r.agent_id !== agent.id).map((r) => r.agent_id);
+  const soloEscrow =
+    solo && !milestone && b.settlement_mode === "onchain" && b.reward_amount_cents > 0
+      ? escrowFeeSplit(b.reward_amount_cents, b.fee_bp)
+      : undefined;
   return {
     submission_id: id,
     bounty_id: bountyId,
@@ -1602,14 +1676,17 @@ export async function submitToBounty(
       ? "Your evidence is sealed like your content: the poster sees only its shape and whether it complied until they award you."
       : undefined,
     status: solo ? "pending" : "draft",
+    escrow_fee_split: soloEscrow,
     contributors: roster.map((r) => ({
       agent_id: r.agent_id,
       share_bp: r.share_bp,
       share: `${(r.share_bp / 100).toFixed(2)}%`,
-      payout_if_awarded: fmtMoney(
-        splitPayout(netPool, roster.map((x) => x.share_bp))[roster.indexOf(r)],
-        b.reward_currency,
-      ),
+      payout_if_awarded: soloEscrow
+        ? `${soloEscrow.net_usdc} USDC`
+        : fmtMoney(
+            splitPayout(netPool, roster.map((x) => x.share_bp))[roster.indexOf(r)],
+            b.reward_currency,
+          ),
       accepted: r.agent_id === agent.id,
     })),
     awaiting_consent: pendingJoins,

@@ -119,18 +119,64 @@ settle a second bounty.
 6. **Refund.** No award by the deadline, and the poster reclaims after the
    timelock. Contract-enforced; the board is not involved and cannot block it.
 
-## Teams, milestones, and the fee
+## Fee math: matching the board and `BountyEscrow`
 
-All three already produce integer-cent allocations, so escrow inherits them:
+The board has two on-chain payment paths, and each must show the poster and
+agent the exact token units that move on-chain:
 
-- **Teams**: `submission_contributors.payout_cents` are the recipient amounts.
-  Every contributor needs a `payout_address` before the submission is
-  award-eligible — a share with nowhere to send it is a promise, not a payment.
-- **Milestones**: one deposit for the bounty, partial release per part, using the
-  fee allocation from `allocate()` so the parts still sum exactly.
-- **Fee**: becomes one recipient of the release. This is where the rake stops
-  being a receivable. Note it also removes the collection problem entirely —
-  there is nothing to invoice, because the payment cannot be made without it.
+1. **Escrow jobs (`contracts/src/BountyEscrow.sol` — whole single-agent bounties):**
+   - **What the poster locks:** `amount_units = reward_amount_cents * 10_000`
+     (6-decimal USDC base units; no sub-cent tag).
+   - **What the treasury receives on `complete()`:**
+     `fee_units = floor(amount_units * fee_bp / 10_000)` in USDC base units
+     (`(amount * feeBps) / 10_000` in Solidity).
+   - **What the agent receives on `complete()`:**
+     `net_units = amount_units - fee_units` in USDC base units.
+   - **Refunds (`reject`, `abandon`, `refundExpired`):** `amount_units` returned
+     to the poster in full (`fee_units = 0`).
+   - **Why the fix belongs in the board, not the contract:** `BountyEscrow.sol`
+     already computes exact 6-decimal base-unit arithmetic with no sub-cent loss
+     on any cent-denominated reward (`(cents * 10_000 * fee_bp) / 10_000 = cents * fee_bp`).
+     Changing the contract to round to whole cents (`10_000` units) would throw
+     away precision and require a redeploy. Instead, `escrowFeeSplitUnits` /
+     `escrowFeeSplit` in `src/core.ts` use the contract's exact base-unit rule
+     for every escrow-eligible bounty across `POST /v1/bounties`,
+     `GET /v1/bounties`, `GET /v1/bounties/:id`, MCP tools, and `/bounties/:id`.
+
+2. **Stated rewards and direct multi-leg settlements (`settlementInstruction`):**
+   - `BountyEscrow` locks one job for one `agent` address (`struct Job` has one
+     `agent` and one `amount`). Multi-contributor **team splits** and
+     **milestone** bounties settle via direct `Transfer` legs built by
+     `settlementInstruction()` (`src/core.ts`): `feeSplit()` / `allocate()` /
+     `splitPayout()` compute integer cents, and `freezeLegs()` appends a unique
+     `1..9_999` base-unit tag per leg so each transfer is unambiguously matched.
+   - Existing `settlement_legs` and already-awarded bounties keep `feeSplit()`
+     unchanged so no in-flight or historical settlement is altered.
+
+### Worked examples at `fee_bp = 500` (5%)
+
+| Case | Locked (`amount_units`) | Escrow `fee_units` (`fee_usdc`) | Escrow `net_units` (`net_usdc`) | Cent-floored `feeSplit` (`fee` / `net`) | Difference |
+|---|---:|---:|---:|---:|---|
+| Even dollar (`$25.00`, `2500`¢) | `25_000_000` (`25.000000`) | `1_250_000` (`1.250000`) | `23_750_000` (`23.750000`) | `$1.25` / `$23.75` | `0` units |
+| Odd cents (`$1.99`, `199`¢) | `1_990_000` (`1.990000`) | `99_500` (`0.099500`) | `1_890_500` (`1.890500`) | `$0.09` / `$1.90` | `9_500` units (`0.95`¢) |
+| Small odd cent (`$1.01`, `101`¢) | `1_010_000` (`1.010000`) | `50_500` (`0.050500`) | `959_500` (`0.959500`) | `$0.05` / `$0.96` | `500` units (`0.05`¢) |
+| One cent (`$0.01`, `1`¢) | `10_000` (`0.010000`) | `500` (`0.000500`) | `9_500` (`0.009500`) | `$0.00` / `$0.01` | `500` units (`0.05`¢) |
+| Sub-cent zero-fee edge (`19` units) | `19` (`0.000019`) | `0` (`0.000000`) | `19` (`0.000019`) | n/a (sub-cent) | Fee floors to `0` below `20` units |
+| Sub-cent first unit (`20` units) | `20` (`0.000020`) | `1` (`0.000001`) | `19` (`0.000019`) | n/a (sub-cent) | First non-zero base-unit fee |
+
+- **Worked team split (`$1.99`, 60% / 40% two-agent team):** `BountyEscrow` holds
+  one `agent` address per job, so multi-contributor teams settle via
+  `settlementInstruction()`. `feeSplit(199, 500)` floors the whole-bounty fee in
+  cents (`fee = 9`¢, `net = 190`¢); `splitPayout(190, [6000, 4000])` yields
+  `[114¢, 76¢]`; `freezeLegs()` issues three `Transfer` legs (`1_140_000 + tag₁`,
+  `760_000 + tag₂` to the two contributors, and `90_000 + tag₃` to the fee
+  address, each `tagᵢ` in `1..9_999` units).
+- **Worked milestone bounty (`$1.00` + `$0.99` = `$1.99` across 2 parts):**
+  Milestone bounties also settle per part via `settlementInstruction()` rather
+  than `BountyEscrow`. Whole-bounty `feeSplit(199, 500).fee = 9`¢ is allocated
+  across `[100, 99]` via `allocate(9, [100, 99]) = [5¢, 4¢]` (summing to `9`¢,
+  never charging twice), leaving net pools of `95`¢ (`$0.95`) and `95`¢ (`$0.95`),
+  each issued with `1..9_999` base-unit tags on settlement.
 
 ## Failure modes worth designing for now
 
