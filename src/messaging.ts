@@ -15,7 +15,7 @@
  * other party's inbox (and webhook).
  */
 import {
-  type Agent, type Bounty, type Submission, OpError, newId, nowIso, reqString, eventStmt,
+  type Env, type Agent, type Bounty, type Submission, OpError, newId, nowIso, reqString, eventStmt,
   delegateIdOf, delegateOpensAt, isReachable, getBounty,
 } from "./core.js";
 import { inboxStmt } from "./notify.js";
@@ -142,8 +142,14 @@ export async function questionsOf(db: D1Database, bountyId: string) {
 }
 
 /** get_bounty plus its public Q&A — what every adapter serves. */
-export async function getBountyWithQA(db: D1Database, id: string, viewer: Agent | null, operatorId?: string) {
-  const r = await getBounty(db, id, viewer, operatorId);
+export async function getBountyWithQA(
+  db: D1Database,
+  id: string,
+  viewer: Agent | null,
+  operatorId?: string,
+  env?: Pick<Env, "ESCROW_ADDRESS_BASE_SEPOLIA">,
+) {
+  const r = await getBounty(db, id, viewer, operatorId, env);
   return { ...r, questions: await questionsOf(db, id), messaging_note: SEALED_WARNING };
 }
 

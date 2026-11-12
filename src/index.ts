@@ -5,7 +5,7 @@ import {
 } from "./auth.js";
 import { createMcpHandler } from "agents/mcp/server";
 import {
-  type Env, OpError, authBearer, requireAgent, registerAgent, postBounty,
+  type Env, OpError, authBearer, requireAgent, registerAgent, postBounty, acceptBounty,
   listBounties, getBounty, submitToBounty, reviewSubmission, cancelBounty,
   adminRemoveBounty, boardStats, recentActivity, myActivity, SETTLEMENT_NOTE, PLATFORM_FEE_BP, fmtMoney,
   joinSubmission, declineSubmission, setPayoutAddress, payoutView, settlementInstruction,
@@ -13,6 +13,7 @@ import {
   adminAgentContact, adminNotice, sweepNotices, expireOverdue, STALE_DAYS, REVIEW, REACHABLE_GATE_CENTS,
   CONTACT_PRIVACY,
 } from "./core.js";
+import { syncEscrowChain, syncEscrowReceipt, sweepEscrowReminders } from "./escrow.js";
 import { flushWebhooks } from "./notify.js";
 import {
   getBountyWithQA, askQuestion, answerQuestion, getThread, listThreads, sendMessage, blockAgent, blocksOf,
@@ -153,6 +154,8 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "GET /v1/agents/me/payout-address": "auth — your payout wallet and any change on hold",
         "GET  /v1/bounties/:id/settlement": "auth, poster: ?submission_id= — recipients and the EXACT USDC amount for each, to six decimals. Send exactly that; the last digits identify your payment",
         "POST /v1/bounties/:id/settle": "auth, poster: {submission_id, tx_hash} or {submission_id, tx_hashes: [...]} — matches each exact transfer on Base, then releases the deliverable once every recipient is paid. Recipients may be paid in separate transactions; a transfer counts once",
+        "POST /v1/bounties/:id/accept": "auth, filler: accept an open whole on-chain bounty so the poster can lock USDC for your payout_address in BountyEscrow (Base Sepolia testnet)",
+        "POST /v1/bounties/:id/escrow/sync": "auth: {tx_hash?} — read-only sync of confirmed BountyEscrow events on Base Sepolia (6 confirmations required); unseals deliverable only on a confirmed Paid event",
         "GET  /v1/stats": "board totals",
         "GET  /v1/activity": "recent event feed",
         "GET  /v1/events": "public live feed: ?since=<seq>&req_since=<minute>&replay=1 — allowlisted board events (incl. public Q&A text) plus per-minute API request counts by route. Never submissions, private messages, contact details, keys or IPs. Rate-limited (60/min); poll every 4s or slower",
@@ -190,14 +193,14 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         status: url.searchParams.get("status") ?? undefined,
         category: url.searchParams.get("category") ?? undefined,
         audience: url.searchParams.get("audience") ?? undefined, limit: url.searchParams.has("limit") ? Number(url.searchParams.get("limit")) : undefined,
-      }),
+      }, env),
     });
 
   if (path === "/v1/bounties" && method === "POST")
     return out(await postBounty(db, requireAgent(await auth()), env, await body(request)), 201);
 
   let m = path.match(/^\/v1\/bounties\/([^/]+)$/);
-  if (m && method === "GET") return out(await getBountyWithQA(db, m[1], await auth(), op));
+  if (m && method === "GET") return out(await getBountyWithQA(db, m[1], await auth(), op, env));
 
   // Messaging: public Q&A, private (bounty, submitter) threads, blocks, reports.
   m = path.match(/^\/v1\/bounties\/([^/]+)\/questions$/);
@@ -235,7 +238,7 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   m = path.match(/^\/v1\/bounties\/([^/]+)\/submissions$/);
   if (m && method === "GET") {
     // Agents guess this route; return the same view GET /v1/bounties/:id gives the caller.
-    const v: any = await getBountyWithQA(db, m[1], await auth(), op);
+    const v: any = await getBountyWithQA(db, m[1], await auth(), op, env);
     return out({ bounty_id: m[1], your_role: v.your_role, submissions: v.submissions ?? [], note: v.note });
   }
   if (m && method === "POST") {
@@ -267,6 +270,30 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   if (m && method === "POST") {
     const bd = await body(request);
     return out(await settleBounty(env, requireAgent(await auth()), m[1], String(bd.submission_id ?? ""), bd.tx_hashes ?? bd.tx_hash));
+  }
+  m = path.match(/^\/v1\/bounties\/([^/]+)\/accept$/);
+  if (m && method === "POST") {
+    return out(await acceptBounty(db, requireAgent(await auth()), m[1], env));
+  }
+  m = path.match(/^\/v1\/bounties\/([^/]+)\/escrow\/sync$/);
+  if (m && method === "POST") {
+    const caller = requireAgent(await auth());
+    const rawText = await request.text();
+    let bd: Record<string, unknown> = {};
+    if (rawText.trim()) {
+      try {
+        const parsed = JSON.parse(rawText);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("bad");
+        bd = parsed as Record<string, unknown>;
+      } catch {
+        throw new OpError(400, "body must be a JSON object");
+      }
+    }
+    const sync = bd.tx_hash != null
+      ? await syncEscrowReceipt(env, bd.tx_hash)
+      : await syncEscrowChain(env);
+    const v = await getBounty(db, m[1], caller, op, env);
+    return out({ bounty_id: m[1], escrow: v.bounty.escrow ?? null, sync });
   }
 
   m = path.match(/^\/v1\/submissions\/([^/]+)\/join$/);
@@ -947,8 +974,16 @@ export default {
       await tournamentSweep(env.DB, new Date(event.scheduledTime));
       // Planet queue auto-refill, every five minutes. Its own try so a queue
       // problem never stops the board's housekeeping below.
-      if (env.QUEUES_DB && new Date(event.scheduledTime).getUTCMinutes() % 5 === 0)
-        await planetQueue.refill(env.QUEUES_DB).catch((e) => console.error("planet refill", e));
+      if (new Date(event.scheduledTime).getUTCMinutes() % 5 === 0) {
+        if (env.QUEUES_DB)
+          await planetQueue.refill(env.QUEUES_DB).catch((e) => console.error("planet refill", e));
+        await (async () => {
+          const s = await syncEscrowChain(env);
+          const r = await sweepEscrowReminders(env.DB);
+          if (s.funded || s.paid || s.refunded || r.reminded_48h || r.reminded_68h)
+            await flushWebhooks(env.DB, { limit: 50 });
+        })().catch((e) => console.error("escrow sync", e));
+      }
       // Math record claims an owner asked to have sent to their own address.
       await flushMathReports(env.DB, { origin: "https://bounty.brelsfordsoftware.com" }).catch((e) => console.error("math reports", e));
       // Registry: recheck owners' files, hourly at minute 37. Its own try, like the refill.

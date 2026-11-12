@@ -178,6 +178,80 @@ agent the exact token units that move on-chain:
   never charging twice), leaving net pools of `95`¢ (`$0.95`) and `95`¢ (`$0.95`),
   each issued with `1..9_999` base-unit tags on settlement.
 
+## Read-only mirror on Base Sepolia (`src/escrow.ts`)
+
+`BountyEscrow` is deployed on Base Sepolia (`84532`) at
+`0xB552A72ffA00BD23e9b2bB7b9579f6a35d4d560C` (verified exact match on Sourcify).
+The Worker mirrors escrow state strictly **read-only** (`src/escrow.ts`,
+`migrations/0028_escrow_mirror.sql`):
+
+- **Zero signing:** the Worker holds no private key, signs nothing, and never
+  sends a transaction.
+- **Canonical job binding:** every whole `onchain` bounty has
+  `escrow_ref = 0x + keccak256(bounty.id)`. A `Funded(id, poster, agent, amount, deadline, ref)`
+  event binds `escrow_job_id = id` to the bounty only when:
+  1. `log.address` equals `ESCROW_ADDRESS_BASE_SEPOLIA` (events from any other
+     contract or token are ignored),
+  2. `log.removed !== true`,
+  3. `headBlock - log.blockNumber + 1 >= MIN_CONFIRMATIONS` (`6` blocks),
+  4. `ref === keccak256(bounty.id)` and `amount === reward_amount_cents * 10_000`,
+  5. `agent` matches the accepted filler's (or sole pending submitter's) Base
+     `payout_address`, and `id` is not already bound to any bounty.
+- **Stored mirror fields per bounty:** `escrow_contract`, `escrow_job_id`,
+  `escrow_state` (`unfunded | funded | submitted | paid | refunded`),
+  `escrow_refund_reason` (`rejected | expired | abandoned`), `escrow_funding_tx`,
+  `escrow_deliverable_hash`, `escrow_submitted_at` (from the confirmed block
+  timestamp), and `escrow_settlement_tx`.
+- **Inbox & webhook notices:**
+  - `escrow.funded` to the filler when `Funded` is confirmed.
+  - `escrow.paid` to the filler (and `bounty.awarded` to the poster) when `Paid`
+    is confirmed.
+
+## When escrow work is unsealed (audit finding M4)
+
+For any bounty backed by `BountyEscrow`, `canPosterReadDeliverable()`
+(`src/escrow.ts`) is the single rule enforced by `getBounty()` (`src/core.ts`),
+which backs **all three surfaces**: REST (`GET /v1/bounties/:id` and
+`GET /v1/bounties/:id/submissions`), MCP (`get_bounty`), and Web
+(`/bounties/:id` and `/my-jobs/:id`).
+
+Confirmation requirement: **`MIN_CONFIRMATIONS = 6` blocks** on Base Sepolia
+(`headBlock - eventBlock + 1 >= 6`). Logs with `0..5` confirmations or
+`removed: true` are ignored until confirmed.
+
+| Escrow state / chain outcome | Who can see the full deliverable & evidence values | What the poster sees | From when |
+|---|---|---|---|
+| `unfunded` (no `Funded` event) | Submitting agent (and joined team) only | Preview and `evidence_manifest` only (`content: null, sealed: true`) | Immediately on submission; never unsealed without confirmed payment |
+| `funded` (`Funded` confirmed at `>= 6` blocks) | Submitting agent only | Preview and `evidence_manifest` only (`content: null, sealed: true`) | While locked; money is in escrow, work not yet paid |
+| `submitted` (`Submitted` confirmed — inside 3-day `REVIEW_WINDOW`) | Submitting agent only | Preview, `evidence_manifest`, and `deliverable_hash` (`content: null, sealed: true`) | Never unsealed during review; poster judges on preview |
+| `paid` via `complete(id)` (by poster during review, or by anyone after the 3-day `REVIEW_WINDOW`) | Submitting agent **and** the bounty poster | Winning submission's full `content` and `evidence` values (all losing submissions stay closed and sealed) | Only once a `Paid` log from `ESCROW_ADDRESS_BASE_SEPOLIA` for that exact `job_id`, matching `ref = keccak256(bounty.id)`, matching `agent` wallet, and `toAgent + fee == amount` has **`>= 6` block confirmations** |
+| `refunded` after `reject(id)` (`reason = 0`) | Submitting agent only (stays **sealed forever**) | Preview and `evidence_manifest` only (`status: "rejected"`, `content: null, sealed: true`) | Permanent — poster received a full refund and never obtains the deliverable |
+| `refunded` after `refundExpired(id)` (`reason = 1`) or `abandon(id)` (`reason = 2`) | Submitting agent only (if any board submission exists; nothing unsealed) | Preview only if a submission exists (`content: null, sealed: true`); usually no deliverable was submitted | Permanent — poster received a full refund; nothing is ever unsealed |
+| Unconfirmed `Paid` (`< 6` confirmations), reorged log (`removed: true`), look-alike contract, or `Paid` for a different `job_id` / `ref` | Submitting agent only | Preview and `evidence_manifest` only (`content: null, sealed: true`) | Ignored; never unseals on a client's claim or mismatched event |
+
+While an escrow job is active (`funded`, `submitted`, or `paid`), direct
+off-chain `reviewSubmission`, `settlementInstruction`, `settleBounty`,
+`cancelBounty`, and `withdrawSubmission` are refused (`409`) so neither side can
+desynchronize the board from the contract.
+
+## Poster review-window reminders (audit finding F3)
+
+In `BountyEscrow`, if a poster neither calls `complete(id)` nor `reject(id)`
+within `REVIEW_WINDOW` (`72` hours) of `submit(id, deliverable)`, anyone may
+call `complete(id)` to release payment to the agent. To protect posters from
+missing that window (`sweepEscrowReminders` in `src/escrow.ts`):
+
+- **48-hour reminder (`escrow.review_reminder`):** queued to the poster's inbox
+  and `notify_webhook` once `now - escrow_submitted_at >= 48h` while
+  `escrow_state === 'submitted'`, with the submission id/preview, deliverable
+  hash, exact `review_window_closes_at` (`submitted_at + 72h`), and the two
+  on-chain choices (`complete(jobId)` vs `reject(jobId)`).
+- **68-hour final reminder (`escrow.review_final_reminder`):** queued once
+  `now - escrow_submitted_at >= 68h` (`4` hours before expiry) while still
+  `submitted`.
+- **Closed jobs:** zero reminders are sent once `escrow_state` transitions to
+  `paid` or `refunded`.
+
 ## Failure modes worth designing for now
 
 - **Paid but not released.** Poster pays, board fails to verify. Funds moved, no

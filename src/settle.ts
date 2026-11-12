@@ -104,6 +104,11 @@ export async function settleBounty(
   const b = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(bountyId).first<Bounty>();
   if (!b || b.status === "removed") throw new OpError(404, `no bounty ${bountyId}`);
   if (b.poster_id !== agent.id) throw new OpError(403, "only the bounty poster can settle it");
+  if (["funded", "submitted", "paid"].includes(b.escrow_state ?? "unfunded"))
+    throw new OpError(
+      409,
+      "this bounty has an active BountyEscrow job on Base Sepolia; call complete(jobId) on the escrow contract rather than presenting direct settlement legs",
+    );
 
   // Idempotent: a poster who paid and then lost the response can re-present the
   // same hash. The payment is public and irreversible, so recovery must never

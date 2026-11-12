@@ -13,6 +13,10 @@
 
 import { checkPayoutAddress, toChecksumAddress } from "./wallet.js";
 import { inboxStmt, validateWebhookUrl, newWebhookSecret, WebhookError, eventView, type InboxRow } from "./notify.js";
+import {
+  bountyEscrowRef, canPosterReadDeliverable, sweepEscrowReminders, finalizePaidEscrowSubmission,
+  escrowAddressOf, escrowSourcifyUrl, BASE_SEPOLIA_CHAIN_ID, type EscrowState,
+} from "./escrow.js";
 
 export interface Env {
   DB: D1Database;
@@ -44,6 +48,9 @@ export interface Env {
    */
   PLATFORM_FEE_ADDRESS?: string;
   BASE_RPC_URL?: string;
+  /** Base Sepolia BountyEscrow deployment (testnet only) and read-only RPC URL. */
+  ESCROW_ADDRESS_BASE_SEPOLIA?: string;
+  BASE_SEPOLIA_RPC_URL?: string;
   /** wrangler secret. Absent = admin endpoints disabled, which is fail-closed. */
   ADMIN_KEY?: string;
   /** Optional free keys for the registry safety scan (Worker secrets). */
@@ -73,6 +80,17 @@ export type Bounty = {
   notify_webhook?: string | null; review_delegate: string | null;
   review_after_hours: number | null; review_fee_bp: number;
   review_fee_cents: number | null; awarded_by: string | null;
+  accepted_agent_id?: string | null; accepted_at?: string | null;
+  escrow_ref?: string | null; escrow_contract?: string | null;
+  escrow_job_id?: number | null; escrow_state?: string;
+  escrow_refund_reason?: string | null;
+  escrow_poster_address?: string | null;
+  escrow_agent_id?: string | null; escrow_agent_address?: string | null;
+  escrow_amount_units?: string | null; escrow_deadline?: number | null;
+  escrow_funding_tx?: string | null; escrow_deliverable_hash?: string | null;
+  escrow_submitted_at?: string | null; escrow_settlement_tx?: string | null;
+  escrow_to_agent_units?: string | null; escrow_fee_units?: string | null;
+  escrow_reminder_48h_at?: string | null; escrow_reminder_68h_at?: string | null;
 };
 
 export type Submission = {
@@ -659,13 +677,19 @@ export function evidenceManifest(rows: EvidenceRow[]) {
 export async function expireOverdue(db: D1Database): Promise<void> {
   const now = nowIso();
   const { results } = await db
-    .prepare("SELECT id FROM bounties WHERE status = 'open' AND deadline IS NOT NULL AND deadline < ?")
+    .prepare(
+      "SELECT id FROM bounties WHERE status = 'open' AND deadline IS NOT NULL AND deadline < ? AND COALESCE(escrow_state, 'unfunded') NOT IN ('funded', 'submitted', 'paid')",
+    )
     .bind(now)
     .all<{ id: string }>();
   if (!results.length) return;
   const stmts: D1PreparedStatement[] = [];
   for (const { id } of results) {
-    stmts.push(db.prepare("UPDATE bounties SET status = 'expired' WHERE id = ? AND status = 'open'").bind(id));
+    stmts.push(
+      db.prepare(
+        "UPDATE bounties SET status = 'expired' WHERE id = ? AND status = 'open' AND COALESCE(escrow_state, 'unfunded') NOT IN ('funded', 'submitted', 'paid')",
+      ).bind(id),
+    );
     stmts.push(
       db.prepare(
         "UPDATE submissions SET status = 'closed', review_note = 'bounty expired', reviewed_at = ? WHERE bounty_id = ? AND status = 'pending'",
@@ -1093,6 +1117,7 @@ export async function postBounty(
 
   const id = newId("bty");
   const at = nowIso();
+  const escrowRef = settlementMode === "onchain" && !parts.length ? bountyEscrowRef(id) : null;
   await db.batch([
     ...(newSecret
       ? [db.prepare("UPDATE agents SET webhook_secret = ? WHERE id = ? AND webhook_secret IS NULL").bind(newSecret, agent.id)]
@@ -1100,10 +1125,10 @@ export async function postBounty(
     db.prepare(
       `INSERT INTO bounties (id, poster_id, title, description, category, acceptance_criteria,
          reward_amount_cents, reward_currency, status, deadline, fee_bp, audience, evidence_required, settlement_mode,
-         notify_webhook, review_delegate, review_after_hours, review_fee_bp, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'USD', 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         escrow_ref, notify_webhook, review_delegate, review_after_hours, review_fee_bp, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'USD', 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(id, agent.id, title, description, category, criteria, cents, deadline, PLATFORM_FEE_BP, audience,
-           evidence.length ? JSON.stringify(evidence) : null, settlementMode,
+           evidence.length ? JSON.stringify(evidence) : null, settlementMode, escrowRef,
            bountyHook, review?.delegate ?? null, review?.after_hours ?? null, review?.fee_bp ?? 0, at),
     ...parts.map((m, i) =>
       db.prepare(
@@ -1242,6 +1267,10 @@ const PUBLIC_BOUNTY_COLS =
    b.deadline, b.awarded_submission_id, b.awarded_at, b.payment_ref,
    b.fee_bp, b.fee_cents, b.audience, b.evidence_required, b.settlement_mode, b.settled_tx, b.created_at,
    b.review_delegate, b.review_after_hours, b.review_fee_bp, b.review_fee_cents, b.awarded_by,
+   b.accepted_agent_id, b.accepted_at, b.escrow_ref, b.escrow_contract, b.escrow_job_id,
+   b.escrow_state, b.escrow_refund_reason, b.escrow_agent_id, b.escrow_funding_tx,
+   b.escrow_deliverable_hash, b.escrow_submitted_at, b.escrow_settlement_tx,
+   b.escrow_to_agent_units, b.escrow_fee_units,
    (SELECT COUNT(*) FROM submissions s WHERE s.bounty_id = b.id) AS submission_count,
    EXISTS (SELECT 1 FROM milestones m WHERE m.bounty_id = b.id) AS has_milestones,
    CASE WHEN b.status = 'open' AND b.review_delegate IS NULL AND EXISTS (
@@ -1253,29 +1282,70 @@ const PUBLIC_BOUNTY_COLS =
 // NOTE: notify_webhook and every contact column are deliberately absent above.
 // This column list is the ONLY way bounty rows reach public responses.
 
+export type PublicEscrowView = {
+  network: "base-sepolia";
+  chain_id: number;
+  contract_address: string;
+  sourcify_url: string;
+  ref: string;
+  state: EscrowState;
+  refund_reason: string | null;
+  job_id: number | null;
+  funding_tx: string | null;
+  settlement_tx: string | null;
+  submitted_at: string | null;
+  deliverable_hash: string | null;
+  accepted_agent_id: string | null;
+  confirmations_required: number;
+};
+
 export type PublicBounty = Bounty & {
   poster_name: string; submission_count: number;
   poster_unresponsive: number | boolean; poster_reachable: number | boolean;
   escrow_fee_split?: EscrowFeeSplit;
+  escrow?: PublicEscrowView;
 };
 
 /** SQLite hands back 0/1; the API speaks booleans. */
-function shapeBounty(b: PublicBounty & { has_milestones?: number | boolean }): PublicBounty {
+function shapeBounty(
+  b: PublicBounty & { has_milestones?: number | boolean },
+  env?: Pick<Env, "ESCROW_ADDRESS_BASE_SEPOLIA">,
+): PublicBounty {
   const hasMilestones = !!b.has_milestones;
   delete b.has_milestones;
   b.poster_unresponsive = !!b.poster_unresponsive;
   b.poster_reachable = !!b.poster_reachable;
+  const escrowBacked = b.escrow_job_id != null || (b.escrow_state != null && b.escrow_state !== "unfunded");
   // Do not attach escrow_fee_split to bounties already settled via direct
-  // cent-floored settlement_legs (fee_cents / settled_tx already recorded).
+  // cent-floored settlement_legs (escrow_job_id is null while fee_cents/settled_tx are set).
   if (
     b.settlement_mode === "onchain" &&
     b.reward_amount_cents > 0 &&
     !hasMilestones &&
-    b.status === "open" &&
-    b.fee_cents == null &&
-    b.settled_tx == null
+    (escrowBacked || (b.status === "open" && b.fee_cents == null && b.settled_tx == null))
   ) {
     b.escrow_fee_split = escrowFeeSplit(b.reward_amount_cents, b.fee_bp);
+  }
+  if (b.settlement_mode === "onchain" && b.reward_amount_cents > 0 && !hasMilestones) {
+    const contractAddr = b.escrow_contract
+      ? toChecksumAddress(b.escrow_contract)
+      : escrowAddressOf(env);
+    b.escrow = {
+      network: "base-sepolia",
+      chain_id: BASE_SEPOLIA_CHAIN_ID,
+      contract_address: contractAddr,
+      sourcify_url: escrowSourcifyUrl(contractAddr),
+      ref: b.escrow_ref ?? bountyEscrowRef(b.id),
+      state: ((b.escrow_state ?? "unfunded") as EscrowState),
+      refund_reason: b.escrow_refund_reason ?? null,
+      job_id: b.escrow_job_id ?? null,
+      funding_tx: b.escrow_funding_tx ?? null,
+      settlement_tx: b.escrow_settlement_tx ?? null,
+      submitted_at: b.escrow_submitted_at ?? null,
+      deliverable_hash: b.escrow_deliverable_hash ?? null,
+      accepted_agent_id: b.accepted_agent_id ?? null,
+      confirmations_required: MIN_CONFIRMATIONS,
+    };
   }
   return b;
 }
@@ -1283,6 +1353,7 @@ function shapeBounty(b: PublicBounty & { has_milestones?: number | boolean }): P
 export async function listBounties(
   db: D1Database,
   q: { status?: string; category?: string; limit?: number; audience?: string },
+  env?: Pick<Env, "ESCROW_ADDRESS_BASE_SEPOLIA">,
 ): Promise<PublicBounty[]> {
   await expireOverdue(db);
   const status = q.status ?? "open";
@@ -1313,7 +1384,7 @@ export async function listBounties(
     )
     .bind(...args, limit)
     .all<PublicBounty>();
-  return (results ?? []).map(shapeBounty);
+  return (results ?? []).map((r) => shapeBounty(r, env));
 }
 
 /**
@@ -1378,7 +1449,7 @@ async function withTeams(db: D1Database, subs: Submission[], reveal = false) {
   return Promise.all(
     subs.map(async (sub) => {
       const rows = await evidenceOf(db, sub.id);
-      const revealThis = reveal || sub.status === "accepted";
+      const revealThis = reveal || (sub.status === "accepted" && !(sub as { sealed?: boolean }).sealed);
       return {
         ...sub,
         contributors: await contributorsOf(db, sub.id),
@@ -1396,6 +1467,7 @@ export async function getBounty(
   id: string,
   viewer: Agent | null,
   operatorId?: string,
+  env?: Pick<Env, "ESCROW_ADDRESS_BASE_SEPOLIA">,
 ): Promise<{
   bounty: PublicBounty;
   submissions?: Omit<Submission, "content">[] | Submission[];
@@ -1409,7 +1481,7 @@ export async function getBounty(
     .bind(id)
     .first<PublicBounty>();
   if (!bounty || bounty.status === "removed") throw new OpError(404, `no bounty ${id}`);
-  shapeBounty(bounty);
+  shapeBounty(bounty, env);
   (bounty as PublicBounty & { review_terms?: unknown }).review_terms = reviewTerms(bounty);
   (bounty as PublicBounty & { poster_reputation?: unknown; milestones?: unknown }).poster_reputation =
     await posterReputation(db, bounty.poster_id);
@@ -1435,25 +1507,30 @@ export async function getBounty(
       .prepare("SELECT * FROM submissions WHERE bounty_id = ? AND status NOT IN ('draft','withdrawn') ORDER BY created_at")
       .bind(id)
       .all<Submission>();
-    // Content is released ONLY for the submission you awarded. Everything else
-    // shows its preview. This is what makes "read everything then cancel"
-    // stop being a way to get work for free.
+    // Content is released ONLY for a submission that passes canPosterReadDeliverable:
+    // on escrow jobs (M4 / #66), ONLY after a confirmed Paid event for that job id
+    // and matching ref; never on Submitted, never after reject(), never on a claim.
     const shown = (results ?? []).map((r) =>
-      r.status === "accepted" ? r : { ...r, content: null, sealed: true },
+      canPosterReadDeliverable(bounty, r) ? r : { ...r, content: null, sealed: true },
     );
+    const escrowBacked = bounty.escrow_job_id != null || (bounty.escrow_state != null && bounty.escrow_state !== "unfunded");
     return {
       bounty,
       submissions: await withTeams(db, shown as Submission[]),
       your_role: "poster",
-      note: "You review on previews. Awarding releases the winning submission's full content; it is final and cannot be undone.",
+      note: escrowBacked
+        ? `Escrow job #${bounty.escrow_job_id ?? "—"} (${bounty.escrow_state}): you review on previews. The full deliverable is released only after a confirmed Paid event (${MIN_CONFIRMATIONS} confirmations on Base Sepolia).`
+        : "You review on previews. Awarding releases the winning submission's full content; it is final and cannot be undone.",
     };
   }
   // The opted-in review delegate. It sees a submission in FULL only once that
   // submission has waited out the poster's window — the poster agreed to exactly
   // that at post time, and nothing more. Submissions still inside the window
   // stay invisible to it, and every access is logged publicly.
+  // Defense in depth: never reveal an on-chain or escrow-backed submission to a delegate.
+  const escrowBacked = bounty.escrow_job_id != null || (bounty.escrow_state != null && bounty.escrow_state !== "unfunded");
   const del = delegateIdOf(bounty, operatorId);
-  if (viewer && del && viewer.id === del) {
+  if (viewer && del && viewer.id === del && !escrowBacked && bounty.settlement_mode !== "onchain") {
     const { results } = await db
       .prepare(
         "SELECT * FROM submissions WHERE bounty_id = ? AND (status = 'pending' OR reviewed_by = ?) ORDER BY created_at",
@@ -1516,6 +1593,98 @@ export async function getBounty(
   return { bounty };
 }
 
+/**
+ * Accept an open whole on-chain bounty so the poster knows which agent wallet
+ * to lock funds for in `BountyEscrow.fund(agent, amount, deadline, ref)`.
+ */
+export async function acceptBounty(
+  db: D1Database,
+  agent: Agent,
+  bountyId: string,
+  env?: Pick<Env, "ESCROW_ADDRESS_BASE_SEPOLIA">,
+) {
+  await expireOverdue(db);
+  const b = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(bountyId).first<Bounty>();
+  if (!b || b.status === "removed") throw new OpError(404, `no bounty ${bountyId}`);
+  if (b.status !== "open") throw new OpError(409, `bounty is ${b.status}, not open`);
+  if (b.poster_id === agent.id) throw new OpError(403, "you cannot accept your own bounty");
+  if (b.settlement_mode !== "onchain" || b.reward_amount_cents <= 0)
+    throw new OpError(409, "only paid on-chain bounties use BountyEscrow acceptance");
+  const parts = await milestonesOf(db, bountyId);
+  if (parts.length)
+    throw new OpError(409, "milestoned bounties do not use single-job BountyEscrow acceptance");
+  const state = b.escrow_state ?? "unfunded";
+  if (state !== "unfunded" && state !== "refunded")
+    throw new OpError(409, `this bounty already has an active escrow job in state ${state}`);
+
+  await applyDuePayoutChanges(db, [agent.id]);
+  const me = await db
+    .prepare("SELECT payout_address FROM agents WHERE id = ?")
+    .bind(agent.id)
+    .first<{ payout_address: string | null }>();
+  if (!me?.payout_address)
+    throw new OpError(
+      409,
+      "set your payout_address first (set_payout_address or POST /v1/agents/me/payout-address) so the poster's escrow funding transaction knows which wallet to lock USDC for",
+    );
+
+  const checksumWallet = toChecksumAddress(me.payout_address);
+  const ref = b.escrow_ref ?? bountyEscrowRef(bountyId);
+  const contractAddr = escrowAddressOf(env);
+  const ef = escrowFeeSplit(b.reward_amount_cents, b.fee_bp);
+
+  if (b.accepted_agent_id === agent.id) {
+    return {
+      bounty_id: bountyId,
+      accepted_agent_id: agent.id,
+      agent_payout_address: checksumWallet,
+      already_accepted: true,
+      escrow_ref: ref,
+      escrow_contract: contractAddr,
+      escrow_fee_split: ef,
+      fund_url: `${PUBLIC_ORIGIN}/bounties/${bountyId}/fund`,
+    };
+  }
+  if (b.accepted_agent_id && b.accepted_agent_id !== agent.id)
+    throw new OpError(409, "another agent has already accepted this bounty for escrow funding");
+
+  const at = nowIso();
+  const upd = await db
+    .prepare(
+      "UPDATE bounties SET accepted_agent_id = ?, accepted_at = ?, escrow_ref = COALESCE(escrow_ref, ?) WHERE id = ? AND status = 'open' AND accepted_agent_id IS NULL",
+    )
+    .bind(agent.id, at, ref, bountyId)
+    .run();
+  if (!upd.meta.changes) throw new OpError(409, "another agent accepted this bounty first");
+
+  await db.batch([
+    inboxStmt(db, at, b.poster_id, "bounty.accepted", bountyId, null, {
+      title: b.title,
+      agent_id: agent.id,
+      agent_name: agent.name,
+      agent_payout_address: checksumWallet,
+      escrow_ref: ref,
+      escrow_contract: contractAddr,
+      locked_units: ef.locked_units,
+      locked_usdc: ef.locked_usdc,
+      fund_url: `${PUBLIC_ORIGIN}/bounties/${bountyId}/fund`,
+      message: `Agent "${agent.name}" (${agent.id}) accepted "${b.title}". Lock ${ef.locked_usdc} USDC in BountyEscrow on Base Sepolia so work can begin.`,
+    }),
+    eventStmt(db, at, "bounty_accepted", bountyId, agent.id, `agent "${agent.name}" accepted "${b.title}" for escrow`),
+  ]);
+
+  return {
+    bounty_id: bountyId,
+    accepted_agent_id: agent.id,
+    agent_payout_address: checksumWallet,
+    accepted_at: at,
+    escrow_ref: ref,
+    escrow_contract: contractAddr,
+    escrow_fee_split: ef,
+    fund_url: `${PUBLIC_ORIGIN}/bounties/${bountyId}/fund`,
+  };
+}
+
 export async function submitToBounty(
   db: D1Database,
   agent: Agent,
@@ -1537,6 +1706,14 @@ export async function submitToBounty(
   const b = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(bountyId).first<Bounty>();
   if (!b || b.status === "removed") throw new OpError(404, `no bounty ${bountyId}`);
   if (b.status !== "open") throw new OpError(409, `bounty is ${b.status}, not accepting submissions`);
+  const latePaidEscrow =
+    (b.escrow_state ?? "unfunded") === "paid" &&
+    b.awarded_submission_id == null &&
+    b.escrow_agent_id === agent.id &&
+    contributorsRaw == null &&
+    milestoneIdRaw == null;
+  if ((b.escrow_state ?? "unfunded") === "paid" && !latePaidEscrow)
+    throw new OpError(409, "escrow job for this bounty is already paid");
   if (b.poster_id === agent.id) throw new OpError(403, "you cannot submit to your own bounty");
   const delegate = delegateIdOf(b, operatorId);
   if (delegate && delegate === agent.id)
@@ -1635,6 +1812,16 @@ export async function submitToBounty(
   // starts as 'draft'. Solo submissions skip straight to 'pending' — the lead
   // consents by the act of submitting.
   const solo = roster.length === 1;
+  if (
+    (b.escrow_state === "funded" || b.escrow_state === "submitted") &&
+    b.escrow_agent_id != null &&
+    (agent.id !== b.escrow_agent_id || !solo)
+  ) {
+    throw new OpError(
+      409,
+      "this bounty has an active solo BountyEscrow job locked for the accepted agent",
+    );
+  }
   const id = newId("sub");
   const at = nowIso();
   const stmts = [
@@ -1660,6 +1847,10 @@ export async function submitToBounty(
     ...(solo ? [submissionReceivedInbox(db, at, b, id, milestone?.id ?? null)] : []),
   ];
   await db.batch(stmts);
+  const finalizedPaid =
+    latePaidEscrow && solo && !milestone
+      ? await finalizePaidEscrowSubmission(db, b, id)
+      : false;
 
   const pendingJoins = roster.filter((r) => r.agent_id !== agent.id).map((r) => r.agent_id);
   const soloEscrow =
@@ -1675,7 +1866,7 @@ export async function submitToBounty(
     evidence_note: evidence.length
       ? "Your evidence is sealed like your content: the poster sees only its shape and whether it complied until they award you."
       : undefined,
-    status: solo ? "pending" : "draft",
+    status: finalizedPaid ? "accepted" : solo ? "pending" : "draft",
     escrow_fee_split: soloEscrow,
     contributors: roster.map((r) => ({
       agent_id: r.agent_id,
@@ -2117,6 +2308,11 @@ export async function settlementInstruction(
   const b = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(bountyId).first<Bounty>();
   if (!b || b.status === "removed") throw new OpError(404, `no bounty ${bountyId}`);
   if (b.poster_id !== agent.id) throw new OpError(403, "only the bounty poster can settle it");
+  if (["funded", "submitted", "paid"].includes(b.escrow_state ?? "unfunded"))
+    throw new OpError(
+      409,
+      "this bounty has an active BountyEscrow job on Base Sepolia; call complete(jobId) or reject(jobId) on the escrow contract rather than paying direct settlement legs",
+    );
   if (!env.PLATFORM_FEE_ADDRESS)
     throw new OpError(503, "on-chain settlement is not configured on this board");
   const sub = await db
@@ -2125,6 +2321,11 @@ export async function settlementInstruction(
     .first<Submission>();
   if (!sub) throw new OpError(404, `no submission ${submissionId} on bounty ${bountyId}`);
   if (sub.status !== "pending") throw new OpError(409, `submission is ${sub.status}, not pending`);
+  if (b.escrow_state === "refunded" && b.escrow_agent_id && sub.agent_id === b.escrow_agent_id)
+    throw new OpError(
+      409,
+      "this agent's BountyEscrow job was refunded, so their deliverable stays sealed under M4; fund a new escrow job or settle a different agent's submission",
+    );
 
   const { team, mil, potCents, fee, payouts } = await computePayout(db, b, sub);
 
@@ -2210,6 +2411,11 @@ export async function reviewSubmission(
 ) {
   const b = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(bountyId).first<Bounty>();
   if (!b || b.status === "removed") throw new OpError(404, `no bounty ${bountyId}`);
+  if (["funded", "submitted", "paid"].includes(b.escrow_state ?? "unfunded"))
+    throw new OpError(
+      409,
+      "this bounty has an active BountyEscrow job: call complete(jobId) or reject(jobId) on the escrow contract; the board mirrors confirmed chain events automatically",
+    );
   // The poster may always act. The delegate may act only because the poster
   // opted in at post time, and only on submissions that waited out the window.
   const asDelegate = b.poster_id !== agent.id;
@@ -2221,6 +2427,11 @@ export async function reviewSubmission(
     .first<Submission>();
   if (!s) throw new OpError(404, `no submission ${submissionId} on bounty ${bountyId}`);
   if (s.status !== "pending") throw new OpError(409, `submission is ${s.status}, not pending`);
+  if (decision === "accept" && b.escrow_state === "refunded" && b.escrow_agent_id && s.agent_id === b.escrow_agent_id)
+    throw new OpError(
+      409,
+      "this agent's BountyEscrow job was refunded, so their deliverable stays sealed under M4 and cannot be accepted off-escrow",
+    );
   if (asDelegate) {
     const opens = delegateOpensAt(b, s);
     if (opens == null || opens > Date.now())
@@ -2475,6 +2686,17 @@ export async function withdrawSubmission(db: D1Database, agent: Agent, submissio
   if (!s) throw new OpError(404, `no submission ${submissionId}`);
   if (s.agent_id !== agent.id) throw new OpError(403, "only the agent that made the submission can withdraw it");
   if (s.status !== "pending") throw new OpError(409, `submission is ${s.status}, not pending`);
+  const bCheck = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(s.bounty_id).first<Bounty>();
+  if (
+    bCheck &&
+    bCheck.escrow_agent_id === agent.id &&
+    ["funded", "submitted", "paid"].includes(bCheck.escrow_state ?? "unfunded")
+  ) {
+    throw new OpError(
+      409,
+      `this submission is backed by active escrow job #${bCheck.escrow_job_id ?? "—"} (${bCheck.escrow_state}) and cannot be withdrawn off-chain`,
+    );
+  }
   const since = Date.parse(s.pending_at ?? s.created_at);
   if (since + STALE_MS > Date.now())
     throw new OpError(
@@ -2588,13 +2810,24 @@ export async function sweepNotices(db: D1Database, operatorId?: string, nowMs = 
     );
   }
   if (stmts.length) await db.batch(stmts);
-  return { stale_bounties: byBounty.size, delegate_unlocked: (ripe.results ?? []).length };
+  const escrow = await sweepEscrowReminders(db, nowMs);
+  return {
+    stale_bounties: byBounty.size,
+    delegate_unlocked: (ripe.results ?? []).length,
+    escrow_reminded_48h: escrow.reminded_48h,
+    escrow_reminded_68h: escrow.reminded_68h,
+  };
 }
 
 export async function cancelBounty(db: D1Database, agent: Agent, bountyId: string) {
   const b = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(bountyId).first<Bounty>();
   if (!b || b.status === "removed") throw new OpError(404, `no bounty ${bountyId}`);
   if (b.poster_id !== agent.id) throw new OpError(403, "only the bounty poster can cancel it");
+  if (["funded", "submitted", "paid"].includes(b.escrow_state ?? "unfunded"))
+    throw new OpError(
+      409,
+      `cannot cancel on the board while escrow job #${b.escrow_job_id ?? "—"} is ${b.escrow_state}; refund on BountyEscrow first`,
+    );
   const at = nowIso();
   const res = await db
     .prepare("UPDATE bounties SET status = 'cancelled' WHERE id = ? AND status = 'open'")

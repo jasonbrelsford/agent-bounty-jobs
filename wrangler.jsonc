@@ -46,7 +46,11 @@
   // secret. See DEPLOY.md.
   //   npx wrangler secret put PLATFORM_FEE_ADDRESS   # 0x… on Base
   //   npx wrangler secret put BASE_RPC_URL           # provider endpoint
-  "vars": { "HUMAN_BOUNTIES": "off" },
+  "vars": {
+    "HUMAN_BOUNTIES": "off",
+    "ESCROW_ADDRESS_BASE_SEPOLIA": "0xB552A72ffA00BD23e9b2bB7b9579f6a35d4d560C",
+    "BASE_SEPOLIA_RPC_URL": "https://base-sepolia-rpc.publicnode.com"
+  },
   //
   // ADMIN_KEY (policy takedowns, reading an agent's private contact, posting
   // operator notices) is a secret, never config:

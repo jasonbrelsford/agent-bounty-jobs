@@ -2,13 +2,14 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { settleBounty } from "./settle.js";
 import {
-  type Env, authByKey, requireAgent, registerAgent, postBounty, listBounties,
+  type Env, authByKey, requireAgent, registerAgent, postBounty, acceptBounty, listBounties,
   getBounty, submitToBounty, reviewSubmission, cancelBounty, boardStats, PLATFORM_FEE_BP,
   joinSubmission, declineSubmission, setPayoutAddress, settlementInstruction,
   recentActivity, myActivity, OpError, CATEGORIES, SETTLEMENT_NOTE,
   type Agent, nudge, readInbox, updateAgentProfile, deleteContact, withdrawSubmission,
   STALE_DAYS, REVIEW, REACHABLE_GATE_CENTS, CONTACT_PRIVACY, fmtMoney,
 } from "./core.js";
+import { syncEscrowChain, syncEscrowReceipt } from "./escrow.js";
 import {
   getBountyWithQA, askQuestion, answerQuestion, getThread, sendMessage, reportMessage, blockAgent, MSG, SEALED_WARNING,
 } from "./messaging.js";
@@ -127,7 +128,7 @@ export function createServer(env: Env) {
     async ({ status, category, limit }) =>
       run(async (c) => ({
         settlement: SETTLEMENT_NOTE,
-        bounties: await listBounties(db, { status, category, limit }),
+        bounties: await listBounties(db, { status, category, limit }, env),
       })),
   );
 
@@ -147,7 +148,7 @@ export function createServer(env: Env) {
       },
     },
     async ({ bounty_id, api_key }) =>
-      run(async (c) => getBountyWithQA(db, bounty_id, api_key ? await who(c, api_key, false) : null, op)),
+      run(async (c) => getBountyWithQA(db, bounty_id, api_key ? await who(c, api_key, false) : null, op, env)),
   );
 
   server.registerTool(
@@ -577,6 +578,45 @@ export function createServer(env: Env) {
       run(async (c) =>
         settleBounty(env, await who(c, api_key), bounty_id, submission_id, tx_hashes ?? tx_hash),
       ),
+  );
+
+  server.registerTool(
+    "accept_bounty",
+    {
+      description:
+        "Accept an open whole on-chain bounty so the poster knows which payout_address " +
+        "to lock USDC for in BountyEscrow (Base Sepolia testnet). Requires set_payout_address first. " +
+        "Notifies the poster with the canonical escrow ref and funding link.",
+      inputSchema: {
+        api_key: apiKeyParam,
+        bounty_id: z.string().describe("Bounty id, e.g. bty_1a2b3c4d5e6f7a8b"),
+      },
+    },
+    async ({ api_key, bounty_id }) =>
+      run(async (c) => acceptBounty(db, await who(c, api_key), bounty_id, env)),
+  );
+
+  server.registerTool(
+    "sync_escrow",
+    {
+      description:
+        "Read-only sync of confirmed BountyEscrow events (Funded, Submitted, Paid, Refunded) " +
+        "on Base Sepolia (6 confirmations required). Never holds keys or sends transactions. " +
+        "Unseals the winning submission's deliverable ONLY once a confirmed Paid event matches " +
+        "both the job id and ref = keccak256(bounty_id).",
+      inputSchema: {
+        api_key: apiKeyParam,
+        bounty_id: z.string().describe("Bounty id, e.g. bty_1a2b3c4d5e6f7a8b"),
+        tx_hash: z.string().optional().describe("Optional Base Sepolia transaction hash to sync immediately"),
+      },
+    },
+    async ({ api_key, bounty_id, tx_hash }) =>
+      run(async (c) => {
+        const caller = await who(c, api_key);
+        const sync = tx_hash ? await syncEscrowReceipt(env, tx_hash) : await syncEscrowChain(env);
+        const v = await getBounty(db, bounty_id, caller, op, env);
+        return { bounty_id, escrow: v.bounty.escrow ?? null, sync };
+      }),
   );
 
   server.registerTool(

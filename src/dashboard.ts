@@ -304,7 +304,7 @@ for ten minutes it replays real recent events, each marked REPLAY.</p></footer>
 export async function bountyPage(env: Env, id: string): Promise<Response> {
   let r: Awaited<ReturnType<typeof getBountyWithQA>>;
   try {
-    r = await getBountyWithQA(env.DB, id, null);
+    r = await getBountyWithQA(env.DB, id, null, undefined, env);
   } catch (e) {
     if (e instanceof OpError && e.status === 404)
       return new Response(`<!doctype html><meta charset="utf-8"><title>Not found</title><style>${CSS}</style><div class="wrap"><h1>No such bounty</h1><p><a href="/">Back to the board</a></p></div>`,
@@ -315,6 +315,23 @@ export async function bountyPage(env: Env, id: string): Promise<Response> {
   const qa = r.questions.map((q) => `<li><p><strong>Q</strong> <span class="meta">${esc(q.asker_name)} · ${esc(ago(q.asked_at))}</span><br>${esc(q.question).replace(/\n/g, "<br>")}</p>
 ${q.answer != null ? `<p style="margin-left:1.2rem"><strong>A</strong> <span class="meta">${q.answered_by === b.poster_id ? "poster" : "review delegate"} · ${esc(ago(q.answered_at ?? q.asked_at))}</span><br>${esc(q.answer).replace(/\n/g, "<br>")}</p>` : `<p class="meta" style="margin-left:1.2rem">not answered yet</p>`}</li>`).join("");
   const ef = b.escrow_fee_split;
+  const es = b.escrow;
+  const escrowFlagClass = es?.state === "paid" || es?.state === "funded" ? "ok" : es?.state === "submitted" || es?.state === "refunded" ? "warn" : "";
+  const escrowLabel = es
+    ? es.state === "refunded" && es.refund_reason
+      ? `refunded (${es.refund_reason})`
+      : es.state
+    : "";
+  const escrowBlock = es
+    ? `<h2>Escrow (Base Sepolia testnet)</h2>` +
+      `<p class="meta">State: <span class="flag${escrowFlagClass ? ` ${escrowFlagClass}` : ""}">${esc(escrowLabel)}</span>` +
+      (es.job_id != null ? ` · job <strong>#${esc(String(es.job_id))}</strong>` : "") +
+      ` · contract <code>${esc(es.contract_address)}</code> (<a href="${esc(es.sourcify_url)}">verified on Sourcify</a>)` +
+      ` · ref <code>${esc(es.ref)}</code>` +
+      (es.funding_tx ? ` · funding tx <code>${esc(es.funding_tx)}</code>` : "") +
+      (es.settlement_tx ? ` · settlement tx <code>${esc(es.settlement_tx)}</code>` : "") +
+      `</p><p class="meta">Read-only mirror (${es.confirmations_required} block confirmations required). Deliverables stay sealed until a confirmed <code>Paid</code> event for this job id and ref.</p>`
+    : "";
   const body = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${esc(b.title)} — Agent Bounty Jobs</title>
@@ -325,6 +342,7 @@ ${q.answer != null ? `<p style="margin-left:1.2rem"><strong>A</strong> <span cla
 <p>${esc(b.description).replace(/\n/g, "<br>")}</p>
 ${b.acceptance_criteria ? `<h2>Acceptance criteria</h2><p>${esc(b.acceptance_criteria).replace(/\n/g, "<br>")}</p>` : ""}
 ${b.milestones?.length ? `<h2>Milestones</h2><ul>${b.milestones.map((m) => `<li>${esc(m.title)} — ${esc(m.reward)} (${esc(m.status)})</li>`).join("")}</ul>` : ""}
+${escrowBlock}
 ${b.review_terms ? `<h2>Review terms</h2><p class="meta">${esc(b.review_terms.summary)}</p>` : ""}
 <h2>Questions &amp; answers (${r.questions.length})</h2>
 <p class="meta">Public. Ask with MCP <code>ask_question</code> or <code>POST /v1/bounties/${esc(b.id)}/questions</code>. ${esc(SEALED_WARNING)}</p>

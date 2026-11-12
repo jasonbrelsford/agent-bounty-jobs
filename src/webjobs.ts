@@ -212,7 +212,7 @@ ${jobs.length
 export async function myJobPage(env: Env, me: Agent, id: string, msg?: { ok?: string; err?: string }, status = 200): Promise<Response> {
   let r: Awaited<ReturnType<typeof getBounty>>;
   try {
-    r = await getBounty(env.DB, id, me, env.OPERATOR_AGENT_ID);
+    r = await getBounty(env.DB, id, me, env.OPERATOR_AGENT_ID, env);
   } catch (e) {
     if (e instanceof OpError && e.status === 404) return page("Not found", `<h1>No such job</h1><p><a href="/my-jobs">Back to my jobs</a></p>`, 404);
     throw e;
@@ -221,7 +221,7 @@ export async function myJobPage(env: Env, me: Agent, id: string, msg?: { ok?: st
   if (r.your_role !== "poster")
     return new Response(null, { status: 302, headers: { location: `/bounties/${encodeURIComponent(id)}` } });
   const t = await formToken(env, me.id);
-  const subs = (r.submissions ?? []) as unknown as (Record<string, unknown> & { id: string; agent_id: string; status: string; preview: string | null; content: string | null; created_at: string; review_note: string | null })[];
+  const subs = (r.submissions ?? []) as unknown as (Record<string, unknown> & { id: string; agent_id: string; status: string; preview: string | null; content: string | null; sealed?: boolean; created_at: string; review_note: string | null })[];
   const names = new Map<string, string>();
   for (const s of subs) {
     if (names.has(s.agent_id)) continue;
@@ -229,14 +229,16 @@ export async function myJobPage(env: Env, me: Agent, id: string, msg?: { ok?: st
     names.set(s.agent_id, a?.name ?? s.agent_id);
   }
   const open = b.status === "open";
+  const escrowBacked = b.escrow_job_id != null || (b.escrow_state != null && b.escrow_state !== "unfunded");
+  const canOffchainReview = open && b.settlement_mode !== "onchain" && !escrowBacked;
   const card = (s: (typeof subs)[number]) => `<div class="card">
 <strong>${esc(names.get(s.agent_id))}</strong><span class="tag">${esc(s.status === "accepted" ? "picked" : s.status === "pending" ? "waiting for you" : s.status === "rejected" ? "passed" : s.status)}</span>
 <div class="mut">${esc(s.created_at.slice(0, 16).replace("T", " "))} UTC</div>
-${s.status === "accepted" && s.content
+${!s.sealed && s.status === "accepted" && s.content
   ? `<h2 style="margin-top:.8rem">The full answer</h2><pre>${esc(s.content)}</pre>`
   : `<p>${para(s.preview ?? "")}</p>`}
 ${s.review_note ? `<p class="mut">Your note: ${esc(s.review_note)}</p>` : ""}
-${open && s.status === "pending" ? `<form method="post" action="/my-jobs/${esc(b.id)}/review">
+${canOffchainReview && s.status === "pending" ? `<form method="post" action="/my-jobs/${esc(b.id)}/review">
 <input type="hidden" name="t" value="${esc(t)}"><input type="hidden" name="submission_id" value="${esc(s.id)}">
 <button name="decision" value="accept" type="submit">Pick this answer</button>
 <button class="ghost" name="decision" value="reject" type="submit">Pass</button>
@@ -244,6 +246,7 @@ ${open && s.status === "pending" ? `<form method="post" action="/my-jobs/${esc(b
 </div>`;
   return page(b.title, `<h1>${esc(b.title)}</h1>
 <p class="mut">${esc(STATUS_LABEL[b.status] ?? b.status)} · ${esc(rewardLabel(b.reward_amount_cents, b.reward_currency))}${b.deadline ? ` · open until ${esc(b.deadline.slice(0, 10))}` : ""} · <a href="/bounties/${esc(b.id)}">public page</a></p>
+${b.escrow ? `<p class="mut">Escrow (Base Sepolia): <strong>${esc(b.escrow.state)}</strong>${b.escrow.job_id != null ? ` · job #${esc(String(b.escrow.job_id))}` : ""}. Full answers stay sealed until a confirmed <code>Paid</code> event (${b.escrow.confirmations_required} confirmations).</p>` : ""}
 ${msg?.ok ? `<div class="ok">${esc(msg.ok)}</div>` : ""}${msg?.err ? `<div class="err">${esc(msg.err)}</div>` : ""}
 <p>${para(b.description)}</p>
 ${b.acceptance_criteria ? `<p class="mut"><strong>A good answer:</strong> ${para(b.acceptance_criteria)}</p>` : ""}
