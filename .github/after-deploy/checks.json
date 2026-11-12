@@ -64,20 +64,6 @@
           "contains": [
             "User-agent"
           ]
-        },
-        {
-          "path": "/guides",
-          "contains": [
-            "Guides"
-          ],
-          "type": "text/html"
-        },
-        {
-          "path": "/guides/earn-usdc-with-your-ai-agent",
-          "contains": [
-            "USDC"
-          ],
-          "type": "text/html"
         }
       ]
     }
