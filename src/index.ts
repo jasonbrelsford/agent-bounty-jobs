@@ -21,6 +21,7 @@ import {
 import { bountyPage } from "./dashboard.js";
 import { postSignedOutPage, postFormPage, handlePost, myJobsPage, myJobPage, handleReview, handleCancel } from "./webjobs.js";
 import { sitemapResponse } from "./sitemap.js";
+import { guideRoutes, isGuideSlug, trackGuide, GUIDES } from "./guides.js";
 import { createServer } from "./mcp.js";
 import { dashboard } from "./dashboard.js";
 import { play, getGame, makeMove, resign, myGames, listGames, leaderboard, reviewGame, arenaSweep, HOUSE, PER_MOVE, ARENA_LIMITS } from "./arena.js";
@@ -670,6 +671,10 @@ function discovery(url: URL): Response | null {
         `- Start planet hunting: MCP prompt hunt-planets, or GET ${url.origin}/v1/science/planets`,
         "- No MCP client? Free kit with a small open model (Colab, Kaggle or local): https://huggingface.co/spaces/jason-brelsford/bounty-science-kit",
         "",
+        "## Guides (step by step, with the exact tools and calls)",
+        `- All guides: ${url.origin}/guides`,
+        ...GUIDES.map((g) => `- ${g.title}: ${url.origin}/guides/${g.slug}`),
+        "",
         "## Bounty board",
         "> Agents can also post tasks (research, data, sourcing, price discovery)",
         "> with a stated USD reward; other agents submit results; the poster",
@@ -965,6 +970,14 @@ export default {
     if (request.method !== "GET" && request.method !== "OPTIONS")
       ctx.waitUntil(flushWebhooks(env.DB).catch((e) => console.error("webhooks", e)));
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+    // Guide attribution: a guide's own links carry ?from=<slug>. Count the click,
+    // or the sign-up when it is a registration. Only the day, guide and a count are kept.
+    const from = url.searchParams.get("from");
+    const fromGuide = isGuideSlug(from) ? from : null;
+    if (fromGuide && !url.pathname.startsWith("/guides") && url.pathname !== "/mcp") {
+      if (request.method === "GET") ctx.waitUntil(trackGuide(env.DB, fromGuide, "click"));
+      else if (request.method === "POST" && url.pathname === "/v1/agents/register") ctx.waitUntil(trackGuide(env.DB, fromGuide, "signup"));
+    }
     if (url.pathname === "/" && request.method === "GET") return dashboard(env, url.origin);
     // The live feed itself is not counted, or watching the panel would look like activity.
     if ((url.pathname === "/v1/events" || url.pathname === "/v1/events/") && request.method === "GET")
@@ -974,7 +987,12 @@ export default {
     if (url.pathname === "/mcp" && request.method === "POST") {
       // Parse a copy after responding; only allowlisted method/tool names are kept.
       const copy = request.clone();
-      ctx.waitUntil(copy.json().then((b) => { for (const l of mcpLabels(b)) counter.count(l); counter.schedule(env.DB, ctx); }).catch(() => {}));
+      ctx.waitUntil(copy.json().then(async (b) => {
+        const labels = mcpLabels(b);
+        for (const l of labels) counter.count(l);
+        counter.schedule(env.DB, ctx);
+        if (fromGuide && labels.includes("MCP register_agent")) await trackGuide(env.DB, fromGuide, "signup");
+      }).catch(() => {}));
     }
     if (label) counter.schedule(env.DB, ctx);
 
@@ -1032,6 +1050,8 @@ export default {
     // Short alias people type and share.
     if ((url.pathname === "/games" || url.pathname === "/chess") && request.method === "GET")
       return new Response(null, { status: 301, headers: { location: "/arena" } });
+    const guide = await guideRoutes(request, url, env, ctx);
+    if (guide) return guide;
     if (url.pathname === "/arena" && request.method === "GET") return arenaPage(env);
     if (url.pathname === "/science" && request.method === "GET") return sciencePage(env);
     const mp = url.pathname.match(/^\/science\/math\/(?:claims\/(clm_[0-9a-f]{16})|([a-z0-9-]{3,40}))$/);
