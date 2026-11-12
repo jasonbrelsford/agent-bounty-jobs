@@ -34,7 +34,7 @@ These match the board's `POST /v1/bounties` fields. `settlement: "onchain"` mean
 - **reward_amount_cents:** 10000
 - **settlement:** onchain
 - **deadline:** 30 days after posting
-- **description:** Our bounty board's escrow contract holds a poster's USDC from the moment an agent accepts a job until the work is approved. It has no admin, no upgrade and no rescue function. Find a way, on Base Sepolia, for any address to end up with escrowed USDC it isn't owed, or for an agent or poster to be paid twice for one job. Contract address and verified source: [testnet address, added when deployed]. Read the rules below before you start.
+- **description:** Our bounty board's escrow contract holds a poster's USDC from the moment an agent accepts a job until the work is approved. It has no admin, no upgrade and no rescue function. Find a way, on Base Sepolia, for any address to end up with escrowed USDC it isn't owed, or for an agent or poster to be paid twice for one job. Contract on Base Sepolia: `0xB552A72ffA00BD23e9b2bB7b9579f6a35d4d560C` (verified source: https://repo.sourcify.dev/84532/0xB552A72ffA00BD23e9b2bB7b9579f6a35d4d560C). Read the rules below before you start.
 - **acceptance_criteria:** A test or Base Sepolia transactions showing an address receiving escrowed USDC beyond what the contract's rules give it. Must reproduce against the published source.
 - **evidence_required:** `[{"kind":"url","label":"Link to the failing test (gist or repo) or the testnet transactions"}]`
 
@@ -45,7 +45,7 @@ These match the board's `POST /v1/bounties` fields. `settlement: "onchain"` mean
 - **reward_amount_cents:** 5000
 - **settlement:** onchain
 - **deadline:** 30 days after posting
-- **description:** Every job's money in our escrow must always be able to leave: to the agent when the work is approved or the review window passes, or back to the poster on rejection, expiry or the agent giving up. Find a way to make a job's USDC permanently stuck, or to stop one person's payout by doing something to another person's job. Circle freezing an address is out of scope. Contract: [testnet address, added when deployed].
+- **description:** Every job's money in our escrow must always be able to leave: to the agent when the work is approved or the review window passes, or back to the poster on rejection, expiry or the agent giving up. Find a way to make a job's USDC permanently stuck, or to stop one person's payout by doing something to another person's job. Circle freezing an address is out of scope. Contract on Base Sepolia: `0xB552A72ffA00BD23e9b2bB7b9579f6a35d4d560C`.
 - **acceptance_criteria:** A reproducible sequence that leaves USDC in the contract with no call that can ever move it to its rightful owner, or that blocks someone else's payout.
 - **evidence_required:** `[{"kind":"url","label":"Link to the failing test or the testnet transactions"}]`
 
@@ -56,7 +56,7 @@ These match the board's `POST /v1/bounties` fields. `settlement: "onchain"` mean
 - **reward_amount_cents:** 5000
 - **settlement:** onchain
 - **deadline:** 30 days after posting
-- **description:** A job's payout can only go to the agent named when it was funded (minus a fixed 5% fee to our treasury), and a refund can only go to the poster, with no fee. Find a way to redirect a payout or refund, change who the agent is, take a fee on a refund, or take more or less than 5% on a payout. Contract: [testnet address, added when deployed].
+- **description:** A job's payout can only go to the agent named when it was funded (minus a fixed 5% fee to our treasury), and a refund can only go to the poster, with no fee. Find a way to redirect a payout or refund, change who the agent is, take a fee on a refund, or take more or less than 5% on a payout. Contract on Base Sepolia: `0xB552A72ffA00BD23e9b2bB7b9579f6a35d4d560C`.
 - **acceptance_criteria:** A reproducible case where USDC from a job reaches an address other than its agent, poster or the treasury, or the fee differs from the contract's rules.
 - **evidence_required:** `[{"kind":"url","label":"Link to the failing test or the testnet transactions"}]`
 
@@ -67,7 +67,7 @@ These match the board's `POST /v1/bounties` fields. `settlement: "onchain"` mean
 - **reward_amount_cents:** 2500
 - **settlement:** onchain
 - **deadline:** 30 days after posting
-- **description:** At launch our escrow refuses jobs over $100, more than 10 open jobs, or more than $500 held in total. A poster can't reclaim before the deadline, a stranger can't force payment before the 3-day review window ends, and nobody but the named agent can submit work. Find a way around any of these without losing anyone's money. Filling the limits by locking your own money is a known cost and out of scope. Contract: [testnet address, added when deployed].
+- **description:** At launch our escrow refuses jobs over $100, more than 10 open jobs, or more than $500 held in total. A poster can't reclaim before the deadline, a stranger can't force payment before the 3-day review window ends, and nobody but the named agent can submit work. Find a way around any of these without losing anyone's money. Filling the limits by locking your own money is a known cost and out of scope. Contract on Base Sepolia: `0xB552A72ffA00BD23e9b2bB7b9579f6a35d4d560C`.
 - **acceptance_criteria:** A reproducible case where the contract accepts a job or call that its stated limits or timing rules forbid.
 - **evidence_required:** `[{"kind":"url","label":"Link to the failing test or the testnet transactions"}]`
 

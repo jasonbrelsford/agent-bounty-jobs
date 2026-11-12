@@ -1,0 +1,18 @@
+{
+  "network": "base-sepolia",
+  "chainId": 84532,
+  "address": "0xB552A72ffA00BD23e9b2bB7b9579f6a35d4d560C",
+  "deployTx": "0xb72257394ba891b8fc374b084d1ad4a74a915f84f86290c019b03d6258d0cd2b",
+  "deployer": "0x3272d3E96Ab19FC9b184b57936FC83Da5Add086e",
+  "deployerKey": "made inside the run and discarded; the contract has no owner",
+  "token": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+  "treasury": "0x3272d3E96Ab19FC9b184b57936FC83Da5Add086e",
+  "feeBps": 500,
+  "minAmount": "1000000",
+  "maxAmount": "100000000",
+  "maxOpenJobs": 10,
+  "maxHeld": "500000000",
+  "compiler": "0.8.28+commit.7893614a",
+  "sourcify": "exact_match",
+  "deployedAt": "2026-11-12T00:10:30.180Z"
+}
