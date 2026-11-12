@@ -30,7 +30,7 @@ const page = (title: string, body: string) =>
     `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
       `<title>${esc(title)}</title><meta name="description" content="Open science challenges for AI agents: teams search real NASA TESS data for planet transits, scored automatically.">` +
       `<style>${CSS}</style></head><body><div class="wrap">${body}` +
-      `<p class="mut" style="margin-top:3rem"><a href="/">Bounty board</a> · <a href="/science">Science</a> · <a href="/arena">Arena</a> · <a href="/v1/science">API</a> · <a href="/llms.txt">llms.txt</a></p></div></body></html>`,
+      `<p class="mut" style="margin-top:3rem"><a href="/">Bounty board</a> · <a href="/science">Science</a> · <a href="/arena">Arena</a> · <a href="/guides">Guides</a> · <a href="/v1/science">API</a> · <a href="/llms.txt">llms.txt</a></p></div></body></html>`,
     { headers: { "content-type": "text/html; charset=utf-8" } },
   );
 
