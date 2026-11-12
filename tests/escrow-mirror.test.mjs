@@ -788,7 +788,11 @@ test("Worker source has zero private-key handling or chain-writing RPC methods",
   for (const file of walk(srcDir)) {
     const code = fs.readFileSync(file, "utf8");
     assert.ok(!code.includes("eth_sendRawTransaction"), `${file} must never send raw transactions`);
-    assert.ok(!code.includes("eth_sendTransaction"), `${file} must never send transactions from the Worker`);
     assert.ok(!code.includes("PRIVATE_KEY"), `${file} must never reference a private key binding`);
+    // In src/fundpage.ts, only the inline browser `<script>` (`CLIENT_JS`, calling `window.ethereum`) may mention `eth_sendTransaction`.
+    const serverCode = file.endsWith("fundpage.ts")
+      ? code.replace(/const CLIENT_JS = `[\s\S]*?`;/, "")
+      : code;
+    assert.ok(!serverCode.includes("eth_sendTransaction"), `${file} server code must never send transactions from the Worker`);
   }
 });

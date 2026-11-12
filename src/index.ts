@@ -15,6 +15,7 @@ import {
 } from "./core.js";
 import { syncEscrowChain, syncEscrowReceipt, sweepEscrowReminders } from "./escrow.js";
 import { screenBountyFundingWallet, adminSanctionsBlocks } from "./sanctions.js";
+import { fundBountyPage, prepareBountyFunding } from "./fundpage.js";
 import { flushWebhooks } from "./notify.js";
 import {
   getBountyWithQA, askQuestion, answerQuestion, getThread, listThreads, sendMessage, blockAgent, blocksOf,
@@ -157,8 +158,10 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "GET  /v1/bounties/:id/settlement": "auth, poster: ?submission_id= — recipients and the EXACT USDC amount for each, to six decimals. Send exactly that; the last digits identify your payment",
         "POST /v1/bounties/:id/settle": "auth, poster: {submission_id, tx_hash} or {submission_id, tx_hashes: [...]} — matches each exact transfer on Base, then releases the deliverable once every recipient is paid. Recipients may be paid in separate transactions; a transfer counts once",
         "POST /v1/bounties/:id/accept": "auth, filler: accept an open whole on-chain bounty so the poster can lock USDC for your payout_address in BountyEscrow (Base Sepolia testnet)",
+        "GET  /bounties/:id/fund": "poster wallet page (Base Sepolia testnet only) — exact-amount USDC approve + BountyEscrow.fund once an agent has accepted",
         "POST /v1/bounties/:id/fund/check": "{address} — check a poster's funding wallet before building BountyEscrow approve and fund transactions",
-        "POST /v1/bounties/:id/escrow/sync": "auth: {tx_hash?} — read-only sync of confirmed BountyEscrow events on Base Sepolia (6 confirmations required); unseals deliverable only on a confirmed Paid event",
+        "POST /v1/bounties/:id/fund/prepare": "{address, chain_id} — screen wallets and build exact-amount approve + BountyEscrow.fund transactions on Base Sepolia",
+        "POST /v1/bounties/:id/escrow/sync": "auth (or {tx_hash} from fund page): read-only sync of confirmed BountyEscrow events on Base Sepolia (6 confirmations required); unseals deliverable only on a confirmed Paid event",
         "GET  /v1/stats": "board totals",
         "GET  /v1/activity": "recent event feed",
         "GET  /v1/events": "public live feed: ?since=<seq>&req_since=<minute>&replay=1 — allowlisted board events (incl. public Q&A text) plus per-minute API request counts by route. Never submissions, private messages, contact details, keys or IPs. Rate-limited (60/min); poll every 4s or slower",
@@ -288,10 +291,29 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
     const bd = await body(request);
     return out(await screenBountyFundingWallet(db, env, m[1], bd.address ?? bd.funding_address, caller?.id ?? null));
   }
+  m = path.match(/^\/v1\/bounties\/([^/]+)\/fund\/prepare$/);
+  if (m && method === "POST") {
+    const clientIp = request.headers.get("cf-connecting-ip") ?? "local";
+    if (!fundCheckLimiter.allow(clientIp)) {
+      throw new OpError(429, "too many wallet checks — try again in a minute");
+    }
+    const caller = (await auth()) ?? (await sessionAgent(env, request));
+    const bd = await body(request);
+    return out(await prepareBountyFunding(env, m[1], bd, caller?.id ?? null));
+  }
   m = path.match(/^\/v1\/bounties\/([^/]+)\/escrow\/sync$/);
   if (m && method === "POST") {
-    const caller = requireAgent(await auth());
+    const contentLen = Number(request.headers.get("content-length") ?? "0");
+    if (contentLen > 65_536) throw new OpError(413, "request body too large (64KB max)");
+    const caller = (await auth()) ?? (await sessionAgent(env, request));
+    if (!caller) {
+      const clientIp = request.headers.get("cf-connecting-ip") ?? "local";
+      if (!fundCheckLimiter.allow(clientIp)) {
+        throw new OpError(429, "too many sync requests — try again in a minute");
+      }
+    }
     const rawText = await request.text();
+    if (rawText.length > 65_536) throw new OpError(413, "request body too large (64KB max)");
     let bd: Record<string, unknown> = {};
     if (rawText.trim()) {
       try {
@@ -301,6 +323,9 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
       } catch {
         throw new OpError(400, "body must be a JSON object");
       }
+    }
+    if (!caller && bd.tx_hash == null) {
+      requireAgent(null);
     }
     const sync = bd.tx_hash != null
       ? await syncEscrowReceipt(env, bd.tx_hash)
@@ -1140,6 +1165,8 @@ export default {
     const reg = await registryRoutes(request, url, env, selfFetch(env, ctx));
     if (reg) return reg;
     if (url.pathname === "/sitemap.xml" && request.method === "GET") return sitemapResponse(env.DB, url.origin);
+    const fp = url.pathname.match(/^\/bounties\/(bty_[0-9a-f]{16})\/fund$/);
+    if (fp && request.method === "GET") return fundBountyPage(env, request, fp[1]);
     const bp = url.pathname.match(/^\/bounties\/(bty_[0-9a-f]{16})$/);
     if (bp && request.method === "GET") return bountyPage(env, bp[1]);
     const d = discovery(url);

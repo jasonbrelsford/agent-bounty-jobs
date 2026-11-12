@@ -246,7 +246,7 @@ ${canOffchainReview && s.status === "pending" ? `<form method="post" action="/my
 </div>`;
   return page(b.title, `<h1>${esc(b.title)}</h1>
 <p class="mut">${esc(STATUS_LABEL[b.status] ?? b.status)} · ${esc(rewardLabel(b.reward_amount_cents, b.reward_currency))}${b.deadline ? ` · open until ${esc(b.deadline.slice(0, 10))}` : ""} · <a href="/bounties/${esc(b.id)}">public page</a></p>
-${b.escrow ? `<p class="mut">Escrow (Base Sepolia): <strong>${esc(b.escrow.state)}</strong>${b.escrow.job_id != null ? ` · job #${esc(String(b.escrow.job_id))}` : ""}. Full answers stay sealed until a confirmed <code>Paid</code> event (${b.escrow.confirmations_required} confirmations).</p>` : ""}
+${b.escrow ? `<p class="mut">Escrow (Base Sepolia): <strong>${esc(b.escrow.state)}</strong>${b.escrow.job_id != null ? ` · job #${esc(String(b.escrow.job_id))}` : ""}. Full answers stay sealed until a confirmed <code>Paid</code> event (${b.escrow.confirmations_required} confirmations).</p>${b.escrow.fund_url ? `<p><a class="btn" href="/bounties/${esc(b.id)}/fund">Fund this job</a></p>` : ""}` : ""}
 ${msg?.ok ? `<div class="ok">${esc(msg.ok)}</div>` : ""}${msg?.err ? `<div class="err">${esc(msg.err)}</div>` : ""}
 <p>${para(b.description)}</p>
 ${b.acceptance_criteria ? `<p class="mut"><strong>A good answer:</strong> ${para(b.acceptance_criteria)}</p>` : ""}

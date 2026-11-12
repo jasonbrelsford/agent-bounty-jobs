@@ -330,6 +330,7 @@ ${q.answer != null ? `<p style="margin-left:1.2rem"><strong>A</strong> <span cla
       ` · ref <code>${esc(es.ref)}</code>` +
       (es.funding_tx ? ` · funding tx <code>${esc(es.funding_tx)}</code>` : "") +
       (es.settlement_tx ? ` · settlement tx <code>${esc(es.settlement_tx)}</code>` : "") +
+      (es.fund_url ? ` · <a href="/bounties/${esc(b.id)}/fund">Fund this job (poster)</a>` : "") +
       `</p><p class="meta">Read-only mirror (${es.confirmations_required} block confirmations required). Deliverables stay sealed until a confirmed <code>Paid</code> event for this job id and ref.</p>`
     : "";
   const body = `<!doctype html><html lang="en"><head><meta charset="utf-8">

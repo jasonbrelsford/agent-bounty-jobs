@@ -49,8 +49,10 @@ export interface Env {
    */
   PLATFORM_FEE_ADDRESS?: string;
   BASE_RPC_URL?: string;
-  /** Base Sepolia BountyEscrow deployment (testnet only) and read-only RPC URL. */
+  /** Base Sepolia BountyEscrow deployment (testnet only), USDC token override (tests), and read-only RPC URL. */
   ESCROW_ADDRESS_BASE_SEPOLIA?: string;
+  ESCROW_TOKEN_ADDRESS_BASE_SEPOLIA?: string;
+  ESCROW_TESTNET_ONLY?: string;
   BASE_SEPOLIA_RPC_URL?: string;
   /** Read-only Base RPC + Chainalysis Sanctions Oracle address for wallet screening (#51). */
   SANCTIONS_RPC_URL?: string;
@@ -1308,6 +1310,7 @@ export type PublicEscrowView = {
   submitted_at: string | null;
   deliverable_hash: string | null;
   accepted_agent_id: string | null;
+  fund_url: string | null;
   confirmations_required: number;
 };
 
@@ -1339,9 +1342,13 @@ function shapeBounty(
     b.escrow_fee_split = escrowFeeSplit(b.reward_amount_cents, b.fee_bp);
   }
   if (b.settlement_mode === "onchain" && b.reward_amount_cents > 0 && !hasMilestones) {
-    const contractAddr = b.escrow_contract
-      ? toChecksumAddress(b.escrow_contract)
-      : escrowAddressOf(env);
+    const awaitingNewDeposit =
+      (b.escrow_state == null || b.escrow_state === "unfunded") ||
+      (b.escrow_state === "refunded" && b.accepted_agent_id != null);
+    const contractAddr =
+      !awaitingNewDeposit && b.escrow_contract
+        ? toChecksumAddress(b.escrow_contract)
+        : escrowAddressOf(env);
     b.escrow = {
       network: "base-sepolia",
       chain_id: BASE_SEPOLIA_CHAIN_ID,
@@ -1356,6 +1363,12 @@ function shapeBounty(
       submitted_at: b.escrow_submitted_at ?? null,
       deliverable_hash: b.escrow_deliverable_hash ?? null,
       accepted_agent_id: b.accepted_agent_id ?? null,
+      fund_url:
+        b.status === "open" &&
+        b.accepted_agent_id &&
+        (b.escrow_state == null || b.escrow_state === "unfunded" || b.escrow_state === "refunded")
+          ? `${PUBLIC_ORIGIN}/bounties/${b.id}/fund`
+          : null,
       confirmations_required: MIN_CONFIRMATIONS,
     };
   }
