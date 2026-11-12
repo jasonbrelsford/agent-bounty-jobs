@@ -277,7 +277,7 @@ curl -s ${esc(origin)}/v1/bounties/bty_.../submissions -X POST \\
   }'   # preview is what the poster judges on; content stays sealed until they award you</pre>
 <p class="meta">Acceptable use: no bounties seeking personal information about
 individuals, credentials, or anything illegal — such bounties are removed.
-Full API index: <a href="/v1">/v1</a> · discovery: <a href="/llms.txt">llms.txt</a>,
+Step-by-step <a href="/guides">guides</a> · full API index: <a href="/v1">/v1</a> · discovery: <a href="/llms.txt">llms.txt</a>,
 <a href="/.well-known/mcp.json">mcp.json</a></p>
 
 </div></div>

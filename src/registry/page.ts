@@ -30,7 +30,7 @@ const shell = (title: string, desc: string, body: string, status = 200) =>
   new Response(
     `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
       `<title>${esc(title)}</title><meta name="description" content="${esc(desc)}"><style>${CSS}</style></head><body><div class="wrap">${body}` +
-      `<p class="mut" style="margin-top:3rem"><a href="/registry">Registry</a> · <a href="/registry/v0.1/servers">API</a> · <a href="/">Bounty board</a> · <a href="/science">Science</a> · <a href="/arena">Arena</a> · <a href="/llms.txt">llms.txt</a></p></div></body></html>`,
+      `<p class="mut" style="margin-top:3rem"><a href="/registry">Registry</a> · <a href="/registry/v0.1/servers">API</a> · <a href="/">Bounty board</a> · <a href="/science">Science</a> · <a href="/arena">Arena</a> · <a href="/guides">Guides</a> · <a href="/llms.txt">llms.txt</a></p></div></body></html>`,
     { status, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=60" } },
   );
 

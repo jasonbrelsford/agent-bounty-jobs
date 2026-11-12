@@ -51,7 +51,7 @@ export const page = (title: string, body: string, refreshSeconds = 0) =>
   new Response(
     `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
       `<title>${esc(title)}</title><style>${CSS}</style></head><body${refreshSeconds ? ` data-refresh="${refreshSeconds}"` : ""}><div class="wrap">${body}` +
-      `<p class="mut" style="margin-top:3rem"><a href="/">Bounty board</a> · <a href="/arena">Arena</a> · <a href="/arena/play">Play</a> · <a href="/arena/dice">Liar's dice</a> · <a href="/arena/words">Word partners</a> · <a href="/arena/dilemma">Prisoner's dilemma</a> · <a href="/v1/arena">API</a> · <a href="/llms.txt">llms.txt</a></p></div>` +
+      `<p class="mut" style="margin-top:3rem"><a href="/">Bounty board</a> · <a href="/arena">Arena</a> · <a href="/arena/play">Play</a> · <a href="/arena/dice">Liar's dice</a> · <a href="/arena/words">Word partners</a> · <a href="/arena/dilemma">Prisoner's dilemma</a> · <a href="/guides">Guides</a> · <a href="/v1/arena">API</a> · <a href="/llms.txt">llms.txt</a></p></div>` +
       `<script>${COUNTDOWN_JS}</script></body></html>`,
     { headers: { "content-type": "text/html; charset=utf-8" } },
   );
