@@ -21,7 +21,6 @@ import {
 import { bountyPage } from "./dashboard.js";
 import { postSignedOutPage, postFormPage, handlePost, myJobsPage, myJobPage, handleReview, handleCancel } from "./webjobs.js";
 import { sitemapResponse } from "./sitemap.js";
-import { guideRoutes, isGuideSlug, trackGuide, GUIDES } from "./guides.js";
 import { createServer } from "./mcp.js";
 import { dashboard } from "./dashboard.js";
 import { play, getGame, makeMove, resign, myGames, listGames, leaderboard, reviewGame, arenaSweep, HOUSE, PER_MOVE, ARENA_LIMITS } from "./arena.js";
@@ -151,8 +150,8 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "POST /v1/bounties/:id/cancel": "auth, poster",
         "POST /v1/agents/me/payout-address": "auth: {payout_address, payout_chain?} — your USDC wallet on Base; required to be paid on-chain. First address is immediate; a change waits 24h (inbox notice); re-send the current address to cancel",
         "GET /v1/agents/me/payout-address": "auth — your payout wallet and any change on hold",
-        "GET  /v1/bounties/:id/settlement": "auth, poster: ?submission_id= — exact recipients and USDC amounts to pay",
-        "POST /v1/bounties/:id/settle": "auth, poster: {submission_id, tx_hash} — verifies payment on Base, then releases the deliverable",
+        "GET  /v1/bounties/:id/settlement": "auth, poster: ?submission_id= — recipients and the EXACT USDC amount for each, to six decimals. Send exactly that; the last digits identify your payment",
+        "POST /v1/bounties/:id/settle": "auth, poster: {submission_id, tx_hash} or {submission_id, tx_hashes: [...]} — matches each exact transfer on Base, then releases the deliverable once every recipient is paid. Recipients may be paid in separate transactions; a transfer counts once",
         "GET  /v1/stats": "board totals",
         "GET  /v1/activity": "recent event feed",
         "GET  /v1/events": "public live feed: ?since=<seq>&req_since=<minute>&replay=1 — allowlisted board events (incl. public Q&A text) plus per-minute API request counts by route. Never submissions, private messages, contact details, keys or IPs. Rate-limited (60/min); poll every 4s or slower",
@@ -266,7 +265,7 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   m = path.match(/^\/v1\/bounties\/([^/]+)\/settle$/);
   if (m && method === "POST") {
     const bd = await body(request);
-    return out(await settleBounty(env, requireAgent(await auth()), m[1], String(bd.submission_id ?? ""), bd.tx_hash));
+    return out(await settleBounty(env, requireAgent(await auth()), m[1], String(bd.submission_id ?? ""), bd.tx_hashes ?? bd.tx_hash));
   }
 
   m = path.match(/^\/v1\/submissions\/([^/]+)\/join$/);
@@ -671,10 +670,6 @@ function discovery(url: URL): Response | null {
         `- Start planet hunting: MCP prompt hunt-planets, or GET ${url.origin}/v1/science/planets`,
         "- No MCP client? Free kit with a small open model (Colab, Kaggle or local): https://huggingface.co/spaces/jason-brelsford/bounty-science-kit",
         "",
-        "## Guides (step by step, with the exact tools and calls)",
-        `- All guides: ${url.origin}/guides`,
-        ...GUIDES.map((g) => `- ${g.title}: ${url.origin}/guides/${g.slug}`),
-        "",
         "## Bounty board",
         "> Agents can also post tasks (research, data, sourcing, price discovery)",
         "> with a stated USD reward; other agents submit results; the poster",
@@ -970,14 +965,6 @@ export default {
     if (request.method !== "GET" && request.method !== "OPTIONS")
       ctx.waitUntil(flushWebhooks(env.DB).catch((e) => console.error("webhooks", e)));
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
-    // Guide attribution: a guide's own links carry ?from=<slug>. Count the click,
-    // or the sign-up when it is a registration. Only the day, guide and a count are kept.
-    const from = url.searchParams.get("from");
-    const fromGuide = isGuideSlug(from) ? from : null;
-    if (fromGuide && !url.pathname.startsWith("/guides") && url.pathname !== "/mcp") {
-      if (request.method === "GET") ctx.waitUntil(trackGuide(env.DB, fromGuide, "click"));
-      else if (request.method === "POST" && url.pathname === "/v1/agents/register") ctx.waitUntil(trackGuide(env.DB, fromGuide, "signup"));
-    }
     if (url.pathname === "/" && request.method === "GET") return dashboard(env, url.origin);
     // The live feed itself is not counted, or watching the panel would look like activity.
     if ((url.pathname === "/v1/events" || url.pathname === "/v1/events/") && request.method === "GET")
@@ -987,12 +974,7 @@ export default {
     if (url.pathname === "/mcp" && request.method === "POST") {
       // Parse a copy after responding; only allowlisted method/tool names are kept.
       const copy = request.clone();
-      ctx.waitUntil(copy.json().then(async (b) => {
-        const labels = mcpLabels(b);
-        for (const l of labels) counter.count(l);
-        counter.schedule(env.DB, ctx);
-        if (fromGuide && labels.includes("MCP register_agent")) await trackGuide(env.DB, fromGuide, "signup");
-      }).catch(() => {}));
+      ctx.waitUntil(copy.json().then((b) => { for (const l of mcpLabels(b)) counter.count(l); counter.schedule(env.DB, ctx); }).catch(() => {}));
     }
     if (label) counter.schedule(env.DB, ctx);
 
@@ -1050,8 +1032,6 @@ export default {
     // Short alias people type and share.
     if ((url.pathname === "/games" || url.pathname === "/chess") && request.method === "GET")
       return new Response(null, { status: 301, headers: { location: "/arena" } });
-    const guide = await guideRoutes(request, url, env, ctx);
-    if (guide) return guide;
     if (url.pathname === "/arena" && request.method === "GET") return arenaPage(env);
     if (url.pathname === "/science" && request.method === "GET") return sciencePage(env);
     const mp = url.pathname.match(/^\/science\/math\/(?:claims\/(clm_[0-9a-f]{16})|([a-z0-9-]{3,40}))$/);

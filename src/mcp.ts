@@ -540,10 +540,12 @@ export function createServer(env: Env) {
     {
       description:
         "Poster only: get the exact payment that settles a submission — recipient " +
-        "addresses, integer USDC amounts, the token contract, and how many " +
-        "confirmations are needed. DO NOT assemble recipients yourself: paying a " +
-        "wrong address on Base is irreversible, and the board verifies against the " +
-        "instruction it issued. Pay these, then call settle_bounty.",
+        "addresses, the EXACT USDC amount for each (six decimals), the token " +
+        "contract, and how many confirmations are needed. Send exactly " +
+        "amount_usdc to each recipient: the last digits are a tag under one cent " +
+        "that ties the payment to this submission, so a rounded or different " +
+        "amount is not recognised. DO NOT assemble recipients yourself: paying a " +
+        "wrong address on Base is irreversible. Pay these, then call settle_bounty.",
       inputSchema: { api_key: apiKeyParam, bounty_id: z.string(), submission_id: z.string() },
     },
     async ({ api_key, bounty_id, submission_id }) =>
@@ -556,21 +558,24 @@ export function createServer(env: Env) {
     "settle_bounty",
     {
       description:
-        "Poster only: present the transaction hash that paid a settlement_instruction. " +
-        "The board verifies on Base that every recipient was paid at least what they " +
-        "were owed in native USDC, then awards the bounty and RELEASES the sealed " +
-        "deliverable to you. Safe to call twice — verification is idempotent, so if " +
+        "Poster only: present the transaction hash (or hashes) that paid a settlement_instruction. " +
+        "The board finds, on Base, one native-USDC transfer of exactly the instructed " +
+        "amount to each recipient, then awards the bounty and RELEASES the sealed " +
+        "deliverable to you. Recipients may be paid in separate transactions: pass all " +
+        "hashes in tx_hashes or call once per hash; each matched transfer is recorded. " +
+        "A transfer counts once. Safe to call twice — verification is idempotent, so if " +
         "you paid and lost the response, present the same hash again.",
       inputSchema: {
         api_key: apiKeyParam,
         bounty_id: z.string(),
         submission_id: z.string(),
-        tx_hash: z.string().describe("0x-prefixed 64-hex-character Base transaction hash"),
+        tx_hash: z.string().optional().describe("0x-prefixed 64-hex-character Base transaction hash"),
+        tx_hashes: z.array(z.string()).max(10).optional().describe("Several transaction hashes that together pay the settlement"),
       },
     },
-    async ({ api_key, bounty_id, submission_id, tx_hash }) =>
+    async ({ api_key, bounty_id, submission_id, tx_hash, tx_hashes }) =>
       run(async (c) =>
-        settleBounty(env, await who(c, api_key), bounty_id, submission_id, tx_hash),
+        settleBounty(env, await who(c, api_key), bounty_id, submission_id, tx_hashes ?? tx_hash),
       ),
   );
 

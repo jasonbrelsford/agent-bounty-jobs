@@ -1892,6 +1892,137 @@ export async function setPayoutAddress(db: D1Database, agent: Agent, raw: unknow
   };
 }
 
+/** One recipient of a settlement, with the exact amount that identifies the payment. */
+export type SettlementLeg = {
+  id: string; bounty_id: string; submission_id: string; milestone_id: string | null;
+  role: "contributor" | "platform_fee"; agent_id: string; address: string;
+  amount_cents: number; units: string; open: number; created_at: string;
+  paid_tx: string | null; paid_log: number | null; paid_at: string | null;
+};
+
+/** The tag added to each amount is 1 to this many USDC units: always under one cent. */
+export const LEG_TAG_MAX = Number(UNITS_PER_CENT) - 1;
+
+/** USDC units as a 6-decimal string, e.g. 47503917n -> "47.503917". */
+export function unitsToUsdc(units: bigint): string {
+  const s = units.toString().padStart(7, "0");
+  return `${s.slice(0, -6)}.${s.slice(-6)}`;
+}
+
+/** A tag from 1 to LEG_TAG_MAX, each equally likely. Exported for tests. */
+export function randomTag(): number {
+  const buf = new Uint32Array(1);
+  const limit = Math.floor(0x1_0000_0000 / LEG_TAG_MAX) * LEG_TAG_MAX;
+  do crypto.getRandomValues(buf); while (buf[0] >= limit);
+  return 1 + (buf[0] % LEG_TAG_MAX);
+}
+
+/** Every leg of a submission that can still be paid, or already has been. */
+export async function liveLegs(db: D1Database, submissionId: string): Promise<SettlementLeg[]> {
+  const r = await db
+    .prepare(
+      "SELECT * FROM settlement_legs WHERE submission_id = ? AND (open = 1 OR paid_tx IS NOT NULL) ORDER BY created_at, id",
+    )
+    .bind(submissionId)
+    .all<SettlementLeg>();
+  return r.results ?? [];
+}
+
+type Slot = { role: "contributor" | "platform_fee"; agent_id: string | null; address: string; amount_cents: number };
+const slotOf = (l: { role: string; agent_id: string | null }) => `${l.role}|${l.agent_id ?? ""}`;
+
+/**
+ * The leg a poster should pay for each recipient, issuing one where needed.
+ *
+ * This is what ties a payment to a submission. The board cannot see who "owns"
+ * a transaction, and a payment is public, so matching on recipient and "at
+ * least this much" let any poster present someone else's payment to the same
+ * agent. Instead each leg's amount is what is owed plus a tag under one cent,
+ * chosen so that no two open legs anywhere have the same recipient and amount.
+ * A transfer of exactly that amount to that address is then the payment for
+ * that leg and no other, whoever sent it and however it was sent.
+ *
+ * A recipient ("slot": the fee, or one contributor) can have more than one leg
+ * over time. If a contributor's payout address change comes due, a new leg is
+ * issued for the new address, but the earlier leg STAYS payable: the board
+ * cannot know whether the poster has already paid it and is waiting for
+ * confirmations. Whichever leg of a slot is paid first settles that slot, and
+ * the others are then closed. So a poster who paid what they were told is
+ * never asked to pay again.
+ */
+async function freezeLegs(
+  db: D1Database,
+  b: Bounty,
+  sub: Submission,
+  milestoneId: string | null,
+  want: Slot[],
+): Promise<SettlementLeg[]> {
+  // Unpaid legs of submissions that can no longer be awarded release their
+  // amounts. Driven from the open legs, so the cost follows what is in flight.
+  await db
+    .prepare(
+      `UPDATE settlement_legs SET open = 0
+        WHERE open = 1 AND paid_tx IS NULL
+          AND NOT EXISTS (SELECT 1 FROM submissions s WHERE s.id = settlement_legs.submission_id AND s.status = 'pending')`,
+    )
+    .run();
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const have = await liveLegs(db, sub.id);
+    const chosen: SettlementLeg[] = [];
+    const missing: Slot[] = [];
+    for (const w of want) {
+      const mine = have.filter((l) => slotOf(l) === slotOf(w));
+      const paid = mine.find((l) => l.paid_tx);
+      // Newest first: the leg for the recipient's current address and amount.
+      const current = [...mine].reverse().find(
+        (l) => !l.paid_tx && l.address === w.address.toLowerCase() && l.amount_cents === w.amount_cents,
+      );
+      if (paid) chosen.push(paid);
+      else if (current) chosen.push(current);
+      else missing.push(w);
+    }
+    if (!missing.length) return chosen;
+
+    // Pick a tag for each new leg that no other open leg is using.
+    const at = nowIso();
+    const rows: SettlementLeg[] = [];
+    for (const w of missing) {
+      const address = w.address.toLowerCase();
+      let units = "";
+      for (let i = 0; i < 40 && !units; i++) {
+        const candidate = (BigInt(w.amount_cents) * UNITS_PER_CENT + BigInt(randomTag())).toString();
+        const taken = await db
+          .prepare("SELECT 1 AS x FROM settlement_legs WHERE open = 1 AND address = ? AND units = ?")
+          .bind(address, candidate)
+          .first<{ x: number }>();
+        if (!taken && !rows.some((r) => r.address === address && r.units === candidate)) units = candidate;
+      }
+      if (!units)
+        throw new OpError(503, "could not allocate a unique payment amount for this settlement; try again shortly");
+      rows.push({
+        id: newId("leg"), bounty_id: b.id, submission_id: sub.id, milestone_id: milestoneId,
+        role: w.role, agent_id: w.agent_id ?? "", address, amount_cents: w.amount_cents, units,
+        open: 1, created_at: at, paid_tx: null, paid_log: null, paid_at: null,
+      });
+    }
+    try {
+      // The unique index on (address, amount) refuses the batch if another
+      // request took one of these amounts a moment ago; then look again.
+      await db.batch(
+        rows.map((r) =>
+          db.prepare(
+            "INSERT INTO settlement_legs (id, bounty_id, submission_id, milestone_id, role, agent_id, address, amount_cents, units, open, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+          ).bind(r.id, r.bounty_id, r.submission_id, r.milestone_id, r.role, r.agent_id, r.address, r.amount_cents, r.units, r.created_at),
+        ),
+      );
+    } catch {
+      // Lost a race for an amount: go round again.
+    }
+  }
+  throw new OpError(503, "could not issue the settlement instruction; try again shortly");
+}
+
 /**
  * The exact payment that settles this submission: who, how much, on what chain.
  *
@@ -1935,39 +2066,59 @@ export async function settlementInstruction(
       `cannot settle: ${unpaid.length} contributor(s) have no payout_address — ${unpaid.map((u) => u.agent_id).join(", ")}. They must call set_payout_address first.`,
     );
 
-  const recipients = [
+  const base = [
     ...team.map((t, i) => ({
       role: "contributor" as const,
-      agent_id: t.agent_id,
+      agent_id: t.agent_id as string | null,
       address: byId.get(t.agent_id)!,
       amount_cents: payouts[i],
-      amount_usdc: (payouts[i] / 100).toFixed(2),
     })),
     {
       role: "platform_fee" as const,
-      agent_id: null,
+      agent_id: null as string | null,
       address: env.PLATFORM_FEE_ADDRESS.toLowerCase(),
       amount_cents: fee,
-      amount_usdc: (fee / 100).toFixed(2),
     },
   ].filter((r) => r.amount_cents > 0);
+
+  const legs = await freezeLegs(db, b, sub, mil?.id ?? null, base);
+  const recipients = legs.map((l) => ({
+    role: l.role,
+    agent_id: l.agent_id || null,
+    address: l.address,
+    checksum_address: toChecksumAddress(l.address),
+    amount_cents: l.amount_cents,
+    // The amount to send. Exact: not rounded, not more, not less.
+    amount_units: l.units,
+    amount_usdc: unitsToUsdc(BigInt(l.units)),
+    paid: l.paid_tx != null,
+    paid_tx: l.paid_tx,
+  }));
+  const totalUnits = legs.reduce((a, l) => a + BigInt(l.units), 0n);
 
   return {
     bounty_id: bountyId,
     submission_id: submissionId,
-    milestone_id: mil?.id ?? null,
+    milestone_id: legs[0]?.milestone_id ?? mil?.id ?? null,
     chain: "base",
     asset: "USDC",
     token_contract: USDC_BASE,
     recipients,
-    total_cents: recipients.reduce((a, r) => a + r.amount_cents, 0),
-    total_usdc: (recipients.reduce((a, r) => a + r.amount_cents, 0) / 100).toFixed(2),
+    legs,
+    total_cents: legs.reduce((a, l) => a + l.amount_cents, 0),
+    total_usdc: unitsToUsdc(totalUnits),
     confirmations_required: MIN_CONFIRMATIONS,
     note:
-      "Send these USDC amounts on Base — one transaction paying every recipient is simplest, but separate transactions work if you settle each and present each hash. " +
-      "Then call settle_bounty with the transaction hash. The deliverable is released only after the payment is verified on-chain, and paying a wrong address is irreversible.",
+      "Send each recipient EXACTLY its amount_usdc in native USDC on Base, to six decimal places (amount_units is the same number in raw token units). " +
+      "The last four digits are a tag under one cent that identifies your payment: a rounded, larger or smaller amount is not recognised and cannot be matched automatically. " +
+      "One transfer per recipient. They may be in one transaction or in separate ones, from any wallet. " +
+      "Then call settle_bounty with the transaction hash, or all the hashes; each matched transfer is recorded as it is presented. " +
+      "The deliverable is released only once every recipient is paid, and paying a wrong address is irreversible.",
   };
 }
+
+/** How old a half-finished award must be before the same submission may finish it. */
+export const HALF_AWARD_RETRY_MS = 60_000;
 
 export async function reviewSubmission(
   db: D1Database,
@@ -2079,21 +2230,28 @@ export async function reviewSubmission(
   // the whole race arbiter, one level down when the bounty is milestoned. It
   // ALSO requires the submission to still be pending, so a submission withdrawn
   // a moment ago can never be awarded.
+  // If an earlier attempt got as far as this swap and then failed before marking
+  // the submission accepted, the pot is "awarded" to a submission that is still
+  // pending. Only that same submission may pick the award up and finish it.
+  // "Failed", not "in progress": the earlier attempt must be at least a minute old,
+  // so two requests racing each other still get exactly one winner.
+  const halfAwardedBefore = new Date(Date.now() - HALF_AWARD_RETRY_MS).toISOString();
+  const openOrHalfAwarded = `(status = 'open' OR (status = 'awarded' AND awarded_submission_id = ? AND awarded_at < '${halfAwardedBefore}'))`;
   const stillPending = "EXISTS (SELECT 1 FROM submissions WHERE id = ? AND status = 'pending')";
   const res = mil
     ? await db
         .prepare(
           `UPDATE milestones SET status = 'awarded', awarded_submission_id = ?, awarded_at = ?, fee_cents = ?, review_fee_cents = ?, awarded_by = ?
-            WHERE id = ? AND status = 'open' AND ${stillPending}`,
+            WHERE id = ? AND ${openOrHalfAwarded} AND ${stillPending}`,
         )
-        .bind(submissionId, at, fee, reviewFee, agent.id, mil.id, submissionId)
+        .bind(submissionId, at, fee, reviewFee, agent.id, mil.id, submissionId, submissionId)
         .run()
     : await db
         .prepare(
           `UPDATE bounties SET status = 'awarded', awarded_submission_id = ?, awarded_at = ?, payment_ref = ?, fee_cents = ?, review_fee_cents = ?, awarded_by = ?
-            WHERE id = ? AND status = 'open' AND ${stillPending}`,
+            WHERE id = ? AND ${openOrHalfAwarded} AND ${stillPending}`,
         )
-        .bind(submissionId, at, ref, fee, reviewFee, agent.id, bountyId, submissionId)
+        .bind(submissionId, at, ref, fee, reviewFee, agent.id, bountyId, submissionId, submissionId)
         .run();
   if (!res.meta.changes)
     throw new OpError(
@@ -2252,11 +2410,20 @@ export async function withdrawSubmission(db: D1Database, agent: Agent, submissio
       `UPDATE submissions SET status = 'withdrawn', review_note = 'withdrawn by submitter after ${STALE_DAYS} days without review', reviewed_at = ?
         WHERE id = ? AND status = 'pending'
           AND NOT EXISTS (SELECT 1 FROM bounties WHERE awarded_submission_id = submissions.id)
-          AND NOT EXISTS (SELECT 1 FROM milestones WHERE awarded_submission_id = submissions.id)`,
+          AND NOT EXISTS (SELECT 1 FROM milestones WHERE awarded_submission_id = submissions.id)
+          AND NOT EXISTS (SELECT 1 FROM settlement_legs WHERE submission_id = submissions.id AND paid_tx IS NOT NULL)`,
     )
     .bind(at, submissionId)
     .run();
-  if (!res.meta.changes) throw new OpError(409, "submission is no longer pending");
+  if (!res.meta.changes) {
+    const paid = await db
+      .prepare("SELECT 1 AS x FROM settlement_legs WHERE submission_id = ? AND paid_tx IS NOT NULL")
+      .bind(submissionId)
+      .first<{ x: number }>();
+    if (paid)
+      throw new OpError(409, "the poster has started paying for this submission on-chain, so it can no longer be withdrawn");
+    throw new OpError(409, "submission is no longer pending");
+  }
   const b = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(s.bounty_id).first<Bounty>();
   await db.batch([
     eventStmt(db, at, "submission_withdrawn", s.bounty_id, agent.id,

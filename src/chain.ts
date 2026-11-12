@@ -4,12 +4,13 @@
  * the board verifies payments it did not make and cannot make, which is what
  * keeps it out of the custody path.
  */
-import { OpError, USDC_BASE, UNITS_PER_CENT, MIN_CONFIRMATIONS } from "./core.js";
+import { OpError, USDC_BASE, MIN_CONFIRMATIONS } from "./core.js";
 
 /** keccak256("Transfer(address,address,uint256)") */
 const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
-export type Transfer = { from: string; to: string; units: bigint };
+export type Transfer = { from: string; to: string; units: bigint; logIndex: number };
+export type TxRead = { transfers: Transfer[]; blockTime: number };
 
 async function rpc(url: string, method: string, params: unknown[]): Promise<unknown> {
   const res = await fetch(url, {
@@ -41,9 +42,9 @@ export function isTxHash(v: unknown): v is string {
  * a list back knows the transaction succeeded, is buried deep enough, and that
  * these transfers were emitted by the real USDC contract.
  */
-export async function usdcTransfers(rpcUrl: string, txHash: string): Promise<Transfer[]> {
+export async function usdcTransfers(rpcUrl: string, txHash: string): Promise<TxRead> {
   const receipt = (await rpc(rpcUrl, "eth_getTransactionReceipt", [txHash])) as {
-    status?: string; blockNumber?: string; logs?: { address: string; topics: string[]; data: string }[];
+    status?: string; blockNumber?: string; logs?: { address: string; topics: string[]; data: string; logIndex?: string }[];
   } | null;
   if (!receipt) throw new OpError(404, "transaction not found on Base — is it mined, and is the hash right?");
   if (receipt.status !== "0x1") throw new OpError(400, "that transaction reverted on-chain; nothing was transferred");
@@ -57,7 +58,14 @@ export async function usdcTransfers(rpcUrl: string, txHash: string): Promise<Tra
       `transaction has ${confirmations} confirmation(s); ${MIN_CONFIRMATIONS} required before the deliverable is released. Try again shortly.`,
     );
 
-  return parseTransferLogs(receipt.logs ?? []);
+  // When the block was produced. A payment made before its instruction existed
+  // cannot be the payment for it, so an unreadable timestamp is a refusal.
+  const block = (await rpc(rpcUrl, "eth_getBlockByNumber", [receipt.blockNumber, false])) as { timestamp?: string } | null;
+  const blockTime = block?.timestamp ? Number(hexToBigInt(block.timestamp)) : NaN;
+  if (!Number.isSafeInteger(blockTime) || blockTime <= 0)
+    throw new OpError(502, "could not read the block time for that transaction; try again shortly");
+
+  return { transfers: parseTransferLogs(receipt.logs ?? []), blockTime };
 }
 
 /**
@@ -69,9 +77,12 @@ export async function usdcTransfers(rpcUrl: string, txHash: string): Promise<Tra
  * any other token, or any other event, is not a payment we accept.
  */
 export function parseTransferLogs(
-  logs: { address: string; topics: string[]; data: string }[],
+  logs: { address: string; topics: string[]; data: string; logIndex?: string }[],
 ): Transfer[] {
   return logs
+    // The position in the block identifies one transfer for good. Receipts from a
+    // node carry it; without it (hand-built logs) the position in the list stands in.
+    .map((l, i) => ({ ...l, logIndex: l.logIndex ? Number(hexToBigInt(l.logIndex)) : i }))
     .filter(
       (l) =>
         l.address.toLowerCase() === USDC_BASE &&
@@ -82,31 +93,6 @@ export function parseTransferLogs(
       from: topicToAddress(l.topics[1]),
       to: topicToAddress(l.topics[2]),
       units: hexToBigInt(l.data),
+      logIndex: l.logIndex,
     }));
-}
-
-/**
- * Does this transaction pay every required recipient at least what they are owed?
- *
- * Transfers to the same address are summed, and the comparison is `>=` rather
- * than `==`: overpaying is the payer's business, underpaying is the board's.
- * Extra recipients are ignored — a batched transaction that also settles
- * something unrelated is still a valid settlement of this bounty.
- */
-export function coversPayouts(
-  transfers: Transfer[],
-  required: { address: string; amount_cents: number }[],
-): { ok: true } | { ok: false; missing: { address: string; owed_cents: number; paid_cents: number }[] } {
-  const paid = new Map<string, bigint>();
-  for (const t of transfers) paid.set(t.to, (paid.get(t.to) ?? 0n) + t.units);
-  const missing = required
-    .map((r) => {
-      const got = paid.get(r.address.toLowerCase()) ?? 0n;
-      const owed = BigInt(r.amount_cents) * UNITS_PER_CENT;
-      return got >= owed
-        ? null
-        : { address: r.address, owed_cents: r.amount_cents, paid_cents: Number(got / UNITS_PER_CENT) };
-    })
-    .filter((x): x is { address: string; owed_cents: number; paid_cents: number } => x !== null);
-  return missing.length ? { ok: false, missing } : { ok: true };
 }
