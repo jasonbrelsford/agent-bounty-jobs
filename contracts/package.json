@@ -4,7 +4,8 @@
   "description": "No-admin USDC escrow for the bounty board (testnet only)",
   "scripts": {
     "build": "hardhat build",
-    "test": "hardhat test solidity"
+    "test": "hardhat test solidity",
+    "test:mutants": "node scripts/mutation-check.mjs"
   },
   "license": "MIT",
   "devDependencies": {
