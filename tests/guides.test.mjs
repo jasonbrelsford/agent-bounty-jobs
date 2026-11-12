@@ -3,9 +3,12 @@
 // are readable only with the admin key.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import { makeD1 } from "./d1shim.mjs";
 import { GUIDES, guideRoutes, guideHtml, hubHtml, trackGuide, guideStats, isGuideSlug } from "../.test-build/guides.js";
 import { sitemapXml } from "../.test-build/sitemap.js";
+import { mathProblem } from "../.test-build/science/math-records.js";
+import { checkPackingA, checkPackingB } from "../.test-build/science/math-check.js";
 
 const ctx = () => { const p = []; return { waitUntil: (x) => p.push(x), done: () => Promise.all(p) }; };
 const get = (path, headers = {}) => new Request(`https://bounty.example.com${path}`, { headers });
@@ -22,13 +25,52 @@ test("every guide renders with metadata and unique slugs", () => {
     assert.ok(html.includes('<meta name="description"'));
     assert.ok(html.includes('application/ld+json'));
     assert.ok(html.includes(`from=${g.slug}`), `${g.slug} has no tagged link`);
+    assert.doesNotMatch(html, /href="[^"]*#[^"]*\?/, `${g.slug} puts query string after #fragment`);
     // internal guide links must point at real guides
     for (const m of html.matchAll(/href="\/guides\/([a-z0-9-]+)"/g)) assert.ok(isGuideSlug(m[1]), `${g.slug} links to missing guide ${m[1]}`);
   }
-  assert.ok(GUIDES.length >= 6);
+  assert.ok(GUIDES.length >= 11);
   assert.equal(guideHtml("nope"), null);
   const hub = hubHtml();
   for (const g of GUIDES) assert.ok(hub.includes(`/guides/${g.slug}`));
+
+  for (const requiredSlug of ["science-job-queues", "math-record-hunt-ai-agents", "taskmarket-alternative"]) {
+    assert.ok(isGuideSlug(requiredSlug), `missing guide ${requiredSlug}`);
+  }
+  const mathPage = guideHtml("math-record-hunt-ai-agents");
+  assert.match(mathPage, /unconfirmed/i);
+  assert.match(mathPage, /record keeper/i);
+  assert.ok(mathPage.includes("&quot;problem_id&quot;: &quot;packing-2&quot;"));
+  assert.equal(mathProblem("packing-2")?.kind, "record");
+  const sampleCircles = { circles: [["0.25", "0.25", "0.25"], ["0.75", "0.75", "0.25"]] };
+  assert.equal(checkPackingA(sampleCircles, 2).ok, true);
+  assert.equal(checkPackingB(sampleCircles, 2).ok, true);
+  const tmPage = guideHtml("taskmarket-alternative");
+  assert.match(tmPage, /taskmarket\.dev/);
+  assert.match(tmPage, /read on 2026-\d{2}-\d{2}/);
+});
+
+test("index.ts wires guideRoutes, llms.txt guides and attribution; tool names exist in mcp.ts", () => {
+  const indexSrc = fs.readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
+  const mcpSrc = fs.readFileSync(new URL("../src/mcp.ts", import.meta.url), "utf8");
+
+  assert.ok(indexSrc.includes('from "./guides.js"'), "src/index.ts must import ./guides.js");
+  assert.ok(indexSrc.includes("guideRoutes(request, url, env, ctx)"), "src/index.ts must dispatch guideRoutes");
+  assert.ok(indexSrc.includes("## Guides (step by step"), "llms.txt must list guides");
+
+  for (const tool of [
+    "planet_queue", "disease_queue", "hla_names_queue",
+    "science_team", "math_problems", "math_get_problem", "math_submit",
+    "math_vet", "math_house_vet", "math_mine", "math_claims", "math_report_settings",
+  ]) {
+    assert.ok(mcpSrc.includes(`"${tool}"`), `MCP tool ${tool} missing from src/mcp.ts`);
+  }
+  for (const route of [
+    "/v1/queues/planets/claim", "/v1/queues/rare-disease/claim", "/v1/queues/hla-names/claim",
+    "/v1/science/math", "/v1/science/math/submissions", "/v1/science/math/claims", "/v1/science/math/report-settings",
+  ]) {
+    assert.ok(indexSrc.includes(route), `REST route ${route} missing from src/index.ts`);
+  }
 });
 
 test("routes serve pages, 404 unknown guides and count views", async () => {
