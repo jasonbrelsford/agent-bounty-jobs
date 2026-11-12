@@ -88,12 +88,21 @@ const livePanel = () => `<aside class="a-live" aria-label="Live activity">
 <div class="lf-foot"><span class="lf-status">connecting<span class="lf-cursor" aria-hidden="true"></span></span><span><span style="color:#3fb950">LIVE</span> now · <span style="color:#d29922">REPLAY</span> past events · LOG earlier</span></div>
 </section></aside>`;
 
+function span(s: number): string {
+  if (s < 90) return `${Math.round(s)}s`;
+  if (s < 5400) return `${Math.round(s / 60)}m`;
+  if (s < 129600) return `${Math.round(s / 3600)}h`;
+  return `${Math.round(s / 86400)}d`;
+}
+
 function ago(iso: string): string {
-  const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
-  if (s < 90) return `${Math.round(s)}s ago`;
-  if (s < 5400) return `${Math.round(s / 60)}m ago`;
-  if (s < 129600) return `${Math.round(s / 3600)}h ago`;
-  return `${Math.round(s / 86400)}d ago`;
+  return `${span(Math.max(0, (Date.now() - Date.parse(iso)) / 1000))} ago`;
+}
+
+/** A deadline as the board shows it: "30d left" while open, "ended 2h ago" once past. */
+export function deadlineLabel(iso: string, now = Date.now()): string {
+  const s = (Date.parse(iso) - now) / 1000;
+  return s > 0 ? `${span(s)} left` : `ended ${span(-s)} ago`;
 }
 
 const KIND_LABEL: Record<string, string> = {
@@ -190,7 +199,7 @@ export async function dashboard(env: Env, origin: string): Promise<Response> {
 <td><strong>${esc(b.title)}</strong>${b.poster_unresponsive ? `<span class="flag warn" title="a submission has waited ${STALE_DAYS}+ days for review">poster unresponsive</span>` : ""}<br><span class="meta">${esc(b.id)} · by ${esc(b.poster_name)}${b.poster_reachable ? ` <span class="flag ok" title="this poster can be reached by the operator (contact on file or inbox checked recently); the contact itself is never shown">reachable</span>` : ""}</span>${b.review_delegate ? `<br><span class="meta">review delegate after ${esc(String(b.review_after_hours))}h: ${esc(b.review_delegate === "operator" ? "the operator" : b.review_delegate)}${b.review_fee_bp ? ` · fee ${esc((b.review_fee_bp / 100).toFixed(2))}% if it awards` : ""}</span>` : ""}${extra.get(b.id)?.parts ?? ""}${extra.get(b.id)?.rep ?? ""}</td>
 <td>${esc(b.category)}</td>
 <td>${esc(b.reward_amount_cents === 0 ? "Free" : fmtMoney(b.reward_amount_cents, b.reward_currency))}</td>
-<td>${b.deadline ? esc(ago(b.deadline)).replace(" ago", "") + (Date.parse(b.deadline) > Date.now() ? " left" : "") : "—"}</td>
+<td>${b.deadline ? esc(deadlineLabel(b.deadline)) : "—"}</td>
 <td>${b.submission_count}</td>
 <td>${esc(ago(b.created_at))}</td>
 <td><a href="/bounties/${esc(b.id)}">page</a> · <a href="/v1/bounties/${esc(b.id)}">JSON</a></td>
