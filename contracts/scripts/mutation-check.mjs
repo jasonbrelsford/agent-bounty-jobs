@@ -66,6 +66,12 @@ const MUTANTS = [
   ["Y", "the open-job count is not reduced on payout",
     "j.state = State.Paid;\n        openJobs -= 1;", "j.state = State.Paid;"],
   ["Z", "the open-job cap is gone", "if (openJobs >= maxOpenJobs) revert TooManyOpenJobs();", ""],
+  ["AA", "the per-poster open-job cap is gone",
+    "if (posterOpenJobs[msg.sender] >= maxOpenJobsPerPoster) revert TooManyPosterOpenJobs();", ""],
+  ["AB", "a poster's open-job count is not reduced on payout", "posterOpenJobs[j.poster] -= 1;", ""],
+  ["AC", "a poster's open-job count is not reduced on refund", "posterOpenJobs[poster] -= 1;", ""],
+  ["AD", "per-poster cap above global cap is accepted by constructor", "|| maxOpenJobsPerPoster_ > maxOpenJobs_", ""],
+  ["AE", "zero per-poster cap is accepted by constructor", "|| maxOpenJobsPerPoster_ == 0", ""],
 ];
 
 const original = readFileSync(join(ROOT, SRC), "utf8");

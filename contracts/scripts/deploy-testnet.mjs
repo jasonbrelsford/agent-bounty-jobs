@@ -26,6 +26,7 @@ const FEE_BPS = 500n; // 5%
 const MIN = 1_000_000n; // $1
 const MAX = 100_000_000n; // $100 per job
 const MAX_OPEN = 10n;
+const MAX_OPEN_PER_POSTER = 3n;
 const MAX_HELD = 500_000_000n; // $500 in total
 
 const waitMinutes = Number(process.env.WAIT_MINUTES || 40);
@@ -78,7 +79,7 @@ const buildInfo = JSON.parse(readFileSync(new URL(`../artifacts/build-info/${art
 
 const factory = new ethers.ContractFactory(artifact.abi, artifact.bytecode, wallet);
 // The treasury on testnet is the throwaway deployer: test fees go nowhere useful, by design.
-const args = [USDC, wallet.address, FEE_BPS, MIN, MAX, MAX_OPEN, MAX_HELD];
+const args = [USDC, wallet.address, FEE_BPS, MIN, MAX, MAX_OPEN, MAX_OPEN_PER_POSTER, MAX_HELD];
 const escrow = await factory.deploy(...args);
 const tx = escrow.deploymentTransaction();
 note(`Deploy transaction: \`${tx.hash}\``);
@@ -93,9 +94,19 @@ const got = {
   minAmount: await escrow.minAmount(),
   maxAmount: await escrow.maxAmount(),
   maxOpenJobs: await escrow.maxOpenJobs(),
+  maxOpenJobsPerPoster: await escrow.maxOpenJobsPerPoster(),
   maxHeld: await escrow.maxHeld(),
 };
-const want = { token: USDC, treasury: wallet.address, feeBps: FEE_BPS, minAmount: MIN, maxAmount: MAX, maxOpenJobs: MAX_OPEN, maxHeld: MAX_HELD };
+const want = {
+  token: USDC,
+  treasury: wallet.address,
+  feeBps: FEE_BPS,
+  minAmount: MIN,
+  maxAmount: MAX,
+  maxOpenJobs: MAX_OPEN,
+  maxOpenJobsPerPoster: MAX_OPEN_PER_POSTER,
+  maxHeld: MAX_HELD,
+};
 for (const k of Object.keys(want)) {
   if (String(got[k]).toLowerCase() !== String(want[k]).toLowerCase()) throw new Error(`Setting ${k} is ${got[k]}, expected ${want[k]}`);
 }
@@ -145,6 +156,7 @@ const record = {
   minAmount: MIN.toString(),
   maxAmount: MAX.toString(),
   maxOpenJobs: Number(MAX_OPEN),
+  maxOpenJobsPerPoster: Number(MAX_OPEN_PER_POSTER),
   maxHeld: MAX_HELD.toString(),
   compiler: buildInfo.solcLongVersion,
   sourcify: verified,

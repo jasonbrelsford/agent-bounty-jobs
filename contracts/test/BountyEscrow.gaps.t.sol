@@ -368,6 +368,7 @@ contract BountyEscrowGapsTest is EscrowBase {
         assertEq(escrow.totalCredit(), 160 * USD);
         assertEq(escrow.held(), 0);
         assertEq(escrow.openJobs(), 0);
+        assertEq(escrow.posterOpenJobs(poster), 0);
         assertEq(usdc.balanceOf(address(escrow)), 160 * USD);
 
         // No new money can come in while paused, and nothing is half-recorded.
@@ -376,6 +377,7 @@ contract BountyEscrowGapsTest is EscrowBase {
         escrow.fund(agent, 10 * USD, block.timestamp + 1 days, bytes32(0));
         vm.stopPrank();
         assertEq(escrow.openJobs(), 0);
+        assertEq(escrow.posterOpenJobs(poster), 0);
         assertEq(escrow.held(), 0);
 
         usdc.setPaused(false);
@@ -485,7 +487,9 @@ contract BountyEscrowGapsTest is EscrowBase {
     // ── Other fee settings the constructor allows ────────────────────────
 
     function _deploy(uint256 feeBps, uint256 minAmount) internal returns (BountyEscrow e) {
-        e = new BountyEscrow(IERC20(address(usdc)), treasury, feeBps, minAmount, MAX, MAX_OPEN, MAX_HELD);
+        e = new BountyEscrow(
+            IERC20(address(usdc)), treasury, feeBps, minAmount, MAX, MAX_OPEN, MAX_PER_POSTER, MAX_HELD
+        );
     }
 
     function _runJob(BountyEscrow e, uint256 amount) internal {

@@ -28,9 +28,10 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
  *  - One token, fixed at deploy (Circle's USDC on the target chain).
  *  - The website holds no key and has no role here. Nothing anyone writes in a
  *    job, a submission or a message can move money; only these calls can.
- *  - Launch limits: a cap per job, a cap on how many jobs can be open at once,
- *    and a cap on the total held, so the most anyone could ever take from a bug
- *    is small. Raising them means deploying a new contract.
+ *  - Launch limits: a cap per job, a cap on how many jobs one poster or everyone
+ *    together can hold open at once, and a cap on the total held, so the most
+ *    anyone could ever take from a bug is small and one wallet cannot fill all
+ *    slots. Raising them means deploying a new contract.
  *  - Payouts are pushed; if a transfer is refused (for example Circle froze that
  *    address), the amount is credited for that address to withdraw later, so one
  *    blocked party never traps anyone else's money.
@@ -67,11 +68,13 @@ contract BountyEscrow is ReentrancyGuard {
     uint256 public immutable minAmount;
     uint256 public immutable maxAmount; // per job
     uint256 public immutable maxOpenJobs;
+    uint256 public immutable maxOpenJobsPerPoster;
     uint256 public immutable maxHeld; // total locked in open jobs
 
     uint256 public nextId = 1;
     uint256 public openJobs;
     uint256 public held; // locked in open jobs
+    mapping(address => uint256) public posterOpenJobs;
     mapping(uint256 => Job) public jobs;
     /// Payouts whose transfer was refused, claimable by that address.
     mapping(address => uint256) public credit;
@@ -89,6 +92,7 @@ contract BountyEscrow is ReentrancyGuard {
     error BadDeadline();
     error BadAgent();
     error TooManyOpenJobs();
+    error TooManyPosterOpenJobs();
     error TooMuchHeld();
     error WrongState();
     error NotPoster();
@@ -105,12 +109,14 @@ contract BountyEscrow is ReentrancyGuard {
         uint256 minAmount_,
         uint256 maxAmount_,
         uint256 maxOpenJobs_,
+        uint256 maxOpenJobsPerPoster_,
         uint256 maxHeld_
     ) {
         if (
             address(token_).code.length == 0 || treasury_ == address(0) || treasury_ == address(token_)
                 || feeBps_ > MAX_FEE_BPS || minAmount_ == 0 || minAmount_ > maxAmount_ || maxAmount_ > maxHeld_
-                || maxHeld_ > type(uint96).max || maxOpenJobs_ == 0
+                || maxHeld_ > type(uint96).max || maxOpenJobs_ == 0 || maxOpenJobsPerPoster_ == 0
+                || maxOpenJobsPerPoster_ > maxOpenJobs_
         ) revert BadConfig();
         token = token_;
         treasury = treasury_;
@@ -118,6 +124,7 @@ contract BountyEscrow is ReentrancyGuard {
         minAmount = minAmount_;
         maxAmount = maxAmount_;
         maxOpenJobs = maxOpenJobs_;
+        maxOpenJobsPerPoster = maxOpenJobsPerPoster_;
         maxHeld = maxHeld_;
     }
 
@@ -140,6 +147,7 @@ contract BountyEscrow is ReentrancyGuard {
             revert BadAgent();
         }
         if (openJobs >= maxOpenJobs) revert TooManyOpenJobs();
+        if (posterOpenJobs[msg.sender] >= maxOpenJobsPerPoster) revert TooManyPosterOpenJobs();
         if (held + amount > maxHeld) revert TooMuchHeld();
 
         id = nextId++;
@@ -153,6 +161,7 @@ contract BountyEscrow is ReentrancyGuard {
             deliverable: bytes32(0)
         });
         openJobs += 1;
+        posterOpenJobs[msg.sender] += 1;
         held += amount;
 
         // Exact-receipt check: rejects any token that delivers less than asked.
@@ -211,6 +220,7 @@ contract BountyEscrow is ReentrancyGuard {
         address agent = j.agent;
         j.state = State.Paid;
         openJobs -= 1;
+        posterOpenJobs[j.poster] -= 1;
         held -= amount;
 
         _pay(agent, amount - fee);
@@ -243,6 +253,7 @@ contract BountyEscrow is ReentrancyGuard {
         address poster = j.poster;
         j.state = State.Refunded;
         openJobs -= 1;
+        posterOpenJobs[poster] -= 1;
         held -= amount;
         _pay(poster, amount);
         emit Refunded(id, poster, amount, reason);

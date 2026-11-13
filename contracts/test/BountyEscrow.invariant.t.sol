@@ -102,6 +102,10 @@ contract Handler is Test {
     function idsLength() external view returns (uint256) {
         return ids.length;
     }
+
+    function allIds() external view returns (uint256[] memory) {
+        return ids;
+    }
 }
 
 contract BountyEscrowInvariantTest is StdInvariant, Test {
@@ -110,12 +114,20 @@ contract BountyEscrowInvariantTest is StdInvariant, Test {
     MockUSDC usdc;
     Handler handler;
     address treasury = makeAddr("treasury");
+    address a0;
+    address a1;
+    address a2;
+    address a3;
 
     function setUp() public {
         vm.warp(1_800_000_000);
         usdc = new MockUSDC();
-        escrow = new BountyEscrow(IERC20(address(usdc)), treasury, 500, 1 * USD, 100 * USD, 10, 500 * USD);
+        escrow = new BountyEscrow(IERC20(address(usdc)), treasury, 500, 1 * USD, 100 * USD, 10, 3, 500 * USD);
         handler = new Handler(escrow, usdc, treasury);
+        a0 = handler.actors(0);
+        a1 = handler.actors(1);
+        a2 = handler.actors(2);
+        a3 = handler.actors(3);
         targetContract(address(handler));
     }
 
@@ -124,26 +136,41 @@ contract BountyEscrowInvariantTest is StdInvariant, Test {
         assertEq(usdc.balanceOf(address(escrow)), escrow.held() + escrow.totalCredit());
     }
 
-    /// `held` equals the sum of every open job, and the job count matches.
+    /// `held`, `openJobs`, and per-poster `posterOpenJobs` match every open job.
     function invariant_HeldMatchesOpenJobs() public view {
         uint256 sum;
         uint256 open;
-        uint256 n = handler.idsLength();
-        for (uint256 i; i < n; ++i) {
-            (, uint96 amount,,,, BountyEscrow.State s,) = escrow.jobs(handler.ids(i));
+        uint256[4] memory counts;
+        address[4] memory actors = [a0, a1, a2, a3];
+        uint256[] memory ids = handler.allIds();
+        for (uint256 i; i < ids.length; ++i) {
+            (address p, uint96 amount,,,, BountyEscrow.State s,) = escrow.jobs(ids[i]);
             if (s == BountyEscrow.State.Funded || s == BountyEscrow.State.Submitted) {
                 sum += amount;
                 open++;
+                if (p == actors[0]) counts[0]++;
+                else if (p == actors[1]) counts[1]++;
+                else if (p == actors[2]) counts[2]++;
+                else if (p == actors[3]) counts[3]++;
             }
         }
         assertEq(escrow.held(), sum);
         assertEq(escrow.openJobs(), open);
+        for (uint256 k; k < 4; ++k) {
+            assertEq(escrow.posterOpenJobs(actors[k]), counts[k]);
+        }
+        assertEq(counts[0] + counts[1] + counts[2] + counts[3], open);
     }
 
-    /// The launch limits are never exceeded.
+    /// The launch limits (global and per-poster) are never exceeded.
     function invariant_LimitsHold() public view {
+        uint256 perPosterCap = escrow.maxOpenJobsPerPoster();
         assertLe(escrow.openJobs(), escrow.maxOpenJobs());
         assertLe(escrow.held(), escrow.maxHeld());
+        assertLe(escrow.posterOpenJobs(a0), perPosterCap);
+        assertLe(escrow.posterOpenJobs(a1), perPosterCap);
+        assertLe(escrow.posterOpenJobs(a2), perPosterCap);
+        assertLe(escrow.posterOpenJobs(a3), perPosterCap);
     }
 
     /// No money is created or destroyed: every unit is with a person, the treasury or the escrow.

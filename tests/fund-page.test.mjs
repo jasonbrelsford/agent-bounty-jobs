@@ -160,6 +160,7 @@ async function startLocalHardhatEnv() {
       1_000_000n, // $1.00 minAmount
       100_000_000n, // $100.00 maxAmount
       10n, // maxOpenJobs
+      3n, // maxOpenJobsPerPoster
       1_000_000_000n, // $1,000.00 maxHeld
     ],
   });

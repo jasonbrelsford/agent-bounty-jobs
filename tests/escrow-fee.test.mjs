@@ -12,7 +12,7 @@ import {
 import { settleBounty } from "../.test-build/settle.js";
 import { bountyPage } from "../.test-build/dashboard.js";
 
-/** Exact Solidity formula in contracts/src/BountyEscrow.sol: complete() line 210. */
+/** Exact Solidity formula in contracts/src/BountyEscrow.sol: complete() line 219. */
 function contractRule(amountUnits, feeBps) {
   const fee = (amountUnits * BigInt(feeBps)) / 10_000n;
   return { fee, toAgent: amountUnits - fee };

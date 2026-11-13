@@ -7,13 +7,14 @@ import {BountyEscrow} from "../src/BountyEscrow.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
 import {FeeOnTransferToken, ReentrantToken, FalseToken, IEscrowLike} from "./mocks/BadTokens.sol";
 
-/// Shared setup: the launch settings (5% fee, $1 to $100 per job, 10 open jobs, $500 held).
+/// Shared setup: the launch settings (5% fee, $1 to $100 per job, 10 open jobs, 3 per poster, $500 held).
 abstract contract EscrowBase is Test {
     uint256 constant USD = 1e6;
     uint256 constant FEE_BPS = 500;
     uint256 constant MIN = 1 * USD;
     uint256 constant MAX = 100 * USD;
     uint256 constant MAX_OPEN = 10;
+    uint256 constant MAX_PER_POSTER = 3;
     uint256 constant MAX_HELD = 500 * USD;
 
     MockUSDC usdc;
@@ -26,15 +27,21 @@ abstract contract EscrowBase is Test {
     function setUp() public virtual {
         vm.warp(1_800_000_000);
         usdc = new MockUSDC();
-        escrow = new BountyEscrow(IERC20(address(usdc)), treasury, FEE_BPS, MIN, MAX, MAX_OPEN, MAX_HELD);
+        escrow = new BountyEscrow(
+            IERC20(address(usdc)), treasury, FEE_BPS, MIN, MAX, MAX_OPEN, MAX_PER_POSTER, MAX_HELD
+        );
         usdc.mint(poster, 10_000 * USD);
     }
 
-    function _fund(uint256 amount) internal returns (uint256 id) {
-        vm.startPrank(poster);
+    function _fundFrom(address who, uint256 amount) internal returns (uint256 id) {
+        vm.startPrank(who);
         usdc.approve(address(escrow), amount); // exact amount, never unlimited
         id = escrow.fund(agent, amount, block.timestamp + 7 days, keccak256("job"));
         vm.stopPrank();
+    }
+
+    function _fund(uint256 amount) internal returns (uint256 id) {
+        id = _fundFrom(poster, amount);
     }
 
     function _submit(uint256 id) internal {
@@ -192,9 +199,13 @@ contract BountyEscrowTest is EscrowBase {
     }
 
     function test_TotalHeldCap() public {
-        for (uint256 i; i < 5; ++i) _fund(100 * USD);
+        address poster2 = makeAddr("poster2");
+        usdc.mint(poster2, 1_000 * USD);
+        for (uint256 i; i < 3; ++i) _fund(100 * USD);
+        for (uint256 i; i < 2; ++i) _fundFrom(poster2, 100 * USD);
         assertEq(escrow.held(), 500 * USD);
-        vm.startPrank(poster);
+        assertEq(escrow.posterOpenJobs(poster2), 2); // still under per-poster cap of 3
+        vm.startPrank(poster2);
         usdc.approve(address(escrow), 1 * USD);
         vm.expectRevert(BountyEscrow.TooMuchHeld.selector);
         escrow.fund(agent, 1 * USD, block.timestamp + 1 days, 0);
@@ -202,20 +213,77 @@ contract BountyEscrowTest is EscrowBase {
     }
 
     function test_OpenJobCap_AndSlotsFreeUp() public {
+        address[4] memory posters = [poster, makeAddr("p1"), makeAddr("p2"), makeAddr("p3")];
+        for (uint256 p = 1; p < 4; ++p) usdc.mint(posters[p], 100 * USD);
         uint256 first;
         for (uint256 i; i < 10; ++i) {
-            uint256 id = _fund(1 * USD);
+            uint256 id = _fundFrom(posters[i / 3], 1 * USD);
             if (i == 0) first = id;
         }
-        vm.startPrank(poster);
+        assertEq(escrow.openJobs(), 10);
+        assertEq(escrow.posterOpenJobs(posters[3]), 1); // under per-poster cap, hits global cap
+        vm.startPrank(posters[3]);
         usdc.approve(address(escrow), 1 * USD);
         vm.expectRevert(BountyEscrow.TooManyOpenJobs.selector);
         escrow.fund(agent, 1 * USD, block.timestamp + 1 days, 0);
         vm.stopPrank();
         vm.prank(agent);
         escrow.abandon(first);
-        _fund(1 * USD);
+        _fundFrom(posters[3], 1 * USD);
         assertEq(escrow.openJobs(), 10);
+    }
+
+    function test_PerPosterOpenJobCap_AndCountersAcrossAllExits() public {
+        address poster2 = makeAddr("poster2");
+        usdc.mint(poster2, 100 * USD);
+
+        uint256 id1 = _fund(10 * USD);
+        uint256 id2 = _fund(10 * USD);
+        uint256 id3 = _fund(10 * USD);
+        assertEq(escrow.posterOpenJobs(poster), 3);
+
+        // One poster cannot open a 4th concurrent job...
+        vm.startPrank(poster);
+        usdc.approve(address(escrow), 10 * USD);
+        vm.expectRevert(BountyEscrow.TooManyPosterOpenJobs.selector);
+        escrow.fund(agent, 10 * USD, block.timestamp + 1 days, 0);
+        vm.stopPrank();
+
+        // ...while another poster can still fund without waiting.
+        uint256 otherId = _fundFrom(poster2, 10 * USD);
+        assertEq(escrow.posterOpenJobs(poster2), 1);
+        assertEq(escrow.openJobs(), 4);
+
+        // 1) complete() decrements posterOpenJobs[poster]
+        _submit(id1);
+        vm.prank(poster);
+        escrow.complete(id1);
+        assertEq(escrow.posterOpenJobs(poster), 2);
+        assertEq(escrow.posterOpenJobs(poster2), 1);
+
+        // 2) reject() decrements posterOpenJobs[poster]
+        _submit(id2);
+        vm.prank(poster);
+        escrow.reject(id2);
+        assertEq(escrow.posterOpenJobs(poster), 1);
+
+        // 3) abandon() decrements posterOpenJobs[poster]
+        vm.prank(agent);
+        escrow.abandon(id3);
+        assertEq(escrow.posterOpenJobs(poster), 0);
+
+        // 4) refundExpired() decrements posterOpenJobs[poster]
+        uint256 id4 = _fund(10 * USD);
+        assertEq(escrow.posterOpenJobs(poster), 1);
+        vm.warp(block.timestamp + 7 days + 1);
+        escrow.refundExpired(id4);
+        assertEq(escrow.posterOpenJobs(poster), 0);
+        escrow.refundExpired(otherId);
+        assertEq(escrow.posterOpenJobs(poster2), 0);
+
+        // Poster can fund a full set of MAX_PER_POSTER jobs again once freed.
+        for (uint256 i; i < MAX_PER_POSTER; ++i) _fund(5 * USD);
+        assertEq(escrow.posterOpenJobs(poster), MAX_PER_POSTER);
     }
 
     function test_DeadlineLimits() public {
@@ -242,17 +310,24 @@ contract BountyEscrowTest is EscrowBase {
     function test_ConstructorRefusesBadSettings() public {
         IERC20 t = IERC20(address(usdc));
         vm.expectRevert(BountyEscrow.BadConfig.selector);
-        new BountyEscrow(IERC20(makeAddr("not a contract")), treasury, 500, MIN, MAX, 10, MAX_HELD);
+        new BountyEscrow(IERC20(makeAddr("not a contract")), treasury, 500, MIN, MAX, 10, 3, MAX_HELD);
         vm.expectRevert(BountyEscrow.BadConfig.selector);
-        new BountyEscrow(t, address(0), 500, MIN, MAX, 10, MAX_HELD);
+        new BountyEscrow(t, address(0), 500, MIN, MAX, 10, 3, MAX_HELD);
         vm.expectRevert(BountyEscrow.BadConfig.selector);
-        new BountyEscrow(t, treasury, 1_001, MIN, MAX, 10, MAX_HELD); // fee over 10%
+        new BountyEscrow(t, treasury, 1_001, MIN, MAX, 10, 3, MAX_HELD); // fee over 10%
         vm.expectRevert(BountyEscrow.BadConfig.selector);
-        new BountyEscrow(t, treasury, 500, 0, MAX, 10, MAX_HELD);
+        new BountyEscrow(t, treasury, 500, 0, MAX, 10, 3, MAX_HELD);
         vm.expectRevert(BountyEscrow.BadConfig.selector);
-        new BountyEscrow(t, treasury, 500, MIN, MAX, 0, MAX_HELD);
+        new BountyEscrow(t, treasury, 500, MIN, MAX, 0, 3, MAX_HELD);
         vm.expectRevert(BountyEscrow.BadConfig.selector);
-        new BountyEscrow(t, treasury, 500, MIN, MAX_HELD + 1, 10, MAX_HELD);
+        new BountyEscrow(t, treasury, 500, MIN, MAX, 10, 0, MAX_HELD); // per-poster cap 0
+        vm.expectRevert(BountyEscrow.BadConfig.selector);
+        new BountyEscrow(t, treasury, 500, MIN, MAX, 10, 11, MAX_HELD); // per-poster cap > maxOpenJobs
+        vm.expectRevert(BountyEscrow.BadConfig.selector);
+        new BountyEscrow(t, treasury, 500, MIN, MAX_HELD + 1, 10, 3, MAX_HELD);
+
+        BountyEscrow eqCaps = new BountyEscrow(t, treasury, 500, MIN, MAX, 10, 10, MAX_HELD);
+        assertEq(eqCaps.maxOpenJobsPerPoster(), 10);
     }
 
     // ── Fuzz ─────────────────────────────────────────────────────────────
@@ -314,7 +389,7 @@ contract BountyEscrowAttackTest is EscrowBase {
         assertEq(escrow.held(), 0);
         assertEq(address(escrow.token()), address(usdc));
         // An escrow wrongly deployed with a skimming token refuses every deposit.
-        BountyEscrow bad = new BountyEscrow(IERC20(address(fake)), treasury, 500, MIN, MAX, 10, MAX_HELD);
+        BountyEscrow bad = new BountyEscrow(IERC20(address(fake)), treasury, 500, MIN, MAX, 10, 3, MAX_HELD);
         vm.startPrank(stranger);
         fake.approve(address(bad), 50 * USD);
         vm.expectRevert(BountyEscrow.ReceivedWrongAmount.selector);
@@ -325,7 +400,7 @@ contract BountyEscrowAttackTest is EscrowBase {
     // 2. Reentrancy: a token that calls back in mid-payment to get paid twice.
     function test_Attack_Reentrancy_EveryCallBackIsBlocked() public {
         ReentrantToken evil = new ReentrantToken();
-        BountyEscrow e = new BountyEscrow(IERC20(address(evil)), treasury, 500, MIN, MAX, 10, MAX_HELD);
+        BountyEscrow e = new BountyEscrow(IERC20(address(evil)), treasury, 500, MIN, MAX, 10, 3, MAX_HELD);
         evil.mint(poster, 200 * USD);
         vm.startPrank(poster);
         evil.approve(address(e), 200 * USD);
@@ -479,7 +554,7 @@ contract BountyEscrowAttackTest is EscrowBase {
     // 9. A token that says "false" instead of reverting must not be treated as paid.
     function test_Attack_SilentFailure_IsCreditedNotLost() public {
         FalseToken q = new FalseToken();
-        BountyEscrow e = new BountyEscrow(IERC20(address(q)), treasury, 500, MIN, MAX, 10, MAX_HELD);
+        BountyEscrow e = new BountyEscrow(IERC20(address(q)), treasury, 500, MIN, MAX, 10, 3, MAX_HELD);
         q.mint(poster, 100 * USD);
         vm.startPrank(poster);
         q.approve(address(e), 100 * USD);
@@ -498,26 +573,33 @@ contract BountyEscrowAttackTest is EscrowBase {
         assertEq(q.balanceOf(agent), 95 * USD);
     }
 
-    // 10. Griefing the launch limits (a known, accepted weakness: see the report).
-    function test_Attack_GriefOpenJobLimit_CostsTheAttackerTheirOwnMoneyAndEnds() public {
+    // 10. Griefing the launch limits: one party cannot fill all 10 slots; other posters keep working.
+    function test_Attack_GriefOpenJobLimit_SinglePosterCappedAndOthersStillFund() public {
         address griefer = makeAddr("griefer");
         address accomplice = makeAddr("accomplice");
         usdc.mint(griefer, 10 * USD);
         vm.startPrank(griefer);
-        usdc.approve(address(escrow), 10 * USD);
-        for (uint256 i; i < 10; ++i) escrow.fund(accomplice, 1 * USD, block.timestamp + 30 days, 0);
+        usdc.approve(address(escrow), 4 * USD);
+        for (uint256 i; i < MAX_PER_POSTER; ++i) {
+            escrow.fund(accomplice, 1 * USD, block.timestamp + 30 days, 0);
+        }
+        vm.expectRevert(BountyEscrow.TooManyPosterOpenJobs.selector);
+        escrow.fund(accomplice, 1 * USD, block.timestamp + 30 days, 0);
         vm.stopPrank();
-        // For $10 locked, real posters are blocked until the attacker's deadlines pass...
-        vm.startPrank(poster);
-        usdc.approve(address(escrow), 10 * USD);
-        vm.expectRevert(BountyEscrow.TooManyOpenJobs.selector);
-        escrow.fund(agent, 10 * USD, block.timestamp + 1 days, 0);
-        vm.stopPrank();
-        // ...at most 30 days, after which anyone can clear the slots.
-        vm.warp(block.timestamp + 30 days + 1);
-        for (uint256 id = 1; id <= 10; ++id) escrow.refundExpired(id);
+
+        // Honest posters still have 7 of the 10 slots open and fund without delay.
+        uint256 honestId = _fund(10 * USD);
+        assertEq(escrow.openJobs(), 4);
+        _submit(honestId);
         vm.prank(poster);
-        escrow.fund(agent, 10 * USD, block.timestamp + 1 days, 0);
+        escrow.complete(honestId);
+        assertEq(usdc.balanceOf(agent), 95 * USD / 10);
+
+        // Once the griefer's 30-day deadlines pass, anyone can clear their 3 slots too.
+        vm.warp(block.timestamp + 30 days + 1);
+        for (uint256 id = 1; id <= MAX_PER_POSTER; ++id) escrow.refundExpired(id);
+        assertEq(escrow.openJobs(), 0);
+        assertEq(escrow.posterOpenJobs(griefer), 0);
         assertEq(usdc.balanceOf(griefer), 10 * USD, "the attacker gained nothing");
     }
 }
