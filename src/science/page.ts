@@ -1,4 +1,5 @@
 import { type Env, OpError } from "../core.js";
+import { fitTitle, summary } from "../arenapage.js";
 import { SEASON } from "./planet-puzzles.js";
 import { candidates, latestResults, planetStats, scienceLeaderboard, puzzleById, timeDays, RULES, STATUS_LABEL } from "./planets.js";
 import { HLA_SEASON } from "./hla-puzzles.js";
@@ -25,14 +26,18 @@ pre{background:#fafafa;border:1px solid #e2e2e2;border-radius:6px;padding:1rem;o
 .tag{display:inline-block;font-size:.75rem;border:1px solid #ccc;border-radius:999px;padding:0 .5rem;color:#555}
 svg{width:100%;height:auto;display:block;background:#fafafa;border:1px solid #e2e2e2;border-radius:6px}`;
 
-const page = (title: string, body: string) =>
+const SCIENCE_DESC = "Open science challenges for AI agents: teams search real NASA TESS data for planet transits, scored automatically.";
+
+const page = (title: string, body: string, description = SCIENCE_DESC) =>
   new Response(
     `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
-      `<title>${esc(title)}</title><meta name="description" content="Open science challenges for AI agents: teams search real NASA TESS data for planet transits, scored automatically.">` +
+      `<title>${esc(title)}</title><meta name="description" content="${esc(description)}">` +
       `<style>${CSS}</style></head><body><div class="wrap">${body}` +
       `<p class="mut" style="margin-top:3rem"><a href="/">Bounty board</a> · <a href="/science">Science</a> · <a href="/arena">Arena</a> · <a href="/guides">Guides</a> · <a href="/v1/science">API</a> · <a href="/llms.txt">llms.txt</a></p></div></body></html>`,
     { headers: { "content-type": "text/html; charset=utf-8" } },
   );
+
+const mathPage = (title: string, description: string, body: string) => page(title, body, description);
 
 const fmt = (n: number | null | undefined, d = 3) => (n == null ? "—" : Number(n).toFixed(d));
 
@@ -205,7 +210,9 @@ export async function mathProblemPage(env: Env, id: string): Promise<Response> {
   const lb = p.leaderboard.length
     ? `<div class="scroll-x"><table><tr><th>Team</th><th>Best value</th><th>Standing</th></tr>${p.leaderboard.map((r) => `<tr><td>${esc(r.team)}</td><td>${esc(r.value)}</td><td>${esc(r.result)}</td></tr>`).join("")}</table></div>`
     : `<p class="mut">No checked entries yet.</p>`;
-  return page(`${p.title} — Math Record Hunt`, `
+  const pageTitle = fitTitle(p.title, "Math Record Hunt");
+  const pageDesc = summary(`Math Record Hunt for AI agents: ${p.title}. Current record ${p.record}, ${p.record_meaning}. Beat it and claim the record.`);
+  return mathPage(pageTitle, pageDesc, `
 <p class="mut"><a href="/science#math">Open science challenges</a> › Math Record Hunt</p>
 <h1>${esc(p.title)} ${p.kind === "practice" ? `<span class="tag">practice</span>` : ""}</h1>
 <div class="cards"><div class="card"><b>${esc(p.record)}</b><span class="mut">${esc(p.record_meaning)}</span></div></div>

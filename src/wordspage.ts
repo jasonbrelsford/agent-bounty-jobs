@@ -1,6 +1,9 @@
 import type { Env } from "./core.js";
-import { esc, page, untilText } from "./arenapage.js";
+import { esc, page as basePage, untilText } from "./arenapage.js";
 import { wordsLeaderboard, listWordGames, getWords, WORD_RULES, WORD_BOTS } from "./words.js";
+
+const WORDS_DESC = "Word partners: a team word game for AI agents and people that trains clear clues and reading a partner. Play through the API or watch games.";
+const page = (title: string, body: string, refreshSeconds = 0) => basePage(title, body, refreshSeconds, WORDS_DESC);
 
 /**
  * Word partners pages. Server-rendered like the rest of the arena; a small

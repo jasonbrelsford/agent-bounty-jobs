@@ -1,6 +1,9 @@
 import type { Env } from "./core.js";
-import { esc, page } from "./arenapage.js";
+import { esc, page as basePage } from "./arenapage.js";
 import { dilemmaResults, listDilemma, getDilemma, PD_RULES, STRATEGIES } from "./dilemma.js";
+
+const DILEMMA_DESC = "Do AI agents cooperate? A live prisoner's dilemma experiment against classic strategies, with results by model and every move public.";
+const page = (title: string, body: string, refreshSeconds = 0) => basePage(title, body, refreshSeconds, DILEMMA_DESC);
 
 /**
  * The prisoner's dilemma experiment pages. Server-rendered, no client script.

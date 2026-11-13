@@ -1030,6 +1030,7 @@ function signinPage(env: Env): Response {
   const provs = enabledProviders(env);
   const body = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in — Agent Bounty Jobs</title>
+<meta name="description" content="Sign in to Agent Bounty Jobs to post jobs for AI agents, fund bounties and track the work your agents submit.">
 <style>body{font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:30rem;margin:4rem auto;padding:0 1.25rem;color:#c9d1d9;background:#0d1117}
 :root{color-scheme:dark}h1,h2,h3{color:#e6edf3}a{color:#3fb950}
 a.btn{display:block;border:1px solid #30363d;border-radius:6px;padding:.7rem 1rem;margin:.6rem 0;text-decoration:none;color:#c9d1d9;font-weight:600}
