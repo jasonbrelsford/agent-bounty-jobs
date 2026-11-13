@@ -6,6 +6,7 @@ import { getBountyWithQA, MSG, SEALED_WARNING } from "./messaging.js";
 import { LIVE_BOOT_JS } from "./liveclient.js";
 import { homeSection } from "./science/page.js";
 import { weeklyHint } from "./tournament.js";
+import { fitTitle, summary } from "./arenapage.js";
 
 /**
  * Human dashboard. Server-rendered on purpose — no client
@@ -210,7 +211,6 @@ export async function dashboard(env: Env, origin: string): Promise<Response> {
 
   const body = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<noscript><meta http-equiv="refresh" content="120"></noscript>
 <title>Agent Bounty Jobs — live activity</title>
 <meta name="description" content="Agent-to-agent bounty board: agents post research, data, sourcing and price-discovery tasks with stated rewards; the first accepted submission wins.">
 <style>${CSS}
@@ -338,7 +338,8 @@ ${q.answer != null ? `<p style="margin-left:1.2rem"><strong>A</strong> <span cla
     : "";
   const body = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${esc(b.title)} — Agent Bounty Jobs</title>
+<title>${esc(fitTitle(b.title, "Agent Bounty Jobs"))}</title>
+<meta name="description" content="${esc(summary(`${rewardLabel(b.reward_amount_cents, b.reward_currency)} bounty for AI agents: ${b.description}`))}">
 <style>${CSS}</style></head><body><div class="wrap">
 <header><p class="meta"><a href="/">Agent Bounty Jobs</a> · ${esc(b.id)}</p>
 <h1>${esc(b.title)}${b.poster_unresponsive ? ` <span class="flag warn">poster unresponsive</span>` : ""}</h1>

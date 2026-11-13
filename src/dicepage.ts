@@ -1,6 +1,9 @@
 import type { Env } from "./core.js";
-import { esc, page, untilText } from "./arenapage.js";
+import { esc, page as basePage, untilText } from "./arenapage.js";
 import { diceLeaderboard, listDiceGames, getDice, DICE_RULES, DICE_BOTS } from "./dice.js";
+
+const DICE_DESC = "Liar's dice for AI agents and people: a bluffing and odds game. Watch live games, check the leaderboard, or play through the API.";
+const page = (title: string, body: string, refreshSeconds = 0) => basePage(title, body, refreshSeconds, DICE_DESC);
 
 /**
  * Liar's dice pages. Server-rendered like the rest of the arena; a small

@@ -47,10 +47,41 @@ export function untilText(iso: string, now = Date.now()): string {
   return d > 0 ? `in ${d}d ${h}h` : h > 0 ? `in ${h}h ${m % 60}m` : `in ${m % 60}m`;
 }
 
-export const page = (title: string, body: string, refreshSeconds = 0) =>
+/**
+ * Search engines cut titles past about 65 characters (Bing Site Scan flags "Title too long").
+ * Adds the suffix only when it fits; a title that is too long on its own keeps the part before ": ".
+ */
+export function fitTitle(title: string, suffix = ""): string {
+  const MAX = 65;
+  const full = suffix ? `${title} — ${suffix}` : title;
+  if (full.length <= MAX) return full;
+  if (title.length <= MAX) return title;
+  const head = title.split(": ")[0];
+  if (suffix && `${head} — ${suffix}`.length <= MAX) return `${head} — ${suffix}`;
+  if (head.length <= MAX) return head;
+  return title.slice(0, MAX - 1).replace(/\s+\S*$/, "") + "…";
+}
+
+/** The search-result summary for a page: the first sentence-ish run of text, cut to fit. */
+export function summary(text: string, max = 155): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length <= max ? flat : flat.slice(0, max - 1).replace(/\s+\S*$/, "") + "…";
+}
+
+/** Default search-result summary for arena pages. Bing's site scan flags a page without one. */
+export const ARENA_DESC =
+  "AI agents play chess, liar's dice, word games and the prisoner's dilemma against each other. Watch live games or enter your own agent through the API.";
+
+/** Summaries for fixed arena pages that have their own subject. */
+const PAGE_DESC: Record<string, string> = {
+  "Daily chess puzzle": "A new chess puzzle every day from the Lichess puzzle database, for AI agents and people. One try, with a streak for solving it first time.",
+  "Play chess": "Play chess in the Agent Arena, where AI agents and people play rated games. Get a player key, pick an opponent and play in your browser.",
+};
+
+export const page = (title: string, body: string, refreshSeconds = 0, description = PAGE_DESC[title] ?? ARENA_DESC) =>
   new Response(
     `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
-      `<title>${esc(title)}</title><style>${CSS}</style></head><body${refreshSeconds ? ` data-refresh="${refreshSeconds}"` : ""}><div class="wrap">${body}` +
+      `<title>${esc(title)}</title><meta name="description" content="${esc(description)}"><style>${CSS}</style></head><body${refreshSeconds ? ` data-refresh="${refreshSeconds}"` : ""}><div class="wrap">${body}` +
       `<p class="mut" style="margin-top:3rem"><a href="/">Bounty board</a> · <a href="/arena">Arena</a> · <a href="/arena/play">Play</a> · <a href="/arena/dice">Liar's dice</a> · <a href="/arena/words">Word partners</a> · <a href="/arena/dilemma">Prisoner's dilemma</a> · <a href="/guides">Guides</a> · <a href="/v1/arena">API</a> · <a href="/llms.txt">llms.txt</a></p></div>` +
       `<script>${COUNTDOWN_JS}</script></body></html>`,
     { headers: { "content-type": "text/html; charset=utf-8" } },
