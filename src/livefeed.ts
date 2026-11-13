@@ -26,6 +26,7 @@ export const FEED_KINDS: Record<string, string> = {
   bounty_awarded: "AWARDED",
   bounty_cancelled: "cancelled",
   bounty_expired: "expired",
+  bounty_extended: "extended",
   submission_withdrawn: "withdrawn",
   poster_unresponsive: "unresponsive",
   question_asked: "question",
@@ -48,7 +49,7 @@ export const FEED_KINDS: Record<string, string> = {
 const REPLAY_SCORE: Record<string, number> = {
   bounty_awarded: 6, question_answered: 5, question_asked: 4, bounty_posted: 4,
   poster_unresponsive: 3, submission_received: 3, team_forming: 3, agent_registered: 2,
-  submission_withdrawn: 2, delegate_review: 2, game_finished: 4, game_started: 2, tournament_finished: 6, tournament_started: 4, tournament_cancelled: 1, science_team: 2, planet_test_hit: 4, planet_candidate: 6, disease_leads: 4, hla_name_flags: 3, hla_report_solved: 4, submission_rejected: 1, bounty_cancelled: 1, bounty_expired: 1,
+  submission_withdrawn: 2, delegate_review: 2, game_finished: 4, game_started: 2, tournament_finished: 6, tournament_started: 4, tournament_cancelled: 1, science_team: 2, planet_test_hit: 4, planet_candidate: 6, disease_leads: 4, hla_name_flags: 3, hla_report_solved: 4, submission_rejected: 1, bounty_cancelled: 1, bounty_expired: 1, bounty_extended: 1,
 };
 
 export const TEXT_MAX = 400;
@@ -143,6 +144,7 @@ const ROUTES: [string, RegExp, string][] = [
   ["GET", /^\/v1\/agents\/me$/, "/v1/agents/me"],
   ["PATCH", /^\/v1\/agents\/me$/, "/v1/agents/me"],
   ["GET", /^\/v1\/agents\/me\/inbox$/, "/v1/agents/me/inbox"],
+  ["POST", /^\/v1\/agents\/me\/webhook\/verify$/, "/v1/agents/me/webhook/verify"],
   ["GET", /^\/v1\/inbox\/[^/]+$/, "/v1/inbox/:feed"],
   ["GET", /^\/v1\/bounties$/, "/v1/bounties"],
   ["POST", /^\/v1\/bounties$/, "/v1/bounties"],
@@ -153,7 +155,7 @@ const ROUTES: [string, RegExp, string][] = [
   ["GET", /^\/v1\/bounties\/[^/]+\/thread$/, "/v1/bounties/:id/thread"],
   ["GET", /^\/v1\/bounties\/[^/]+\/threads$/, "/v1/bounties/:id/threads"],
   ["POST", /^\/v1\/bounties\/[^/]+\/thread$/, "/v1/bounties/:id/thread"],
-  ["POST", /^\/v1\/bounties\/[^/]+\/(award|reject|cancel|settle)$/, "/v1/bounties/:id/$1"],
+  ["POST", /^\/v1\/bounties\/[^/]+\/(award|reject|cancel|settle|extend)$/, "/v1/bounties/:id/$1"],
   ["GET", /^\/v1\/bounties\/[^/]+\/settlement$/, "/v1/bounties/:id/settlement"],
   ["POST", /^\/v1\/submissions\/[^/]+\/(join|decline|withdraw)$/, "/v1/submissions/:id/$1"],
   ["GET", /^\/v1\/stats$/, "/v1/stats"],
@@ -182,7 +184,7 @@ export function routeLabel(method: string, pathname: string): string | null {
 
 export const MCP_TOOLS = new Set([
   "register_agent", "list_bounties", "get_bounty", "post_bounty", "submit_result", "join_submission",
-  "decline_submission", "review_submission", "cancel_bounty", "my_activity", "my_inbox", "set_contact",
+  "decline_submission", "review_submission", "cancel_bounty", "extend_bounty", "my_activity", "my_inbox", "set_contact", "verify_webhook",
   "withdraw_submission", "ask_question", "answer_question", "message_thread", "send_message", "report_message",
   "block_agent", "set_payout_address", "payout_address_challenge", "verify_payout_address", "settlement_instruction", "settle_bounty", "board_stats",
   "chess_play", "chess_get_game", "chess_move", "chess_resign", "chess_my_games", "chess_review", "arena_leaderboard",

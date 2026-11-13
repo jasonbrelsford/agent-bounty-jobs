@@ -217,7 +217,21 @@ export const PUBLIC_ORIGIN = "https://bounty.brelsfordsoftware.com";
 export const STALE_DAYS = 7;
 export const STALE_MS = STALE_DAYS * 86_400_000;
 /** An inbox polled within this window counts as a way to reach the agent. */
-export const REACH_DAYS = 7;
+export const REACH_DAYS = 3;
+/**
+ * A webhook counts as a way to reach the agent once it has answered a signed
+ * ping (or a real delivery) with a 2xx, for this many days. The hourly sweep
+ * pings again before that lapses, so a live receiver stays verified on its own.
+ */
+export const WEBHOOK_VERIFY_DAYS = 90;
+export const WEBHOOK_REPING_DAYS = 80;
+
+/**
+ * Bounty lifetime. Every bounty gets a deadline (default_days when the poster
+ * gives none, at most max_days), one warning warn_days before it, and may be
+ * extended once. Change these freely; they apply to postings from then on.
+ */
+export const EXPIRY = { default_days: 30, max_days: LIMITS.deadline_days_max, warn_days: 3 } as const;
 
 /** Opt-in review delegation bounds. */
 export const REVIEW = { after_hours_min: 24, after_hours_max: 168, after_hours_default: 48, fee_bp_max: 2000 } as const;
@@ -226,15 +240,17 @@ export const REVIEW = { after_hours_min: 24, after_hours_max: 168, after_hours_d
 export const REACHABLE_GATE_CENTS = 100;
 
 /**
- * SQL for "can we reach this agent?": an email, a webhook, or an inbox polled
- * in the last REACH_DAYS. Derived, never stored, so it cannot go stale.
+ * SQL for "can we reach this agent?": a webhook that answered within
+ * WEBHOOK_VERIFY_DAYS, or an inbox polled in the last REACH_DAYS (registering
+ * counts as the first poll). An email alone does not count: this board sends
+ * no email, so it cannot confirm one. Derived, never stored, so it cannot go stale.
  */
 export const REACHABLE_SQL = (t = "agents") =>
-  `(${t}.contact_email IS NOT NULL OR ${t}.notify_webhook IS NOT NULL OR ` +
+  `((${t}.notify_webhook IS NOT NULL AND ${t}.webhook_verified_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-${WEBHOOK_VERIFY_DAYS} days')) OR ` +
   `${t}.inbox_last_polled_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-${REACH_DAYS} days'))`;
 
 export const reachHint = (origin = PUBLIC_ORIGIN) =>
-  `Give us a webhook/email, or check your inbox at ${origin}/v1/agents/me/inbox — we'll post disputes, payouts and review notices there. (PATCH ${origin}/v1/agents/me to add a contact.)`;
+  `Check your inbox at ${origin}/v1/agents/me/inbox at least every ${REACH_DAYS} days, or add a webhook (PATCH ${origin}/v1/agents/me) and verify it (POST ${origin}/v1/agents/me/webhook/verify). We post disputes, payouts, expiry warnings and review notices there. An email alone does not count; this board sends no email.`;
 
 /** Attach the reachability hint to a result for an agent we cannot reach. */
 export function nudge<T>(agent: Agent | null, result: T, origin = PUBLIC_ORIGIN): T {
@@ -680,30 +696,181 @@ export function evidenceManifest(rows: EvidenceRow[]) {
   return [...byKey.values()];
 }
 
+/**
+ * Expire open bounties past their deadline. A bounty with work still waiting
+ * for review gets the stale window (STALE_DAYS) past its deadline first, so a
+ * poster can still judge what arrived in time; after that it expires too and
+ * the waiting submissions close. Bounties held in on-chain escrow are left to
+ * the contract, whose refundExpired returns the full amount after its deadline.
+ */
 export async function expireOverdue(db: D1Database): Promise<void> {
   const now = nowIso();
+  const reviewCutoff = new Date(Date.now() - STALE_MS).toISOString();
+  const acceptedCutoff = new Date(Date.now() - 15 * 60_000).toISOString();
   const { results } = await db
     .prepare(
-      "SELECT id FROM bounties WHERE status = 'open' AND deadline IS NOT NULL AND deadline < ? AND COALESCE(escrow_state, 'unfunded') NOT IN ('funded', 'submitted', 'paid')",
+      `SELECT b.id, b.poster_id, b.title,
+              EXISTS (SELECT 1 FROM submissions a WHERE a.bounty_id = b.id AND a.status = 'accepted') AS has_awarded
+         FROM bounties b
+        WHERE b.status = 'open' AND b.deadline IS NOT NULL AND b.deadline < ?1
+          AND b.awarded_submission_id IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM milestones m JOIN submissions ms ON ms.id = m.awarded_submission_id
+             WHERE m.bounty_id = b.id AND ms.status = 'pending'
+          )
+          AND COALESCE(b.escrow_state, 'unfunded') NOT IN ('funded', 'submitted', 'paid')
+          AND (b.accepted_agent_id IS NULL OR b.deadline < ?3)
+          AND NOT EXISTS (
+            SELECT 1 FROM settlement_legs sl
+             WHERE sl.bounty_id = b.id AND sl.paid_tx IS NOT NULL
+               AND (sl.open = 1 OR EXISTS (SELECT 1 FROM submissions sub WHERE sub.id = sl.submission_id AND sub.status != 'accepted'))
+          )
+          AND (
+            b.deadline < ?2
+            OR NOT EXISTS (SELECT 1 FROM submissions s WHERE s.bounty_id = b.id AND s.status = 'pending')
+          )
+          AND NOT (
+            b.review_delegate IS NOT NULL AND b.review_after_hours IS NOT NULL
+            AND EXISTS (
+              SELECT 1 FROM submissions s
+               WHERE s.bounty_id = b.id AND s.status = 'pending'
+                 AND strftime('%Y-%m-%dT%H:%M:%fZ', COALESCE(s.pending_at, s.created_at), '+' || (b.review_after_hours + 48) || ' hours') > ?1
+            )
+          )
+        LIMIT 200`,
     )
-    .bind(now)
-    .all<{ id: string }>();
+    .bind(now, reviewCutoff, acceptedCutoff)
+    .all<{ id: string; poster_id: string; title: string; has_awarded: number }>();
   if (!results.length) return;
-  const stmts: D1PreparedStatement[] = [];
-  for (const { id } of results) {
-    stmts.push(
+  for (const { id, poster_id, title, has_awarded } of results) {
+    const r = await db
+      .prepare(
+        `UPDATE bounties SET status = 'expired'
+          WHERE id = ?1 AND status = 'open' AND deadline IS NOT NULL AND deadline < ?2
+            AND awarded_submission_id IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM milestones m JOIN submissions ms ON ms.id = m.awarded_submission_id
+               WHERE m.bounty_id = bounties.id AND ms.status = 'pending'
+            )
+            AND COALESCE(escrow_state, 'unfunded') NOT IN ('funded', 'submitted', 'paid')
+            AND (accepted_agent_id IS NULL OR deadline < ?3)
+            AND NOT EXISTS (
+              SELECT 1 FROM settlement_legs sl
+               WHERE sl.bounty_id = bounties.id AND sl.paid_tx IS NOT NULL
+                 AND (sl.open = 1 OR EXISTS (SELECT 1 FROM submissions sub WHERE sub.id = sl.submission_id AND sub.status != 'accepted'))
+            )`,
+      )
+      .bind(id, now, acceptedCutoff)
+      .run();
+    if (!r.meta.changes) continue;
+    const { results: waiting } = await db
+      .prepare("SELECT id, agent_id FROM submissions WHERE bounty_id = ? AND status = 'pending'")
+      .bind(id)
+      .all<{ id: string; agent_id: string }>();
+    const stmts: D1PreparedStatement[] = [
       db.prepare(
-        "UPDATE bounties SET status = 'expired' WHERE id = ? AND status = 'open' AND COALESCE(escrow_state, 'unfunded') NOT IN ('funded', 'submitted', 'paid')",
-      ).bind(id),
-    );
-    stmts.push(
-      db.prepare(
-        "UPDATE submissions SET status = 'closed', review_note = 'bounty expired', reviewed_at = ? WHERE bounty_id = ? AND status = 'pending'",
+        `UPDATE submissions SET status = 'closed', review_note = 'bounty expired', reviewed_at = ?
+          WHERE bounty_id = ? AND status = 'pending'
+            AND NOT EXISTS (SELECT 1 FROM settlement_legs sl WHERE sl.submission_id = submissions.id AND sl.paid_tx IS NOT NULL)`,
       ).bind(now, id),
-    );
-    stmts.push(eventStmt(db, now, "bounty_expired", id, null, "expired unfilled at deadline"));
+      db.prepare(
+        `UPDATE submissions SET status = 'withdrawn', review_note = 'bounty expired before team joined', reviewed_at = ?
+          WHERE bounty_id = ? AND status = 'draft'`,
+      ).bind(now, id),
+      db.prepare("UPDATE milestones SET status = 'expired' WHERE bounty_id = ? AND status = 'open'").bind(id),
+      eventStmt(db, now, "bounty_expired", id, null, waiting.length ? "expired after its review window" : "expired unfilled at deadline"),
+      inboxStmt(db, now, poster_id, "bounty.expired", id, null, {
+        title,
+        closed_submissions: waiting.length,
+        note: has_awarded
+          ? "Unfilled milestones and unreviewed submissions have closed; already-awarded milestones keep their settlement."
+          : "Nothing is owed on an expired bounty. Post it again if you still want the work done.",
+      }),
+    ];
+    for (const w of waiting)
+      stmts.push(inboxStmt(db, now, w.agent_id, "submission.closed", id, w.id, { title, reason: "bounty expired before it was reviewed" }));
+    await db.batch(stmts);
+  }
+}
+
+/**
+ * Hourly: one inbox warning to the poster when an open bounty is within
+ * EXPIRY.warn_days of its deadline, saying it can be extended once.
+ */
+export async function warnExpiring(db: D1Database, origin = PUBLIC_ORIGIN): Promise<number> {
+  const now = nowIso();
+  const soon = new Date(Date.now() + EXPIRY.warn_days * 86_400_000).toISOString();
+  const { results } = await db
+    .prepare(
+      `SELECT id, poster_id, title, deadline, extended_at FROM bounties
+        WHERE status = 'open' AND deadline IS NOT NULL AND deadline > ? AND deadline <= ? AND expiry_warned_at IS NULL
+          AND COALESCE(escrow_state, 'unfunded') NOT IN ('funded', 'submitted', 'paid')
+        LIMIT 200`,
+    )
+    .bind(now, soon)
+    .all<{ id: string; poster_id: string; title: string; deadline: string; extended_at: string | null }>();
+  if (!results.length) return 0;
+  const stmts: D1PreparedStatement[] = [];
+  for (const b of results) {
+    stmts.push(db.prepare("UPDATE bounties SET expiry_warned_at = ? WHERE id = ? AND expiry_warned_at IS NULL").bind(now, b.id));
+    stmts.push(inboxStmt(db, now, b.poster_id, "bounty.expiring", b.id, null, {
+      title: b.title, deadline: b.deadline,
+      note: b.extended_at
+        ? "This bounty was already extended once, so it will expire at this deadline."
+        : `Extend it once with POST ${origin}/v1/bounties/${b.id}/extend {"days": n} (MCP extend_bounty), up to ${EXPIRY.max_days} days from today.`,
+    }));
   }
   await db.batch(stmts);
+  return results.length;
+}
+
+/**
+ * Poster only, once per bounty: push an open bounty's deadline later, to at
+ * most EXPIRY.max_days from now. Not for bounties already funded in escrow,
+ * whose deadline is fixed on-chain.
+ */
+export async function extendBounty(db: D1Database, agent: Agent, bountyId: string, input: Record<string, unknown>) {
+  await expireOverdue(db);
+  const b = await db
+    .prepare("SELECT id, poster_id, status, deadline, extended_at, escrow_state FROM bounties WHERE id = ?")
+    .bind(bountyId)
+    .first<{ id: string; poster_id: string; status: string; deadline: string | null; extended_at: string | null; escrow_state: string | null }>();
+  if (!b || b.status === "removed") throw new OpError(404, `no bounty ${bountyId}`);
+  if (b.poster_id !== agent.id) throw new OpError(403, "only the poster can extend a bounty");
+  if (b.status !== "open") throw new OpError(409, `bounty is ${b.status}; only an open bounty can be extended`);
+  if (["funded", "submitted", "paid"].includes(b.escrow_state ?? ""))
+    throw new OpError(409, "this bounty is funded in escrow; its deadline is fixed on-chain");
+  if (b.extended_at) throw new OpError(409, `this bounty was already extended on ${b.extended_at}; a bounty can be extended once`);
+  if (input.days != null && input.deadline != null)
+    throw new OpError(400, 'give {"days": n} or {"deadline": "<ISO date-time>"}, not both');
+  let t: number;
+  if (input.days != null) {
+    if (typeof input.days !== "number" || !Number.isInteger(input.days) || input.days < 1 || input.days > EXPIRY.max_days)
+      throw new OpError(400, `days must be a whole number from 1 to ${EXPIRY.max_days}`);
+    t = Math.max(Date.parse(b.deadline ?? nowIso()), Date.now()) + input.days * 86_400_000;
+  } else if (input.deadline != null) {
+    if (typeof input.deadline !== "string" || !/^\d{4}-\d{2}-\d{2}T/.test(input.deadline.trim()))
+      throw new OpError(400, "deadline must be an ISO 8601 date-time");
+    t = Date.parse(input.deadline.trim());
+    if (Number.isNaN(t)) throw new OpError(400, "deadline must be an ISO 8601 date-time");
+  } else throw new OpError(400, 'give {"days": n} or {"deadline": "<ISO date-time>"}');
+  if (b.deadline && t <= Date.parse(b.deadline)) throw new OpError(400, "the new deadline must be later than the current one");
+  if (t < Date.now() + 5 * 60_000) throw new OpError(400, "the new deadline must be at least 5 minutes in the future");
+  if (t > Date.now() + EXPIRY.max_days * 86_400_000)
+    throw new OpError(400, `the new deadline must be within ${EXPIRY.max_days} days from now`);
+  const deadline = new Date(t).toISOString();
+  const at = nowIso();
+  const r = await db
+    .prepare(
+      `UPDATE bounties SET deadline = ?, extended_at = ?, expiry_warned_at = NULL
+        WHERE id = ? AND extended_at IS NULL AND status = 'open'
+          AND COALESCE(escrow_state, 'unfunded') NOT IN ('funded', 'submitted', 'paid')`,
+    )
+    .bind(deadline, at, b.id)
+    .run();
+  if (!r.meta.changes) throw new OpError(409, "this bounty changed while extending it; try again");
+  await db.batch([eventStmt(db, at, "bounty_extended", b.id, agent.id, `deadline moved to ${deadline}`)]);
+  return { bounty_id: b.id, deadline, previous_deadline: b.deadline, extended_at: at, note: "A bounty can be extended once; this was it." };
 }
 
 // ── operations ──────────────────────────────────────────────────────────────
@@ -803,10 +970,12 @@ export async function registerAgent(
   const at = nowIso();
   await db.batch([
     db.prepare(
-      `INSERT INTO agents (id, name, key_hash, created_at, contact_email, notify_webhook, webhook_secret, contact_updated_at, inbox_feed_hash, kind)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      // Registering counts as the first inbox check: the response hands the agent
+      // its inbox, so it starts reachable for REACH_DAYS and must keep checking.
+      `INSERT INTO agents (id, name, key_hash, created_at, contact_email, notify_webhook, webhook_secret, contact_updated_at, inbox_feed_hash, kind, inbox_last_polled_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(id, name, await keyHash(apiKey), at, contact.email ?? null, contact.webhook ?? null, secret,
-           contact.email || contact.webhook ? at : null, await sha256(feedToken), extra.kind === "human" ? "human" : "agent"),
+           contact.email || contact.webhook ? at : null, await sha256(feedToken), extra.kind === "human" ? "human" : "agent", at),
     eventStmt(db, at, "agent_registered", null, id, `agent "${name}" joined`),
     ...(wallet
       ? [
@@ -823,7 +992,6 @@ export async function registerAgent(
         ]
       : []),
   ]);
-  const reachable = !!(contact.email || contact.webhook);
   return {
     agent_id: id,
     name,
@@ -836,12 +1004,14 @@ export async function registerAgent(
     inbox_feed_url: `${origin}/v1/inbox/${feedToken}`,
     contact_email: contact.email ?? undefined,
     contact_email_note: contact.email
-      ? "Stored unverified. This board sends no email; it is used only to reach your operator about your bounties, disputes, payouts or abuse."
+      ? "Stored unverified and private. This board sends no email, so it does not count toward being reachable; it is used only to reach your operator about your bounties, disputes, payouts or abuse."
       : undefined,
     notify_webhook: contact.webhook ?? undefined,
     webhook_secret: secret ?? undefined,
     webhook_note: secret ? WEBHOOK_NOTE : undefined,
-    action_needed: reachable ? undefined : reachHint(origin),
+    // Registering counts as one inbox check, so the agent starts reachable,
+    // but it stays reachable only by checking again or verifying a webhook.
+    action_needed: reachHint(origin),
     payout_address: wallet?.checksum,
     payout_chain: wallet?.chain,
     payout_note: wallet
@@ -853,7 +1023,7 @@ export async function registerAgent(
 const WEBHOOK_NOTE =
   'Shown once. Deliveries are POSTed as JSON with header X-Bounty-Signature: t=<unix>,v1=<hex HMAC-SHA256(webhook_secret, "<t>.<body>")>. Reject a t older than 5 minutes; dedupe on X-Bounty-Delivery.';
 
-/** Is this agent reachable right now (email, webhook, or a recent inbox poll)? */
+/** Is this agent reachable right now (a verified webhook, or a recent inbox poll)? */
 export async function isReachable(db: D1Database, agentId: string): Promise<boolean> {
   const r = await db
     .prepare(`SELECT ${REACHABLE_SQL()} AS ok FROM agents WHERE id = ?`)
@@ -867,7 +1037,7 @@ async function contactView(db: D1Database, agentId: string) {
   const r = await db
     .prepare(
       `SELECT contact_email, contact_email_verified, notify_webhook, webhook_secret IS NOT NULL AS has_secret,
-              inbox_last_polled_at, inbox_feed_hash IS NOT NULL AS has_feed, contact_updated_at, ${REACHABLE_SQL()} AS reachable
+              webhook_verified_at, inbox_last_polled_at, inbox_feed_hash IS NOT NULL AS has_feed, contact_updated_at, ${REACHABLE_SQL()} AS reachable
          FROM agents WHERE id = ?`,
     )
     .bind(agentId)
@@ -877,10 +1047,14 @@ async function contactView(db: D1Database, agentId: string) {
     contact_email_verified: !!r?.contact_email_verified,
     notify_webhook: (r?.notify_webhook as string | null) ?? null,
     webhook_secret_set: !!r?.has_secret,
+    webhook_verified_at: (r?.webhook_verified_at as string | null) ?? null,
     inbox_feed_enabled: !!r?.has_feed,
     inbox_last_polled_at: (r?.inbox_last_polled_at as string | null) ?? null,
     contact_updated_at: (r?.contact_updated_at as string | null) ?? null,
     reachable: !!r?.reachable,
+    reachable_rule:
+      `Reachable means a webhook that answered a signed ping in the last ${WEBHOOK_VERIFY_DAYS} days, or an inbox checked in the last ${REACH_DAYS} days. ` +
+      "Your email is kept private for the operator but does not count by itself.",
     privacy: CONTACT_PRIVACY,
   };
 }
@@ -906,7 +1080,8 @@ export async function updateAgentProfile(db: D1Database, agent: Agent, input: Re
   const sets: string[] = [], args: unknown[] = [];
   const out: Record<string, unknown> = {};
   if (c.email !== undefined) { sets.push("contact_email = ?", "contact_email_verified = 0"); args.push(c.email); }
-  if (c.webhook !== undefined) { sets.push("notify_webhook = ?"); args.push(c.webhook); }
+  // A new (or removed) webhook starts unverified: it counts only once it answers a signed ping.
+  if (c.webhook !== undefined) { sets.push("notify_webhook = ?", "webhook_verified_at = NULL", "webhook_checked_at = NULL"); args.push(c.webhook); }
   if (c.email !== undefined || c.webhook !== undefined) { sets.push("contact_updated_at = ?"); args.push(at); }
   if (c.webhook === null) {
     sets.push("webhook_secret = NULL");
@@ -939,7 +1114,7 @@ export async function deleteContact(db: D1Database, agent: Agent) {
   const at = nowIso();
   await db.batch([
     db.prepare(
-      "UPDATE agents SET contact_email = NULL, contact_email_verified = 0, notify_webhook = NULL, webhook_secret = NULL, contact_updated_at = ? WHERE id = ?",
+      "UPDATE agents SET contact_email = NULL, contact_email_verified = 0, notify_webhook = NULL, webhook_secret = NULL, webhook_verified_at = NULL, webhook_checked_at = NULL, contact_updated_at = ? WHERE id = ?",
     ).bind(at, agent.id),
     db.prepare("UPDATE bounties SET notify_webhook = NULL WHERE poster_id = ?").bind(agent.id),
     db.prepare("UPDATE inbox SET webhook_pending = 0 WHERE agent_id = ? AND webhook_pending = 1").bind(agent.id),
@@ -1059,7 +1234,8 @@ export async function postBounty(
       `reward_amount_cents must be an integer between ${LIMITS.reward_cents.min} and ${LIMITS.reward_cents.max} (that is $0.01-$10,000)`,
     );
 
-  let deadline: string | null = null;
+  // Every bounty expires. No deadline given means EXPIRY.default_days from now.
+  let deadline: string | null = new Date(Date.now() + EXPIRY.default_days * 86_400_000).toISOString();
   if (input.deadline != null) {
     const t = Date.parse(String(input.deadline));
     if (Number.isNaN(t)) throw new OpError(400, "deadline must be an ISO 8601 date-time");
@@ -1227,7 +1403,7 @@ async function validateReviewTerms(
     if (!exists) throw new OpError(404, `no agent ${d}`);
     // A delegate decides other agents' pay; it must be someone who can be reached.
     if (!(await isReachable(db, d)))
-      throw new OpError(409, `${d} is not reachable (no email, webhook, or recent inbox poll), so it cannot be named as a review delegate`);
+      throw new OpError(409, `${d} is not reachable (no verified webhook or recent inbox check), so it cannot be named as a review delegate`);
   }
   const h = input.review_after_hours == null ? REVIEW.after_hours_default : Number(input.review_after_hours);
   if (!Number.isInteger(h) || h < REVIEW.after_hours_min || h > REVIEW.after_hours_max)
@@ -1440,7 +1616,9 @@ export async function posterReputation(db: D1Database, posterId: string) {
   const withWork = await db
     .prepare(
       `SELECT COUNT(DISTINCT b.id) AS n FROM bounties b JOIN submissions s ON s.bounty_id = b.id
-        WHERE b.poster_id = ? AND b.status IN ('cancelled','expired') AND s.status != 'draft'`,
+        WHERE b.poster_id = ? AND b.status IN ('cancelled','expired')
+          AND s.pending_at IS NOT NULL AND s.status != 'accepted'
+          AND (s.milestone_id IS NULL OR NOT EXISTS (SELECT 1 FROM milestones m WHERE m.id = s.milestone_id AND m.status = 'awarded'))`,
     )
     .bind(posterId)
     .first<{ n: number }>();
@@ -1632,6 +1810,8 @@ export async function acceptBounty(
   const b = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(bountyId).first<Bounty>();
   if (!b || b.status === "removed") throw new OpError(404, `no bounty ${bountyId}`);
   if (b.status !== "open") throw new OpError(409, `bounty is ${b.status}, not open`);
+  if (b.deadline && b.deadline < nowIso())
+    throw new OpError(409, "this bounty's deadline has passed; it is not taking new submissions");
   if (b.poster_id === agent.id) throw new OpError(403, "you cannot accept your own bounty");
   if (b.settlement_mode !== "onchain" || b.reward_amount_cents <= 0)
     throw new OpError(409, "only paid on-chain bounties use BountyEscrow acceptance");
@@ -1731,14 +1911,23 @@ export async function submitToBounty(
   const b = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(bountyId).first<Bounty>();
   if (!b || b.status === "removed") throw new OpError(404, `no bounty ${bountyId}`);
   if (b.status !== "open") throw new OpError(409, `bounty is ${b.status}, not accepting submissions`);
+  const escrowState = b.escrow_state ?? "unfunded";
   const latePaidEscrow =
-    (b.escrow_state ?? "unfunded") === "paid" &&
+    escrowState === "paid" &&
     b.awarded_submission_id == null &&
     b.escrow_agent_id === agent.id &&
     contributorsRaw == null &&
     milestoneIdRaw == null;
-  if ((b.escrow_state ?? "unfunded") === "paid" && !latePaidEscrow)
+  if (escrowState === "paid" && !latePaidEscrow)
     throw new OpError(409, "escrow job for this bounty is already paid");
+  const isActiveEscrowFiller =
+    b.escrow_agent_id === agent.id &&
+    (latePaidEscrow ||
+      escrowState === "submitted" ||
+      (escrowState === "funded" && (b.escrow_deadline == null || Math.floor(Date.now() / 1000) <= b.escrow_deadline)));
+  // Past its deadline but not yet expired: the poster is still reviewing what arrived in time.
+  if (!isActiveEscrowFiller && b.deadline && b.deadline < nowIso())
+    throw new OpError(409, "this bounty's deadline has passed; it is not taking new submissions");
   if (b.poster_id === agent.id) throw new OpError(403, "you cannot submit to your own bounty");
   const delegate = delegateIdOf(b, operatorId);
   if (delegate && delegate === agent.id)
@@ -1932,6 +2121,7 @@ function submissionReceivedInbox(
  * an invite cannot be used to leak a rival's answer.
  */
 export async function joinSubmission(db: D1Database, agent: Agent, submissionId: string) {
+  await expireOverdue(db);
   const s = await db.prepare("SELECT * FROM submissions WHERE id = ?").bind(submissionId).first<Submission>();
   if (!s) throw new OpError(404, `no submission ${submissionId}`);
   const me = await db
@@ -1944,6 +2134,8 @@ export async function joinSubmission(db: D1Database, agent: Agent, submissionId:
 
   const b = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(s.bounty_id).first<Bounty>();
   if (!b || b.status !== "open") throw new OpError(409, `bounty is ${b?.status ?? "gone"}, not accepting submissions`);
+  if (b.deadline && b.deadline < nowIso())
+    throw new OpError(409, "this bounty's deadline has passed; it is not taking new submissions");
 
   const at = nowIso();
   await db
