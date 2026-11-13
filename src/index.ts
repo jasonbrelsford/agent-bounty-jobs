@@ -59,6 +59,7 @@ import { feedResponse, RequestCounter, WindowLimiter, routeLabel, mcpLabels, pru
 // Aggregate request counts for the live panel (route templates only).
 const counter = new RequestCounter();
 const fundCheckLimiter = new WindowLimiter(20, 60_000);
+const webhookVerifyLimiter = new WindowLimiter(6, 60_000);
 
 /**
  * Agent Bounty Jobs — entry point.
@@ -194,7 +195,11 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   }
   if (path === "/v1/agents/me/webhook/verify" && method === "POST") {
     const a = requireAgent(await auth());
-    const r = await pingWebhook(db, a.id);
+    const clientIp = request.headers.get("cf-connecting-ip") ?? "local";
+    if (!webhookVerifyLimiter.allow(`agt:${a.id}`) || !webhookVerifyLimiter.allow(`ip:${clientIp}`))
+      throw new OpError(429, "too many webhook verification attempts — try again in a minute");
+    const r = await pingWebhook(db, a.id, { minIntervalMs: 15_000 });
+    if (r.throttled) throw new OpError(429, r.error ?? "webhook was checked moments ago — wait before verifying again");
     const reachable = await isReachable(db, a.id);
     return json(nudge(reachable ? null : me, { ...r, reachable }, url.origin));
   }

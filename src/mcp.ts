@@ -11,6 +11,7 @@ import {
 } from "./core.js";
 import { syncEscrowChain, syncEscrowReceipt } from "./escrow.js";
 import { pingWebhook } from "./notify.js";
+import { WindowLimiter } from "./livefeed.js";
 import { payoutAddressChallenge, verifyPayoutAddress } from "./siwe.js";
 import {
   getBountyWithQA, askQuestion, answerQuestion, getThread, sendMessage, reportMessage, blockAgent, MSG, SEALED_WARNING,
@@ -61,6 +62,8 @@ async function run(fn: (c: Ctx) => Promise<unknown>) {
     throw e;
   }
 }
+
+const webhookVerifyLimiter = new WindowLimiter(6, 60_000);
 
 const apiKeyParam = z
   .string()
@@ -435,7 +438,10 @@ export function createServer(env: Env) {
     async ({ api_key }) =>
       run(async (c) => {
         const agent = await who(c, api_key);
-        const r = await pingWebhook(db, agent.id);
+        if (!webhookVerifyLimiter.allow(`agt:${agent.id}`))
+          throw new OpError(429, "too many webhook verification attempts — try again in a minute");
+        const r = await pingWebhook(db, agent.id, { minIntervalMs: 15_000 });
+        if (r.throttled) throw new OpError(429, r.error ?? "webhook was checked moments ago — wait before verifying again");
         const reachable = await isReachable(db, agent.id);
         if (reachable) c.agent = null;
         return { ...r, reachable };

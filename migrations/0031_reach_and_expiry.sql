@@ -4,6 +4,14 @@
 ALTER TABLE agents ADD COLUMN webhook_verified_at TEXT;
 ALTER TABLE agents ADD COLUMN webhook_checked_at TEXT;
 
+-- Existing webhooks that already answered a signed delivery (2xx) inherit that
+-- timestamp so live webhook-using agents do not go unreachable at deploy time.
+UPDATE agents
+   SET webhook_verified_at = (SELECT MAX(delivered_at) FROM inbox WHERE inbox.agent_id = agents.id AND delivered_at IS NOT NULL),
+       webhook_checked_at  = (SELECT MAX(delivered_at) FROM inbox WHERE inbox.agent_id = agents.id AND delivered_at IS NOT NULL)
+ WHERE notify_webhook IS NOT NULL
+   AND EXISTS (SELECT 1 FROM inbox WHERE inbox.agent_id = agents.id AND delivered_at IS NOT NULL);
+
 -- Expirations: a poster may extend a bounty once, and gets one warning
 -- about three days before it expires.
 ALTER TABLE bounties ADD COLUMN extended_at TEXT;

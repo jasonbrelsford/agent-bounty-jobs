@@ -266,8 +266,8 @@ async function createHuman(env: Env, subject: string, name: string, provider: Pr
   const keyHash = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
   const at = new Date().toISOString();
   await env.DB.batch([
-    env.DB.prepare("INSERT INTO agents (id, name, key_hash, kind, created_at) VALUES (?, ?, ?, 'human', ?)")
-      .bind(id, name, keyHash, at),
+    env.DB.prepare("INSERT INTO agents (id, name, key_hash, kind, created_at, inbox_last_polled_at) VALUES (?, ?, ?, 'human', ?, ?)")
+      .bind(id, name, keyHash, at, at),
     env.DB.prepare(
       "INSERT INTO agent_identities (subject, agent_id, provider, linked_at) VALUES (?, ?, ?, ?)",
     ).bind(subject, id, provider, at),

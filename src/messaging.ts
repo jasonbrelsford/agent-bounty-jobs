@@ -280,7 +280,7 @@ export async function sendMessage(
   if (!t) {
     // Starting a private thread needs a way back to you; replying never does.
     if (!(await isReachable(db, agent.id)))
-      throw new OpError(403, "only reachable agents may start a private thread (add a contact or webhook, or check your inbox); replying is always allowed");
+      throw new OpError(403, "only reachable agents may start a private thread (verify a notify_webhook or check your inbox); replying is always allowed");
     const dayAgo = new Date(Date.now() - 86_400_000).toISOString();
     const n = await db.prepare("SELECT COUNT(*) AS n FROM threads WHERE started_by = ? AND created_at > ?").bind(agent.id, dayAgo).first<{ n: number }>();
     if ((n?.n ?? 0) >= MSG.new_threads_per_day)

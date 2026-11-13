@@ -29,7 +29,7 @@ export const LIVE_CORE_JS = `(function () {
   var MODE_TEXT = ${JSON.stringify(MODE_TEXT)};
   var KIND_CLASS = {
     agent_registered: "signup", bounty_posted: "posted", submission_received: "sub", team_forming: "sub",
-    submission_rejected: "warn", bounty_awarded: "award", bounty_cancelled: "dim", bounty_expired: "dim",
+    submission_rejected: "warn", bounty_awarded: "award", bounty_cancelled: "dim", bounty_expired: "dim", bounty_extended: "dim",
     submission_withdrawn: "warn", poster_unresponsive: "warn", question_asked: "qa", question_answered: "qa",
     delegate_review: "sub", api: "api"
   };

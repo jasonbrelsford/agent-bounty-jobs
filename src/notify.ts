@@ -271,6 +271,7 @@ export async function flushWebhooks(
         },
         body,
       });
+      await res.body?.cancel().catch(() => {});
       if (res.status < 200 || res.status >= 300) err = `HTTP ${res.status}${res.status >= 300 && res.status < 400 ? " (redirects are not followed)" : ""}`;
     } catch (e) {
       err = e instanceof Error ? e.message.slice(0, 200) : "delivery failed";
@@ -293,7 +294,7 @@ export async function flushWebhooks(
   return { delivered, failed };
 }
 
-export type PingResult = { verified: boolean; verified_at: string | null; error?: string };
+export type PingResult = { verified: boolean; verified_at: string | null; throttled?: boolean; error?: string };
 
 /**
  * Send the agent's webhook one signed `webhook.verify` ping. A 2xx answer marks
@@ -304,18 +305,27 @@ export type PingResult = { verified: boolean; verified_at: string | null; error?
 export async function pingWebhook(
   db: D1Database,
   agentId: string,
-  opts: { fetcher?: Fetcher; resolve?: Resolver; now?: number } = {},
+  opts: { fetcher?: Fetcher; resolve?: Resolver; now?: number; minIntervalMs?: number } = {},
 ): Promise<PingResult> {
   const fetcher = opts.fetcher ?? ((u, i) => fetch(u, i));
   const resolve = opts.resolve ?? dohResolve;
   const now = opts.now ?? Date.now();
   const at = new Date(now).toISOString();
   const a = await db
-    .prepare("SELECT notify_webhook, webhook_secret, webhook_verified_at FROM agents WHERE id = ?")
+    .prepare("SELECT notify_webhook, webhook_secret, webhook_verified_at, webhook_checked_at FROM agents WHERE id = ?")
     .bind(agentId)
-    .first<{ notify_webhook: string | null; webhook_secret: string | null; webhook_verified_at: string | null }>();
+    .first<{ notify_webhook: string | null; webhook_secret: string | null; webhook_verified_at: string | null; webhook_checked_at: string | null }>();
   if (!a?.notify_webhook || !a.webhook_secret)
     return { verified: false, verified_at: null, error: "no notify_webhook set (PATCH /v1/agents/me to add one)" };
+  if (opts.minIntervalMs && a.webhook_checked_at && Date.parse(a.webhook_checked_at) > now - opts.minIntervalMs) {
+    const waitS = Math.max(1, Math.ceil((Date.parse(a.webhook_checked_at) + opts.minIntervalMs - now) / 1000));
+    return {
+      verified: false,
+      verified_at: a.webhook_verified_at,
+      throttled: true,
+      error: `webhook was checked moments ago — wait ${waitS}s (or PATCH /v1/agents/me with a new notify_webhook URL) before verifying again`,
+    };
+  }
   let err: string | null = null;
   try {
     await assertDeliverable(a.notify_webhook, resolve);
@@ -334,6 +344,7 @@ export async function pingWebhook(
       },
       body,
     });
+    await res.body?.cancel().catch(() => {});
     if (res.status < 200 || res.status >= 300) err = `HTTP ${res.status}${res.status >= 300 && res.status < 400 ? " (redirects are not followed)" : ""}`;
   } catch (e) {
     err = e instanceof Error ? e.message.slice(0, 200) : "delivery failed";

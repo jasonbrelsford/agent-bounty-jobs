@@ -6,10 +6,12 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { makeD1 } from "./d1shim.mjs";
 import {
-  registerAgent, authByKey, postBounty, submitToBounty, readInbox, updateAgentProfile, isReachable,
+  registerAgent, authByKey, postBounty, acceptBounty, submitToBounty, joinSubmission, reviewSubmission,
+  setPayoutAddress, settlementInstruction, posterReputation, readInbox, updateAgentProfile, isReachable,
   extendBounty, warnExpiring, expireOverdue, getBounty, EXPIRY, STALE_DAYS,
 } from "../.test-build/core.js";
 import { pingWebhook, repingWebhooks, flushWebhooks } from "../.test-build/notify.js";
+import { routeLabel, mcpLabels } from "../.test-build/livefeed.js";
 
 const ENV = { HUMAN_BOUNTIES: "off" };
 const DAY = 86_400_000;
@@ -186,16 +188,213 @@ test("escrow-funded bounties are left to the contract", async () => {
   await assert.rejects(extendBounty(db, p.a, b.bounty_id, { days: 3 }), /fixed on-chain/);
 });
 
-test("the migration gives open bounties with no deadline one, never sooner than a week", async () => {
+test("the migration gives open bounties with no deadline one, never sooner than a week, and backfills verified webhooks", async () => {
   const db = makeD1();
-  const p = await agent(db, "legacy-poster");
+  const p = await agent(db, "legacy-poster", { notify_webhook: "https://hooks.example.com/live" });
   const old = await postBounty(db, p.a, ENV, BOUNTY);
   const recent = await postBounty(db, p.a, ENV, { ...BOUNTY, title: "Find the second cheapest verified supplier" });
   set(db, "UPDATE bounties SET deadline = NULL, created_at = ? WHERE id = ?", at(-60 * DAY), old.bounty_id);
   set(db, "UPDATE bounties SET deadline = NULL, created_at = ? WHERE id = ?", at(-DAY), recent.bounty_id);
+  const deliveredAt = at(-2 * DAY);
+  set(
+    db,
+    "INSERT INTO inbox (agent_id, at, type, bounty_id, submission_id, data, webhook_pending, delivered_at) VALUES (?, ?, 'bounty.posted', ?, NULL, '{}', 0, ?)",
+    p.agent_id, deliveredAt, old.bounty_id, deliveredAt,
+  );
+  quiet(db, p.agent_id);
+  assert.equal(await isReachable(db, p.agent_id), false);
   const sql = readFileSync(new URL("../migrations/0031_reach_and_expiry.sql", import.meta.url), "utf8");
+  db.raw.exec(sql.slice(sql.indexOf("UPDATE agents"), sql.indexOf("-- Expirations")));
+  assert.equal(await isReachable(db, p.agent_id), true, "existing live webhook inherits delivered_at");
   db.raw.exec(sql.slice(sql.indexOf("UPDATE bounties")));
   const dl = (id) => Date.parse(db.raw.prepare("SELECT deadline FROM bounties WHERE id = ?").get(id).deadline);
   assert.ok(Math.abs(dl(old.bounty_id) - (Date.now() + 7 * DAY)) < 60_000, "old ones get a week");
   assert.ok(Math.abs(dl(recent.bounty_id) - (Date.now() + 29 * DAY)) < 60_000, "recent ones get 30 days from posting");
+});
+
+test("manual webhook verify cooldown blocks rapid spam until URL changes, and livefeed labels new routes/tools", async () => {
+  const db = makeD1();
+  const p = await agent(db, "throttled-hook", { notify_webhook: "https://hooks.example.com/in" });
+  const now = Date.now();
+  const fetcher = async () => new Response("ok", { status: 200 });
+  const first = await pingWebhook(db, p.agent_id, { fetcher, resolve, now, minIntervalMs: 15_000 });
+  assert.equal(first.verified, true);
+  const second = await pingWebhook(db, p.agent_id, { fetcher, resolve, now: now + 2_000, minIntervalMs: 15_000 });
+  assert.equal(second.throttled, true);
+  await updateAgentProfile(db, p.a, { notify_webhook: "https://hooks.example.com/updated" });
+  const third = await pingWebhook(db, p.agent_id, { fetcher, resolve, now: now + 3_000, minIntervalMs: 15_000 });
+  assert.equal(third.verified, true);
+  assert.equal(third.throttled, undefined);
+
+  assert.equal(routeLabel("POST", "/v1/agents/me/webhook/verify"), "POST /v1/agents/me/webhook/verify");
+  assert.equal(routeLabel("POST", "/v1/bounties/bty_0123456789abcdef/extend"), "POST /v1/bounties/:id/extend");
+  assert.deepEqual(
+    mcpLabels([
+      { method: "tools/call", params: { name: "verify_webhook" } },
+      { method: "tools/call", params: { name: "extend_bounty" } },
+    ]),
+    ["MCP verify_webhook", "MCP extend_bounty"],
+  );
+});
+
+test("extendBounty rejects coercion, dual fields, and past deadlines during post-deadline review window", async () => {
+  const db = makeD1();
+  const p = await agent(db, "strict-extend-poster");
+  const f = await agent(db, "strict-extend-filler");
+  const b = await postBounty(db, p.a, ENV, BOUNTY);
+  await submitToBounty(db, f.a, b.bounty_id, ...SUB);
+  // Put bounty into its post-deadline review window (deadline 2 days ago, still open).
+  set(db, "UPDATE bounties SET deadline = ? WHERE id = ?", at(-2 * DAY), b.bounty_id);
+  await assert.rejects(extendBounty(db, p.a, b.bounty_id, { days: true }), /whole number/);
+  await assert.rejects(extendBounty(db, p.a, b.bounty_id, { days: [7] }), /whole number/);
+  await assert.rejects(extendBounty(db, p.a, b.bounty_id, { deadline: 12 }), /ISO 8601/);
+  await assert.rejects(extendBounty(db, p.a, b.bounty_id, { days: 7, deadline: at(7 * DAY) }), /not both/);
+  await assert.rejects(extendBounty(db, p.a, b.bounty_id, { deadline: at(-DAY) }), /in the future/);
+  const ok = await extendBounty(db, p.a, b.bounty_id, { days: 5 });
+  assert.ok(Date.parse(ok.deadline) > Date.now() + 4 * DAY);
+});
+
+test("escrow late-paid/submitted fillers, partial settlement legs, team drafts, acceptBounty, milestones, and 168h delegates are safe across deadline", async () => {
+  const db = makeD1();
+  const poster = await agent(db, "edge-poster");
+  const filler = await agent(db, "edge-filler");
+  const mate = await agent(db, "edge-mate");
+  const delegate = await agent(db, "edge-delegate");
+  await setPayoutAddress(db, filler.a, "0x1111111111111111111111111111111111111111");
+  await setPayoutAddress(db, mate.a, "0x4444444444444444444444444444444444444444");
+
+  const ONCHAIN_ENV = {
+    ...ENV,
+    PLATFORM_FEE_ADDRESS: "0x2222222222222222222222222222222222222222",
+    ESCROW_ADDRESS_BASE_SEPOLIA: "0x3333333333333333333333333333333333333333",
+  };
+  // 1) Late-paid escrow filler can still attach deliverable after board deadline passed.
+  const escB = await postBounty(db, poster.a, ONCHAIN_ENV, { ...BOUNTY, settlement: "onchain" });
+  set(
+    db,
+    "UPDATE bounties SET deadline = ?, escrow_state = 'paid', escrow_agent_id = ? WHERE id = ?",
+    at(-2 * DAY), filler.agent_id, escB.bounty_id,
+  );
+  await assert.rejects(submitToBounty(db, mate.a, escB.bounty_id, ...SUB), /already paid/);
+  const lateSub = await submitToBounty(db, filler.a, escB.bounty_id, ...SUB);
+  assert.ok(lateSub.submission_id);
+
+  // 2) Partially paid direct on-chain settlement leg prevents expireOverdue from stranding USDC.
+  const legB = await postBounty(db, poster.a, ONCHAIN_ENV, { ...BOUNTY, settlement: "onchain" });
+  const legSub = await submitToBounty(db, filler.a, legB.bounty_id, ...SUB);
+  await settlementInstruction(db, ONCHAIN_ENV, poster.a, legB.bounty_id, legSub.submission_id);
+  set(
+    db,
+    "UPDATE settlement_legs SET paid_tx = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', paid_log = 0, paid_at = ? WHERE submission_id = ? AND role = 'contributor'",
+    at(-DAY), legSub.submission_id,
+  );
+  set(db, "UPDATE bounties SET deadline = ? WHERE id = ?", at(-(STALE_DAYS + 2) * DAY), legB.bounty_id);
+  await expireOverdue(db);
+  assert.equal((await getBounty(db, legB.bounty_id, null)).bounty.status, "open", "paid leg prevents expiry");
+
+  // 3) joinSubmission and acceptBounty reject post-deadline calls; accepted bounty gets 15m sync grace.
+  const teamB = await postBounty(db, poster.a, ONCHAIN_ENV, { ...BOUNTY, settlement: "onchain" });
+  await submitToBounty(db, filler.a, teamB.bounty_id, ...SUB); // keeps bounty open in review window
+  const draft = await submitToBounty(
+    db, filler.a, teamB.bounty_id,
+    "Team deliverable content with full verified catalogue references.",
+    [{ agent_id: filler.agent_id, share_bp: 5000 }, { agent_id: mate.agent_id, share_bp: 5000 }],
+    "Team preview with verified catalogue unit pricing and lead time.",
+  );
+  set(db, "UPDATE bounties SET deadline = ? WHERE id = ?", at(-60_000), teamB.bounty_id);
+  await assert.rejects(joinSubmission(db, mate.a, draft.submission_id), /deadline has passed/);
+  await assert.rejects(acceptBounty(db, filler.a, teamB.bounty_id, ONCHAIN_ENV), /deadline has passed/);
+
+  const accB = await postBounty(db, poster.a, ONCHAIN_ENV, { ...BOUNTY, settlement: "onchain" });
+  await acceptBounty(db, filler.a, accB.bounty_id, ONCHAIN_ENV);
+  set(db, "UPDATE bounties SET deadline = ? WHERE id = ?", at(-5 * 60_000), accB.bounty_id);
+  await expireOverdue(db);
+  assert.equal((await getBounty(db, accB.bounty_id, null)).bounty.status, "open", "15m chain confirmation grace");
+  set(db, "UPDATE bounties SET deadline = ? WHERE id = ?", at(-20 * 60_000), accB.bounty_id);
+  await expireOverdue(db);
+  assert.equal((await getBounty(db, accB.bounty_id, null)).bounty.status, "expired");
+
+  // 4) Partially awarded milestone bounty closes open milestones without staining posterReputation.
+  const milPoster = await agent(db, "mil-poster");
+  const milB = await postBounty(db, milPoster.a, ENV, {
+    ...BOUNTY,
+    reward_amount_cents: 2000,
+    milestones: [
+      { title: "Part 1", reward_amount_cents: 1000 },
+      { title: "Part 2", reward_amount_cents: 1000 },
+    ],
+  });
+  const milView = await getBounty(db, milB.bounty_id, null);
+  const m1 = milView.bounty.milestones[0].id;
+  const m2 = milView.bounty.milestones[1].id;
+  const ms1 = await submitToBounty(db, filler.a, milB.bounty_id, SUB[0], undefined, SUB[2], m1);
+  await reviewSubmission(db, milPoster.a, milB.bounty_id, ms1.submission_id, "accept", "good", "paid-offchain");
+  set(db, "UPDATE bounties SET deadline = ? WHERE id = ?", at(-60_000), milB.bounty_id);
+  await expireOverdue(db);
+  const m2Row = db.raw.prepare("SELECT status FROM milestones WHERE id = ?").get(m2);
+  assert.equal(m2Row.status, "expired");
+  const rep = await posterReputation(db, milPoster.agent_id);
+  assert.equal(rep.abandoned_after_submissions, 0, "awarding the only submitted milestone is not abandonment");
+
+  // 5) 168h review delegate still gets 48h after delegateOpensAt before expiry.
+  const delB = await postBounty(db, poster.a, ENV, {
+    ...BOUNTY,
+    review_delegate: delegate.agent_id,
+    review_after_hours: 168,
+  });
+  const delSub = await submitToBounty(db, filler.a, delB.bounty_id, ...SUB);
+  set(db, "UPDATE bounties SET deadline = ? WHERE id = ?", at(-(STALE_DAYS + 0.5) * DAY), delB.bounty_id);
+  set(db, "UPDATE submissions SET pending_at = ? WHERE id = ?", at(-170 * 3_600_000), delSub.submission_id);
+  await expireOverdue(db);
+  assert.equal((await getBounty(db, delB.bounty_id, null)).bounty.status, "open", "delegate still within 48h window");
+
+  // 6) Unconsented team draft on an expiring bounty stays hidden from the poster and does not stain reputation.
+  const draftPoster = await agent(db, "draft-only-poster");
+  const draftOnlyB = await postBounty(db, draftPoster.a, ENV, BOUNTY);
+  const secretDraft = await submitToBounty(
+    db, filler.a, draftOnlyB.bounty_id,
+    "SECRET-DRAFT-CONTENT-9988 with verified supplier link.",
+    [{ agent_id: filler.agent_id, share_bp: 5000 }, { agent_id: mate.agent_id, share_bp: 5000 }],
+    "SECRET-DRAFT-PREVIEW-7766 unconsented draft preview must never leak.",
+  );
+  set(db, "UPDATE bounties SET deadline = ? WHERE id = ?", at(-60_000), draftOnlyB.bounty_id);
+  await expireOverdue(db);
+  const posterDraftView = await getBounty(db, draftOnlyB.bounty_id, draftPoster.a);
+  assert.equal(posterDraftView.bounty.status, "expired");
+  assert.ok(!JSON.stringify(posterDraftView).includes("SECRET-DRAFT"), "unconsented draft preview stays hidden from poster");
+  const draftRow = db.raw.prepare("SELECT status FROM submissions WHERE id = ?").get(secretDraft.submission_id);
+  assert.equal(draftRow.status, "withdrawn");
+  assert.equal((await posterReputation(db, draftPoster.agent_id)).abandoned_after_submissions, 0);
+
+  // 7) On-chain milestoned bounty where Milestone 1 settled on-chain still expires cleanly when Milestone 2 passes deadline,
+  //    while keeping Milestone 1's accepted deliverable readable to the poster.
+  const onMilPoster = await agent(db, "onchain-mil-poster");
+  const onMilB = await postBounty(db, onMilPoster.a, ONCHAIN_ENV, {
+    ...BOUNTY,
+    settlement: "onchain",
+    reward_amount_cents: 2000,
+    milestones: [
+      { title: "On-chain Part 1", reward_amount_cents: 1000 },
+      { title: "On-chain Part 2", reward_amount_cents: 1000 },
+    ],
+  });
+  const onMilView = await getBounty(db, onMilB.bounty_id, null);
+  const om1 = onMilView.bounty.milestones[0].id;
+  const om2 = onMilView.bounty.milestones[1].id;
+  const oms1 = await submitToBounty(db, filler.a, onMilB.bounty_id, "ONCHAIN-M1-DELIVERABLE-4242 verified answer.", undefined, SUB[2], om1);
+  await settlementInstruction(db, ONCHAIN_ENV, onMilPoster.a, onMilB.bounty_id, oms1.submission_id);
+  const settledHash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  await reviewSubmission(db, onMilPoster.a, onMilB.bounty_id, oms1.submission_id, "accept", "paid", settledHash, true);
+  set(
+    db,
+    "UPDATE settlement_legs SET open = 0, paid_tx = ?, paid_log = 0, paid_at = ? WHERE submission_id = ?",
+    settledHash, at(-DAY), oms1.submission_id,
+  );
+  set(db, "UPDATE bounties SET settled_tx = ?, deadline = ? WHERE id = ?", settledHash, at(-60_000), onMilB.bounty_id);
+  await expireOverdue(db);
+  const afterOnMil = await getBounty(db, onMilB.bounty_id, onMilPoster.a, undefined, ONCHAIN_ENV);
+  assert.equal(afterOnMil.bounty.status, "expired", "completed M1 settlement_legs do not block M2 expiry");
+  assert.equal(db.raw.prepare("SELECT status FROM milestones WHERE id = ?").get(om2).status, "expired");
+  assert.ok(JSON.stringify(afterOnMil).includes("ONCHAIN-M1-DELIVERABLE-4242"), "settled M1 deliverable stays unsealed for poster");
+  assert.equal((await posterReputation(db, onMilPoster.agent_id)).abandoned_after_submissions, 0);
 });
