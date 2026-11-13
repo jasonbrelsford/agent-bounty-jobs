@@ -277,7 +277,11 @@ export async function flushWebhooks(
     }
     if (err === null) {
       delivered++;
-      await db.prepare("UPDATE inbox SET webhook_pending = 0, delivered_at = ?, last_error = NULL WHERE seq = ?").bind(nowIso, r.seq).run();
+      await db.batch([
+        db.prepare("UPDATE inbox SET webhook_pending = 0, delivered_at = ?, last_error = NULL WHERE seq = ?").bind(nowIso, r.seq),
+        // A good answer from the agent's own webhook keeps it verified.
+        db.prepare("UPDATE agents SET webhook_verified_at = ?1, webhook_checked_at = ?1 WHERE id = ?2 AND notify_webhook = ?3").bind(nowIso, r.agent_id, r.target),
+      ]);
     } else {
       failed++;
       await db
@@ -287,4 +291,88 @@ export async function flushWebhooks(
     }
   }
   return { delivered, failed };
+}
+
+export type PingResult = { verified: boolean; verified_at: string | null; error?: string };
+
+/**
+ * Send the agent's webhook one signed `webhook.verify` ping. A 2xx answer marks
+ * it verified (it then counts toward being reachable); anything else records
+ * only that it was checked. The update is guarded on the URL, so a webhook
+ * changed while the ping was in flight is never marked verified.
+ */
+export async function pingWebhook(
+  db: D1Database,
+  agentId: string,
+  opts: { fetcher?: Fetcher; resolve?: Resolver; now?: number } = {},
+): Promise<PingResult> {
+  const fetcher = opts.fetcher ?? ((u, i) => fetch(u, i));
+  const resolve = opts.resolve ?? dohResolve;
+  const now = opts.now ?? Date.now();
+  const at = new Date(now).toISOString();
+  const a = await db
+    .prepare("SELECT notify_webhook, webhook_secret, webhook_verified_at FROM agents WHERE id = ?")
+    .bind(agentId)
+    .first<{ notify_webhook: string | null; webhook_secret: string | null; webhook_verified_at: string | null }>();
+  if (!a?.notify_webhook || !a.webhook_secret)
+    return { verified: false, verified_at: null, error: "no notify_webhook set (PATCH /v1/agents/me to add one)" };
+  let err: string | null = null;
+  try {
+    await assertDeliverable(a.notify_webhook, resolve);
+    const body = JSON.stringify({ type: "webhook.verify", at, note: "Answer with any 2xx to stay reachable. Verify the signature as for any delivery." });
+    const t = Math.floor(now / 1000);
+    const res = await fetcher(a.notify_webhook, {
+      method: "POST",
+      redirect: "manual",
+      signal: AbortSignal.timeout(5000),
+      headers: {
+        "content-type": "application/json",
+        "user-agent": "agent-bounty-jobs-webhook/1",
+        "x-bounty-event": "webhook.verify",
+        "x-bounty-delivery": `verify_${t}`,
+        "x-bounty-signature": await signPayload(a.webhook_secret, body, t),
+      },
+      body,
+    });
+    if (res.status < 200 || res.status >= 300) err = `HTTP ${res.status}${res.status >= 300 && res.status < 400 ? " (redirects are not followed)" : ""}`;
+  } catch (e) {
+    err = e instanceof Error ? e.message.slice(0, 200) : "delivery failed";
+  }
+  if (err === null) {
+    const r = await db
+      .prepare("UPDATE agents SET webhook_verified_at = ?1, webhook_checked_at = ?1 WHERE id = ?2 AND notify_webhook = ?3")
+      .bind(at, agentId, a.notify_webhook)
+      .run();
+    return r.meta.changes ? { verified: true, verified_at: at } : { verified: false, verified_at: null, error: "webhook changed during the check" };
+  }
+  await db.prepare("UPDATE agents SET webhook_checked_at = ? WHERE id = ? AND notify_webhook = ?").bind(at, agentId, a.notify_webhook).run();
+  return { verified: false, verified_at: a.webhook_verified_at, error: err };
+}
+
+/**
+ * Hourly: ping webhooks that were never verified or whose verification is
+ * getting old (older than repingDays), at most once a day each, so live
+ * receivers stay reachable without the agent doing anything.
+ */
+export async function repingWebhooks(
+  db: D1Database,
+  repingDays: number,
+  opts: { fetcher?: Fetcher; resolve?: Resolver; now?: number; limit?: number } = {},
+): Promise<{ checked: number; verified: number }> {
+  const now = opts.now ?? Date.now();
+  const old = new Date(now - repingDays * 86_400_000).toISOString();
+  const dayAgo = new Date(now - 86_400_000).toISOString();
+  const { results } = await db
+    .prepare(
+      `SELECT id FROM agents
+        WHERE notify_webhook IS NOT NULL AND webhook_secret IS NOT NULL
+          AND (webhook_verified_at IS NULL OR webhook_verified_at < ?)
+          AND (webhook_checked_at IS NULL OR webhook_checked_at < ?)
+        ORDER BY COALESCE(webhook_checked_at, '') LIMIT ?`,
+    )
+    .bind(old, dayAgo, opts.limit ?? 25)
+    .all<{ id: string }>();
+  let verified = 0;
+  for (const { id } of results ?? []) if ((await pingWebhook(db, id, opts)).verified) verified++;
+  return { checked: results?.length ?? 0, verified };
 }

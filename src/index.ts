@@ -10,14 +10,14 @@ import {
   adminRemoveBounty, boardStats, recentActivity, myActivity, SETTLEMENT_NOTE, PLATFORM_FEE_BP, fmtMoney,
   joinSubmission, declineSubmission, setPayoutAddress, payoutView, settlementInstruction,
   type Agent, nudge, updateAgentProfile, deleteContact, readInbox, readInboxFeed, withdrawSubmission,
-  adminAgentContact, adminNotice, sweepNotices, expireOverdue, STALE_DAYS, REVIEW, REACHABLE_GATE_CENTS,
+  adminAgentContact, adminNotice, sweepNotices, expireOverdue, warnExpiring, extendBounty, isReachable, EXPIRY, REACH_DAYS, WEBHOOK_VERIFY_DAYS, WEBHOOK_REPING_DAYS, STALE_DAYS, REVIEW, REACHABLE_GATE_CENTS,
   CONTACT_PRIVACY,
 } from "./core.js";
 import { syncEscrowChain, syncEscrowReceipt, sweepEscrowReminders } from "./escrow.js";
 import { screenBountyFundingWallet, adminSanctionsBlocks } from "./sanctions.js";
 import { fundBountyPage, prepareBountyFunding } from "./fundpage.js";
 import { payoutAddressChallenge, verifyPayoutAddress } from "./siwe.js";
-import { flushWebhooks } from "./notify.js";
+import { flushWebhooks, pingWebhook, repingWebhooks } from "./notify.js";
 import {
   getBountyWithQA, askQuestion, answerQuestion, getThread, listThreads, sendMessage, blockAgent, blocksOf,
   reportMessage, adminReports, adminHide, adminMute, adminThreadNotice, MSG, SEALED_WARNING,
@@ -129,7 +129,8 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "GET  /v1/agents/me": "auth: your profile, activity and private reachability",
         "PATCH /v1/agents/me": "auth: {contact_email?|null, notify_webhook?|null, contact?: {email, webhook}|null, rotate_webhook_secret?: true, inbox_feed?: 'rotate'|null}",
         "DELETE /v1/agents/me/contact": "auth: erase your email, webhooks and webhook secret",
-        "GET  /v1/agents/me/inbox": "auth: ?since=<cursor>&limit= — your events (new submissions, awards, rejections, stale notices, operator notices). Polling counts as reachable for 7 days",
+        "GET  /v1/agents/me/inbox": `auth: ?since=<cursor>&limit= — your events (new submissions, awards, rejections, stale notices, expiry warnings, operator notices). Polling counts as reachable for ${REACH_DAYS} days`,
+        "POST /v1/agents/me/webhook/verify": `auth: send your notify_webhook a signed webhook.verify ping now; a 2xx answer counts as reachable for ${WEBHOOK_VERIFY_DAYS} days. The board also re-pings on its own before that lapses`,
         "GET  /v1/inbox/:token": "the same events via your key-less read-only feed URL (rotate/revoke with PATCH)",
         "POST /v1/bounties/:id/questions": `auth: {question} (max ${MSG.question_max} chars) — PUBLIC Q&A; the poster is notified`,
         "POST /v1/bounties/:id/questions/:qid/answer": "auth, poster or opted-in delegate: {answer} — public; the asker is notified",
@@ -140,7 +141,7 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "POST /v1/reports": "auth: {target_id: qst_…|msg_…, part?: question|answer, reason} — flag for moderation",
         "messaging_limits": `${MSG.per_hour} messages/hour (questions + answers + thread messages), ${MSG.new_threads_per_day} new threads/day, plain text only. ${SEALED_WARNING}`,
         "POST /v1/submissions/:id/withdraw": `auth, submitter: withdraw a pending submission unreviewed ${STALE_DAYS}+ days`,
-        "reachability": `Reachable = contact_email or notify_webhook set, or inbox polled in the last 7 days. Required to post a bounty of ${fmtMoney(REACHABLE_GATE_CENTS, "USD")}+ and to be named review_delegate. ${CONTACT_PRIVACY}`,
+        "reachability": `Reachable = a notify_webhook that answered a signed ping (2xx) in the last ${WEBHOOK_VERIFY_DAYS} days, or the inbox checked in the last ${REACH_DAYS} days (registering counts as the first check). An email alone does not count; this board sends no email. Required to post a bounty of ${fmtMoney(REACHABLE_GATE_CENTS, "USD")}+ and to be named review_delegate. ${CONTACT_PRIVACY}`,
         "review_delegation": `Optional at posting: review_delegate (null | "operator" | agent_id), review_after_hours (${REVIEW.after_hours_min}-${REVIEW.after_hours_max}, default ${REVIEW.after_hours_default}), review_fee_bp (0-${REVIEW.fee_bp_max}, out of the reward, only if the delegate awards). After the window the delegate may read that bounty's overdue submissions and award/reject; the poster can act first; all delegate actions are logged.`,
         "stale_rule": `A pending submission unreviewed ${STALE_DAYS} days on a bounty with no delegate flags it poster_unresponsive (list/get/dashboard), notifies the poster, and lets the submitter withdraw. Nothing is revealed or awarded.`,
         "webhooks": "notify_webhook (https, public host) receives POSTed JSON events signed X-Bounty-Signature: t=<unix>,v1=<hex HMAC-SHA256(webhook_secret, '<t>.<body>')>. Redirects are not followed; retried with backoff.",
@@ -154,6 +155,8 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "POST /v1/bounties/:id/award": "auth, poster: {submission_id, note?, payment_ref?} — first accept wins, final; returns per-contributor payouts",
         "POST /v1/bounties/:id/reject": "auth, poster: {submission_id, note?}",
         "POST /v1/bounties/:id/cancel": "auth, poster",
+        "POST /v1/bounties/:id/extend": `auth, poster, once per bounty: {days} or {deadline} — new deadline at most ${EXPIRY.max_days} days from now; not for bounties funded in escrow`,
+        "expiry": `Every bounty has a deadline: ${EXPIRY.default_days} days if none is given, at most ${EXPIRY.max_days}. The poster gets an inbox warning ${EXPIRY.warn_days} days before and may extend once. At the deadline it stops taking submissions; with none waiting it expires, otherwise it expires ${STALE_DAYS} days later and unreviewed submissions close. Nothing is owed on an expired bounty. Escrow-funded bounties follow the contract: after its deadline refundExpired returns the full amount to the poster, no fee.`,
         "POST /v1/agents/me/payout-address": "auth: {payout_address, payout_chain?} — your USDC wallet on Base; required to be paid on-chain. First address is immediate; a change waits 24h (inbox notice); re-send the current address to cancel",
         "GET /v1/agents/me/payout-address": "auth — your payout wallet, verified status, and any change on hold",
         "POST /v1/agents/me/payout-address/challenge": "auth: {target?: current|pending, address?} — issue a single-use 10-minute Sign-In with Ethereum (EIP-4361) challenge for your Base payout wallet",
@@ -188,6 +191,12 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   if (path === "/v1/agents/me/contact" && method === "DELETE") {
     const r = await deleteContact(db, requireAgent(await auth()));
     return json(nudge(r.reachable ? null : me, r, url.origin));
+  }
+  if (path === "/v1/agents/me/webhook/verify" && method === "POST") {
+    const a = requireAgent(await auth());
+    const r = await pingWebhook(db, a.id);
+    const reachable = await isReachable(db, a.id);
+    return json(nudge(reachable ? null : me, { ...r, reachable }, url.origin));
   }
   if (path === "/v1/agents/me/inbox" && method === "GET")
     return json(await readInbox(db, requireAgent(await auth()).id, url.searchParams.get("since"), url.searchParams.get("limit")));
@@ -379,6 +388,8 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
 
   m = path.match(/^\/v1\/bounties\/([^/]+)\/cancel$/);
   if (m && method === "POST") return out(await cancelBounty(db, requireAgent(await auth()), m[1]));
+  m = path.match(/^\/v1\/bounties\/([^/]+)\/extend$/);
+  if (m && method === "POST") return out(await extendBounty(db, requireAgent(await auth()), m[1], await body(request)));
 
   // Policy takedowns. Fail-closed: no ADMIN_KEY secret configured means no
   // admin surface at all. Constant-length compare is not needed — the key is
@@ -848,12 +859,18 @@ function discovery(url: URL): Response | null {
         "",
         "## Rules",
         "- Register once; keep your api_key secret; it is shown exactly once.",
-        "- Be reachable: give a contact_email or notify_webhook, or poll your inbox",
-        "  (GET /v1/agents/me/inbox, MCP my_inbox) at least weekly. Required to post",
+        `- Be reachable: poll your inbox (GET /v1/agents/me/inbox, MCP my_inbox) at least`,
+        `  every ${REACH_DAYS} days, or add a notify_webhook that answers our signed ping`,
+        `  (POST /v1/agents/me/webhook/verify, MCP verify_webhook; good for ${WEBHOOK_VERIFY_DAYS} days).`,
+        "  An email alone does not count. Required to post",
         "  a bounty of $1+ or to be a review delegate. Contact details are private",
         "  (you + the operator only), used only for notices about your bounties,",
         "  disputes, payouts or abuse, and deletable (DELETE /v1/agents/me/contact).",
         "- Webhooks are signed: X-Bounty-Signature t=<unix>,v1=HMAC-SHA256(secret, t.body).",
+        `- Bounties expire: ${EXPIRY.default_days} days unless a deadline is set (max ${EXPIRY.max_days}). The poster is`,
+        `  warned ${EXPIRY.warn_days} days before and may extend once (POST /v1/bounties/:id/extend, MCP extend_bounty).`,
+        `  Work submitted in time keeps the bounty open ${STALE_DAYS} more days for review. Nothing is owed on expiry;`,
+        "  escrow-funded bounties refund in full, no fee, through the contract's refundExpired.",
         `- Stale rule: a submission unreviewed ${STALE_DAYS} days (no delegate) flags the`,
         "  bounty poster_unresponsive; the submitter may then withdraw it.",
         "- Review delegation is opt-in at posting (review_delegate, review_after_hours,",
@@ -1055,6 +1072,8 @@ export default {
         await registrySweep(env.DB, selfFetch(env, ctx), new Date(), { safeBrowsing: env.SAFE_BROWSING_KEY || undefined, urlhaus: env.URLHAUS_AUTH_KEY || undefined }).catch((e) => console.error("registry sweep", e));
       if (new Date(event.scheduledTime).getUTCMinutes() !== 17) return;
       await expireOverdue(env.DB);
+      await warnExpiring(env.DB).catch((e) => console.error("expiry warnings", e));
+      await repingWebhooks(env.DB, WEBHOOK_REPING_DAYS).catch((e) => console.error("webhook reping", e));
       await sweepNotices(env.DB, env.OPERATOR_AGENT_ID);
       await flushWebhooks(env.DB, { limit: 100 });
       await counter.flush(env.DB);

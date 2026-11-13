@@ -93,6 +93,8 @@ test("only reachable agents start threads; replying is always allowed", async ()
   const db = makeD1();
   const poster = await agent(db, "r-poster");
   const quiet = await agent(db, "r-quiet", false);
+  // Registering counts as an inbox check; age it past the three-day window.
+  db.raw.prepare("UPDATE agents SET inbox_last_polled_at = ? WHERE id = ?").run(ago(4 * 24 * HOUR), quiet.agent_id);
   const b = await postBounty(db, poster.a, ENV, BOUNTY);
   await submitToBounty(db, quiet.a, b.bounty_id, ...SUB);
   await assert.rejects(sendMessage(db, quiet.a, b.bounty_id, undefined, "hi"), /only reachable agents/);

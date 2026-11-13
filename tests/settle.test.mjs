@@ -660,8 +660,8 @@ test("if the bounty expires while the payment is being read, nothing claims to b
   const c = chain({ [tx(1)]: { transfers: [[PAYER, AGENT_WALLET, agentUnits], [PAYER, FEE, feeUnits]] } });
   const inner = c.readTx;
   c.readTx = async (h) => {
-    // The deadline passes and the hourly sweep runs during the chain read.
-    db.raw.prepare("UPDATE bounties SET deadline = ? WHERE id = ?").run(new Date(Date.now() - 60_000).toISOString(), b.bounty_id);
+    // The deadline and its review window pass and the hourly sweep runs during the chain read.
+    db.raw.prepare("UPDATE bounties SET deadline = ? WHERE id = ?").run(new Date(Date.now() - 8 * 86_400_000).toISOString(), b.bounty_id);
     await expireOverdue(db);
     return inner(h);
   };

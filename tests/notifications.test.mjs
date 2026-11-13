@@ -10,7 +10,7 @@ import {
   myActivity, adminAgentContact, adminNotice, validateEmail, nudge, isReachable,
 } from "../.test-build/core.js";
 import {
-  validateWebhookUrl, isPublicIp, assertDeliverable, signPayload, flushWebhooks,
+  validateWebhookUrl, isPublicIp, assertDeliverable, signPayload, flushWebhooks, pingWebhook,
 } from "../.test-build/notify.js";
 import { dashboard } from "../.test-build/dashboard.js";
 
@@ -23,6 +23,8 @@ async function agent(db, name, extra = {}) {
   return { ...r, a: await authByKey(db, r.api_key) };
 }
 const reach = (db, name) => agent(db, name, { contact_email: `${name}@example.com` });
+// Registering counts as an inbox check; age it past the window to make an agent unreachable.
+const goQuiet = (db, id) => db.raw.prepare("UPDATE agents SET inbox_last_polled_at = ? WHERE id = ?").run(ago(4 * DAY), id);
 
 const BOUNTY = {
   title: "Find the cheapest verified supplier", description: "Unit price, MOQ, lead time and a source link please.",
@@ -82,7 +84,8 @@ test("contact validation", async () => {
   await assert.rejects(registerAgent(db, "bad-field", { contact: { operator_name: "Bob" } }), /not a field/);
   const ok = await registerAgent(db, "good-agent", { contact: { email: "ops@example.com", webhook: "https://hooks.example.com/b" } });
   assert.match(ok.webhook_secret, /^whsec_[0-9a-f]{64}$/);
-  assert.equal(ok.action_needed, undefined);
+  // Staying reachable takes a verified webhook or regular inbox checks, so the hint always comes.
+  assert.match(ok.action_needed, /verify it/);
 });
 
 test("registration hands out an inbox and nudges the unreachable", async () => {
@@ -90,7 +93,11 @@ test("registration hands out an inbox and nudges the unreachable", async () => {
   const r = await registerAgent(db, "quiet-agent");
   assert.match(r.inbox_url, /\/v1\/agents\/me\/inbox$/);
   assert.match(r.inbox_feed_url, /\/v1\/inbox\/[0-9a-f]{64}$/);
-  assert.match(r.action_needed, /Give us a webhook\/email, or check your inbox at .*\/v1\/agents\/me\/inbox/);
+  assert.match(r.action_needed, /Check your inbox at .*\/v1\/agents\/me\/inbox at least every 3 days/);
+  // Registering counts as the first inbox check...
+  assert.ok((await authByKey(db, r.api_key)).reachable);
+  // ...for three days.
+  goQuiet(db, r.agent_id);
   const a = await authByKey(db, r.api_key);
   assert.ok(!a.reachable);
   assert.ok(nudge(a, { x: 1 }).action_needed);
@@ -129,11 +136,16 @@ test("contact details never leak into public responses", async () => {
 test("contact can be patched and deleted", async () => {
   const db = makeD1();
   const p = await agent(db, "patchy", { contact_email: "a@example.com" });
+  goQuiet(db, p.agent_id);
+  assert.equal((await myActivity(db, p.a)).reachability.reachable, false, "an email alone does not count");
   const r1 = await updateAgentProfile(db, p.a, { notify_webhook: "https://hooks.example.com/p" });
   assert.match(r1.webhook_secret, /^whsec_/);
+  assert.equal(r1.reachable, false, "a webhook counts only once it answers a ping");
+  const ok = await pingWebhook(db, p.agent_id, { fetcher: async () => new Response("ok"), resolve: async () => ["93.184.216.34"] });
+  assert.equal(ok.verified, true);
   const r2 = await updateAgentProfile(db, p.a, { contact_email: null });
   assert.equal(r2.contact_email, null);
-  assert.ok(r2.reachable, "webhook still set");
+  assert.ok(r2.reachable, "verified webhook still set");
   await assert.rejects(updateAgentProfile(db, p.a, { operator_name: "x" }), /unknown field/);
   const d = await deleteContact(db, p.a);
   assert.equal(d.notify_webhook, null);
@@ -146,6 +158,7 @@ test("contact can be patched and deleted", async () => {
 test("posting $1+ needs a reachable poster; low-value posting and submitting stay open", async () => {
   const db = makeD1();
   const anon = await agent(db, "anon-poster");
+  goQuiet(db, anon.agent_id);
   await assert.rejects(postBounty(db, anon.a, ENV, { ...BOUNTY, reward_amount_cents: 100 }), (e) => e.status === 403 && /reachable/.test(e.message));
   const small = await postBounty(db, anon.a, ENV, { ...BOUNTY, reward_amount_cents: 99 });
   const filler = await agent(db, "anon-filler");
@@ -228,6 +241,7 @@ test("delegation must be opted into, valid, and reachable", async () => {
   const db = makeD1();
   const poster = await reach(db, "dlg-poster");
   const quiet = await agent(db, "quiet-delegate");
+  goQuiet(db, quiet.agent_id);
   await assert.rejects(postBounty(db, poster.a, ENV, { ...BOUNTY, review_delegate: quiet.agent_id }), (e) => e.status === 409);
   await assert.rejects(postBounty(db, poster.a, ENV, { ...BOUNTY, review_delegate: "operator" }), (e) => e.status === 503);
   await assert.rejects(postBounty(db, poster.a, ENV, { ...BOUNTY, review_delegate: poster.agent_id }), /yourself/);
