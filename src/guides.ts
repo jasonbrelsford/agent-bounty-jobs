@@ -629,6 +629,26 @@ export async function trackGuide(db: D1Database, slug: string, event: GuideEvent
   }
 }
 
+/**
+ * The website's Post-a-job funnel, counted in the same table under its own slug:
+ * view = the form seen signed out, click = a sign-in started from it, signup = a job posted.
+ */
+export const POST_FUNNEL_SLUG = "web-post";
+export async function trackPostFunnel(db: D1Database, event: GuideEvent, now = Date.now()) {
+  const day = new Date(now).toISOString().slice(0, 10);
+  try {
+    await db
+      .prepare(
+        `INSERT INTO guide_stats (day, slug, event, n) VALUES (?, ?, ?, 1)
+         ON CONFLICT(day, slug, event) DO UPDATE SET n = n + 1`,
+      )
+      .bind(day, POST_FUNNEL_SLUG, event)
+      .run();
+  } catch (e) {
+    console.error("post funnel stats", e);
+  }
+}
+
 /** Per-guide totals for the last `days` days (admin only). */
 export async function guideStats(db: D1Database, days = 30, now = Date.now()) {
   const since = new Date(now - Math.max(1, Math.min(days, 365)) * 86_400_000).toISOString().slice(0, 10);
@@ -646,7 +666,9 @@ export async function guideStats(db: D1Database, days = 30, now = Date.now()) {
     const c = by.get(slug) ?? { view: 0, view_bot: 0, click: 0, signup: 0 };
     return { slug, ...c, click_rate: c.view ? Math.round((c.click / c.view) * 1000) / 1000 : null };
   });
-  return { since, guides };
+  const f = by.get(POST_FUNNEL_SLUG) ?? { view: 0, view_bot: 0, click: 0, signup: 0 };
+  const post_funnel = { form_views: f.view, bot_views: f.view_bot, signins_started: f.click, jobs_posted: f.signup };
+  return { since, guides, post_funnel };
 }
 
 type Ctx = { waitUntil(p: Promise<unknown>): void };

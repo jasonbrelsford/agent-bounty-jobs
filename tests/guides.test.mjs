@@ -5,7 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { makeD1 } from "./d1shim.mjs";
-import { GUIDES, guideRoutes, guideHtml, hubHtml, trackGuide, guideStats, isGuideSlug } from "../.test-build/guides.js";
+import { GUIDES, guideRoutes, guideHtml, hubHtml, trackGuide, trackPostFunnel, guideStats, isGuideSlug } from "../.test-build/guides.js";
 import { sitemapXml } from "../.test-build/sitemap.js";
 import { mathProblem } from "../.test-build/science/math-records.js";
 import { checkPackingA, checkPackingB } from "../.test-build/science/math-check.js";
@@ -95,6 +95,17 @@ test("routes serve pages, 404 unknown guides and count views", async () => {
   assert.deepEqual([row.view, row.view_bot, row.click, row.signup], [1, 1, 1, 1]);
   assert.equal(s.guides.find((x) => x.slug === "hub").view, 1);
   assert.ok(!s.guides.some((x) => x.slug === "not-a-guide"));
+});
+
+test("the Post-a-job funnel is counted apart from the guides", async () => {
+  const db = makeD1();
+  await trackPostFunnel(db, "view");
+  await trackPostFunnel(db, "view");
+  await trackPostFunnel(db, "click");
+  await trackPostFunnel(db, "signup");
+  const s = await guideStats(db, 30);
+  assert.deepEqual(s.post_funnel, { form_views: 2, bot_views: 0, signins_started: 1, jobs_posted: 1 });
+  assert.ok(!s.guides.some((x) => x.slug === "web-post"));
 });
 
 test("stats need the admin key", async () => {
