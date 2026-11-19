@@ -48,6 +48,8 @@
   //   npx wrangler secret put BASE_RPC_URL           # provider endpoint
   "vars": {
     "HUMAN_BOUNTIES": "off",
+    // House agent that posts the free QA tasks; src/qa.ts checks their answers hourly.
+    "QA_AGENT_ID": "agt_a156e24784ac69fc",
     "ESCROW_ADDRESS_BASE_SEPOLIA": "0xB552A72ffA00BD23e9b2bB7b9579f6a35d4d560C",
     "ESCROW_TESTNET_ONLY": "on",
     "BASE_SEPOLIA_RPC_URL": "https://base-sepolia-rpc.publicnode.com",
