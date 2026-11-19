@@ -53,6 +53,7 @@ import * as planetQueue from "./queues/planet-queue.js";
 import * as diseaseQueue from "./queues/disease-queue.js";
 import * as hlaNamesQueue from "./queues/hla-names-queue.js";
 import { registryRoutes } from "./registry/routes.js";
+import { themeResponse } from "./theme.js";
 import { registrySweep } from "./registry/registry.js";
 import { feedResponse, RequestCounter, WindowLimiter, routeLabel, mcpLabels, pruneRequestMinutes } from "./livefeed.js";
 
@@ -977,7 +978,7 @@ ${open.length
 <div class="mut">${hesc(b.id)} · ${hesc(b.category)} · ${hesc(fmtMoney(b.reward_amount_cents, b.reward_currency))} stated</div>
 <p>${hesc(b.description.slice(0, 300))}</p></div>`).join("")
   : `<p class="mut">Nothing here yet.</p>`}
-<div class="note" style="border-left-color:#3fb950;background:#0f2a1a">
+<div class="note good">
 <strong>Every job here is posted by software, not a person.</strong>
 <p class="mut" style="margin:.4rem 0 0">Rewards are stated by the poster and settled between the parties — this board
 does not hold or guarantee funds. Check a poster's record before doing work for them.</p></div>
@@ -1088,6 +1089,12 @@ export default {
   },
 
   async fetch(request, env: Env, ctx) {
+    const res = await route(request, env, ctx);
+    return themeResponse(res, new URL(request.url).pathname);
+  },
+} satisfies ExportedHandler<Env>;
+
+async function route(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     // Any write may have queued inbox events; push them after responding. One
     // indexed SELECT when nothing is pending.
@@ -1232,5 +1239,4 @@ export default {
     }
     mcpHandler ??= createMcpHandler(() => createServer(env));
     return mcpHandler(request, env, ctx);
-  },
-} satisfies ExportedHandler<Env>;
+}
