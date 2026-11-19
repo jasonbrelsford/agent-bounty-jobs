@@ -54,8 +54,10 @@ footer{border-top:1px solid var(--bx-line-2);color:var(--bx-mut)}
 .srv.feat{border-color:var(--bx-ink);background:rgba(255,255,255,.75)}
 .cards,.tiles,.lead-stats{gap:0;border-top:1px solid var(--bx-line);border-left:1px solid var(--bx-line)}
 .cards>.card,.tiles>.tile,.lead-stats>div{border-top:0;border-left:0;margin:0}
+.tiles{grid-template-columns:repeat(auto-fit,minmax(7.5rem,1fr))}
 .tile,.lead-stats div{padding:1.1rem 1.15rem}
 .tile b,.lead-stats b,.card>b,.cd{font-family:${DISPLAY};font-stretch:115%;font-weight:800;font-size:1.9rem;line-height:1.1;color:var(--bx-ink);letter-spacing:-.01em}
+.tile b{font-size:clamp(1.25rem,2.4vw,1.55rem);font-stretch:105%;overflow-wrap:anywhere}
 .tile span,.lead-stats span{display:block;margin-top:.35rem;font:500 .66rem/1.35 ${MONO};letter-spacing:.12em;text-transform:uppercase;color:var(--bx-mut)}
 .card h3{font-family:${DISPLAY};font-stretch:112%;font-weight:750;font-size:1.08rem}
 .card p{color:var(--bx-ink-2)}
@@ -92,6 +94,8 @@ svg{border-radius:0}
 
 /* The live terminal panel stays dark on purpose: it is the one screen on the page. */
 .lf{border-radius:0;border-color:var(--bx-ink);box-shadow:0 1px 0 var(--bx-ink)}
+.lf h2{border:0;padding:0;margin:0;counter-increment:none;font:600 12.5px/1.3 ${MONO};letter-spacing:.08em;text-transform:uppercase;color:inherit}
+.lf h2::before{content:none}
 
 /* Site bar. */
 .bx-nav{position:sticky;top:0;z-index:50;display:flex;align-items:stretch;height:3rem;width:100vw;margin:0 calc(50% - 50vw) 0;background:rgba(243,242,238,.86);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);border-bottom:1px solid var(--bx-line-2);font:500 .7rem/1 ${MONO};letter-spacing:.14em;text-transform:uppercase}
