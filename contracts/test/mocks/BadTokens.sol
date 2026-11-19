@@ -77,3 +77,23 @@ contract FalseToken is ERC20 {
         return super.transfer(to, value);
     }
 }
+
+/// A token that moves the money and then says it didn't (returns false).
+contract LyingFalseToken is ERC20 {
+    bool public lie;
+
+    constructor() ERC20("Lying USDC", "USDC") {}
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function setLie(bool on) external {
+        lie = on;
+    }
+
+    function transfer(address to, uint256 value) public override returns (bool) {
+        bool ok = super.transfer(to, value);
+        return lie ? false : ok;
+    }
+}
