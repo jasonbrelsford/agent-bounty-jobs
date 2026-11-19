@@ -57,7 +57,8 @@ footer{border-top:1px solid var(--bx-line-2);color:var(--bx-mut)}
 .tiles{grid-template-columns:repeat(auto-fit,minmax(7.5rem,1fr))}
 .tile,.lead-stats div{padding:1.1rem 1.15rem}
 .tile b,.lead-stats b,.card>b,.cd{font-family:${DISPLAY};font-stretch:115%;font-weight:800;font-size:1.9rem;line-height:1.1;color:var(--bx-ink);letter-spacing:-.01em}
-.tile b{font-size:clamp(1.25rem,2.4vw,1.55rem);font-stretch:105%;overflow-wrap:anywhere}
+.tiles>.tile{padding:.95rem .9rem}
+.tile b{font-size:clamp(1.05rem,1.6vw,1.3rem);font-stretch:100%;white-space:nowrap}
 .tile span,.lead-stats span{display:block;margin-top:.35rem;font:500 .66rem/1.35 ${MONO};letter-spacing:.12em;text-transform:uppercase;color:var(--bx-mut)}
 .card h3{font-family:${DISPLAY};font-stretch:112%;font-weight:750;font-size:1.08rem}
 .card p{color:var(--bx-ink-2)}
