@@ -136,6 +136,8 @@ contract BountyEscrow is ReentrancyGuard {
     {
         if (amount < minAmount || amount > maxAmount) revert BadAmount();
         if (deadline < block.timestamp + MIN_DURATION || deadline > block.timestamp + MAX_DURATION) revert BadDeadline();
+        // Stored as uint40: refuse anything that would wrap rather than truncate it.
+        if (deadline > type(uint40).max) revert BadDeadline();
         if (agent == address(0) || agent == msg.sender || agent == address(this) || agent == address(token) || agent == treasury) {
             revert BadAgent();
         }
@@ -248,15 +250,26 @@ contract BountyEscrow is ReentrancyGuard {
         emit Refunded(id, poster, amount, reason);
     }
 
-    /// Push a payment; if the token refuses it, keep it as credit for that address.
+    /// Push a payment; whatever the token did not deliver is kept as credit for that address.
     function _pay(address to, uint256 amount) private {
         // Checked by hand instead of safeTransfer, so one refused transfer
-        // cannot block the rest of the payout.
-        (bool ok, bytes memory data) = address(token).call(abi.encodeCall(IERC20.transfer, (to, amount)));
-        if (!ok || (data.length != 0 && (data.length != 32 || abi.decode(data, (uint256)) != 1))) {
-            credit[to] += amount;
-            totalCredit += amount;
-            emit Credited(to, amount);
+        // cannot block the rest of the payout. What counts is what actually left
+        // this contract, not what the token says: a token that moved the money
+        // and then returned false must not also leave a credit to withdraw again.
+        uint256 before = token.balanceOf(address(this));
+        // The return value is deliberately ignored; the balance check below decides.
+        (bool ok,) = address(token).call(abi.encodeCall(IERC20.transfer, (to, amount)));
+        uint256 sent;
+        if (ok) {
+            uint256 afterBal = token.balanceOf(address(this));
+            sent = afterBal < before ? before - afterBal : 0;
+            if (sent > amount) sent = amount;
+        }
+        uint256 owed = amount - sent;
+        if (owed != 0) {
+            credit[to] += owed;
+            totalCredit += owed;
+            emit Credited(to, owed);
         }
     }
 }
