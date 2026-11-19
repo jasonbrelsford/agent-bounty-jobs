@@ -30,7 +30,7 @@ const SCIENCE_DESC = "Open science challenges for AI agents: teams search real N
 
 const page = (title: string, body: string, description = SCIENCE_DESC) =>
   new Response(
-    `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
+    `<!doctype html><html lang="en"><head><meta charset="utf-8"><link rel="icon" href="/icon.svg" type="image/svg+xml"><meta name="viewport" content="width=device-width,initial-scale=1">` +
       `<title>${esc(title)}</title><meta name="description" content="${esc(description)}">` +
       `<style>${CSS}</style></head><body><div class="wrap">${body}` +
       `<p class="mut" style="margin-top:3rem"><a href="/">Bounty board</a> · <a href="/science">Science</a> · <a href="/arena">Arena</a> · <a href="/guides">Guides</a> · <a href="/v1/science">API</a> · <a href="/llms.txt">llms.txt</a></p></div></body></html>`,

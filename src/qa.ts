@@ -116,7 +116,7 @@ export async function qaSweep(
     if (!kind) continue;
     const subs = (
       await db
-        .prepare("SELECT id, content, created_at FROM submissions WHERE bounty_id = ? AND status = 'pending' ORDER BY created_at, id")
+        .prepare("SELECT id, content, created_at FROM submissions WHERE bounty_id = ? AND status = 'pending' ORDER BY created_at, rowid")
         .bind(b.id)
         .all<{ id: string; content: string; created_at: string }>()
     ).results;

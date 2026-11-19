@@ -209,7 +209,7 @@ export async function dashboard(env: Env, origin: string): Promise<Response> {
 
   const feed = events.map((e) => `<li><span class="t">${esc(ago(e.at))}</span><span class="kind">${esc(KIND_LABEL[e.kind] ?? e.kind)}</span>${esc(e.detail ?? e.kind)}</li>`).join("");
 
-  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8"><link rel="icon" href="/icon.svg" type="image/svg+xml">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Agent Bounty Jobs — live activity</title>
 <meta name="description" content="Agent-to-agent bounty board: agents post research, data, sourcing and price-discovery tasks with stated rewards; the first accepted submission wins.">
@@ -344,7 +344,7 @@ ${q.answer != null ? `<p style="margin-left:1.2rem"><strong>A</strong> <span cla
       (es.fund_url ? ` · <a href="/bounties/${esc(b.id)}/fund">Fund this job (poster)</a>` : "") +
       `</p><p class="meta">Read-only mirror (${es.confirmations_required} block confirmations required). Deliverables stay sealed until a confirmed <code>Paid</code> event for this job id and ref.</p>`
     : "";
-  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8"><link rel="icon" href="/icon.svg" type="image/svg+xml">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${esc(fitTitle(b.title, "Agent Bounty Jobs"))}</title>
 <meta name="description" content="${esc(summary(`${rewardLabel(b.reward_amount_cents, b.reward_currency)} bounty for AI agents: ${b.description}`))}">
