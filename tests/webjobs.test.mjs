@@ -86,9 +86,18 @@ test("posting, an agent answering and the person picking it, through the pages",
 
   // Signed out page offers sign-in only when a provider is set.
   assert.match(await postSignedOutPage({ ...env, GOOGLE_CLIENT_ID: "x", GOOGLE_CLIENT_SECRET: "y" }).text(), /Post a job for AI agents/);
+  // The whole form shows before sign-in; sign-in is the last step and marks itself as coming from /post.
+  const out = await postSignedOutPage({ ...env, GOOGLE_CLIENT_ID: "x", GOOGLE_CLIENT_SECRET: "y" }).text();
+  assert.match(out, /name="title"/);
+  assert.match(out, /name="description"/);
+  assert.match(out, /href="\/auth\/google\?from=post"/);
+  assert.doesNotMatch(out, /name="t"/);
+  assert.doesNotMatch(out, /method="post"/);
 
   const form = await postFormPage(env, me);
-  assert.match(await form.text(), /name="t" value="[A-Za-z0-9_-]+"/);
+  const formHtml = await form.text();
+  assert.match(formHtml, /name="t" value="[A-Za-z0-9_-]+"/);
+  assert.match(formHtml, /data-signedin="1"/);
 
   const fd = (o) => { const f = new FormData(); for (const [k, v] of Object.entries(o)) f.set(k, v); return f; };
   const req = (o) => new Request("https://bounty.test/post", { method: "POST", body: fd(o) });

@@ -24,6 +24,7 @@ import {
   cancelBounty, violatesHumanPolicy, rewardLabel,
 } from "./core.js";
 import { formToken, checkFormToken, enabledProviders } from "./auth.js";
+import { trackPostFunnel } from "./guides.js";
 
 export const WEB_JOBS = {
   per_day: 3,
@@ -143,30 +144,24 @@ const STATUS_LABEL: Record<string, string> = {
   open: "open", awarded: "answer picked", cancelled: "closed", expired: "expired",
 };
 
-/** Signed out: what posting is, and the sign-in buttons. */
-export function postSignedOutPage(env: Env): Response {
-  const provs = enabledProviders(env);
-  return page("Post a job", `<h1>Post a job for AI agents</h1>
-<p>Describe what you need. Agents send back answers, you read a short preview of each and pick the one you want. Only the answer you pick is opened in full.</p>
-<p class="mut">Posting is free while we're in beta. No money changes hands.</p>
-${provs.length
-  ? provs.map((p) => `<a class="btn" href="/auth/${p}">Sign in with ${p === "github" ? "GitHub" : "Google"} to post</a>`).join("")
-  : `<div class="err">Sign-in isn't set up on this site yet.</div>`}`);
-}
+// A draft typed before sign-in survives the round trip to Google or GitHub in
+// this browser only (localStorage, 30 minutes). Nothing is sent anywhere until
+// the person presses Post after signing in.
+const DRAFT_JS = `(function(){var K="bountyJobDraft",F=["title","description","criteria","category","days"];
+function read(){try{var d=JSON.parse(localStorage.getItem(K)||"null");if(d&&Date.now()-d.at<1800000)return d;localStorage.removeItem(K)}catch(e){}return null}
+var form=document.getElementById("jobform");if(!form)return;
+if(form.dataset.signedin){var d=read();if(d){var any=false;F.forEach(function(f){var el=form.elements[f];if(el&&d[f]&&!el.value){el.value=d[f];any=true}else if(el&&d[f]&&el.tagName==="SELECT"){el.value=d[f];any=true}});
+try{localStorage.removeItem(K)}catch(e){}if(any){var n=document.getElementById("kept");if(n)n.hidden=false}}return}
+document.querySelectorAll("a[data-signin]").forEach(function(a){a.addEventListener("click",function(){var d={at:Date.now()};F.forEach(function(f){var el=form.elements[f];if(el)d[f]=el.value});try{localStorage.setItem(K,JSON.stringify(d))}catch(e){}})});
+form.addEventListener("submit",function(e){e.preventDefault();var a=document.querySelector("a[data-signin]");if(a)a.click()})})();`;
 
-/** The form. `values` and `error` re-fill it after a refused post. */
-export async function postFormPage(
-  env: Env, me: Agent, values: Record<string, string> = {}, error?: string, status = 200,
-): Promise<Response> {
-  const t = await formToken(env, me.id);
+// The sign-in callback always lands on /my-jobs; send someone with a fresh draft on to /post.
+const RESUME_JS = `(function(){try{var d=JSON.parse(localStorage.getItem("bountyJobDraft")||"null");if(d&&Date.now()-d.at<1800000)location.replace("/post")}catch(e){}})();`;
+
+function formFields(values: Record<string, string>): string {
   const days = values.days ?? String(WEB_JOBS.deadline_default);
   const cat = values.category ?? "research";
-  return page("Post a job", `<h1>Post a job for AI agents</h1>
-<p class="mut">Signed in as ${esc(me.name)}. Free while we're in beta. Agents answer; you pick the answer you want.</p>
-${error ? `<div class="err">${esc(error)}</div>` : ""}
-<form method="post" action="/post">
-<input type="hidden" name="t" value="${esc(t)}">
-<label for="title">What do you need?</label>
+  return `<label for="title">What do you need?</label>
 <input type="text" id="title" name="title" required minlength="${LIMITS.title.min}" maxlength="${LIMITS.title.max}" value="${esc(values.title)}" placeholder="Find three suppliers of recycled cardboard mailers in the US">
 <label for="description">Details</label>
 <textarea id="description" name="description" required minlength="${LIMITS.description.min}" maxlength="${LIMITS.description.max}" placeholder="What it's for, what to include, anything to avoid">${esc(values.description)}</textarea>
@@ -176,9 +171,43 @@ ${error ? `<div class="err">${esc(error)}</div>` : ""}
 <select id="category" name="category">${CATEGORIES.map((c) => `<option value="${c}"${c === cat ? " selected" : ""}>${esc(CATEGORY_LABEL[c] ?? c)}</option>`).join("")}</select>
 <label for="days">Keep it open for</label>
 <select id="days" name="days">${WEB_JOBS.deadline_days.map((d) => `<option value="${d}"${String(d) === days ? " selected" : ""}>${d} days</option>`).join("")}</select>
-<p class="mut">Your job and its title are public on the board. Leave out personal details, email addresses and phone numbers. You can post ${WEB_JOBS.per_day} jobs a day.</p>
+<p class="mut">Your job and its title are public on the board. Leave out personal details, email addresses and phone numbers. You can post ${WEB_JOBS.per_day} jobs a day.</p>`;
+}
+
+/**
+ * Signed out: the whole form, so people can write the job before deciding to sign in.
+ * Sign-in comes at the end, and what they typed is kept for after it.
+ */
+export function postSignedOutPage(env: Env): Response {
+  const provs = enabledProviders(env);
+  return page("Post a job", `<h1>Post a job for AI agents</h1>
+<p>Describe what you need. Agents send back answers, you read a short preview of each and pick the one you want. Only the answer you pick is opened in full.</p>
+<p class="mut">Posting is free while we're in beta. No money changes hands.</p>
+<form id="jobform" method="get" action="/post">
+${formFields({})}
+${provs.length
+  ? `<p>To post it, sign in. We keep what you typed.</p>` +
+    provs.map((p) => `<a class="btn" data-signin href="/auth/${p}?from=post">Sign in with ${p === "github" ? "GitHub" : "Google"} and post</a>`).join("")
+  : `<div class="err">Sign-in isn't set up on this site yet.</div>`}
+</form>
+<script>${DRAFT_JS}</script>`);
+}
+
+/** The form. `values` and `error` re-fill it after a refused post. */
+export async function postFormPage(
+  env: Env, me: Agent, values: Record<string, string> = {}, error?: string, status = 200,
+): Promise<Response> {
+  const t = await formToken(env, me.id);
+  return page("Post a job", `<h1>Post a job for AI agents</h1>
+<p class="mut">Signed in as ${esc(me.name)}. Free while we're in beta. Agents answer; you pick the answer you want.</p>
+${error ? `<div class="err">${esc(error)}</div>` : ""}
+<div class="ok" id="kept" hidden>We kept what you typed. Check it and press Post.</div>
+<form id="jobform" data-signedin="1" method="post" action="/post">
+<input type="hidden" name="t" value="${esc(t)}">
+${formFields(values)}
 <button type="submit">Post the job</button>
-</form>`, status);
+</form>
+<script>${DRAFT_JS}</script>`, status);
 }
 
 export async function handlePost(env: Env, me: Agent, request: Request): Promise<Response> {
@@ -189,6 +218,7 @@ export async function handlePost(env: Env, me: Agent, request: Request): Promise
     return postFormPage(env, me, values, "That form went stale. Please post again.", 403);
   try {
     const r = await postJobFromWeb(env.DB, me, env, values);
+    await trackPostFunnel(env.DB, "signup");
     return new Response(null, { status: 303, headers: { location: `/my-jobs/${r.bounty_id}?posted=1` } });
   } catch (e) {
     if (e instanceof OpError) return postFormPage(env, me, values, e.message, e.status);
@@ -198,7 +228,7 @@ export async function handlePost(env: Env, me: Agent, request: Request): Promise
 
 export async function myJobsPage(env: Env, me: Agent): Promise<Response> {
   const jobs = await myJobs(env.DB, me);
-  return page("My jobs", `<h1>My jobs</h1>
+  return page("My jobs", `<script>${RESUME_JS}</script><h1>My jobs</h1>
 <p><a class="btn" href="/post">Post a job</a></p>
 ${jobs.length
   ? jobs.map((j) => `<div class="card"><a href="/my-jobs/${esc(j.id)}"><strong>${esc(j.title)}</strong></a>

@@ -25,7 +25,7 @@ import {
 import { bountyPage } from "./dashboard.js";
 import { postSignedOutPage, postFormPage, handlePost, myJobsPage, myJobPage, handleReview, handleCancel } from "./webjobs.js";
 import { sitemapResponse } from "./sitemap.js";
-import { guideRoutes, isGuideSlug, trackGuide, GUIDES } from "./guides.js";
+import { guideRoutes, isGuideSlug, trackGuide, trackPostFunnel, GUIDES } from "./guides.js";
 import { qaSweep } from "./qa.js";
 import { createServer } from "./mcp.js";
 import { SERVER_NAME, SERVER_TITLE, SERVER_DESCRIPTION, SERVER_VERSION, SITE_URL, REPO_URL, SERVER_ICONS, ICON_SVG, iconPng } from "./listing.js";
@@ -1153,6 +1153,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         const [, prov, cb] = am;
         if (prov === "logout") return logout();
         if (!isProvider(prov)) throw new OpError(404, `unknown sign-in provider ${prov}`);
+        if (!cb && url.searchParams.get("from") === "post") ctx.waitUntil(trackPostFunnel(env.DB, "click"));
         return cb
           ? await oauthCallback(env, prov, request, url.origin)
           : await oauthStart(env, prov, url.origin, url.searchParams.get("link") ? "link" : "login");
@@ -1162,8 +1163,14 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // People post jobs from the website (src/webjobs.ts).
       if (url.pathname === "/post" || url.pathname === "/my-jobs" || url.pathname.startsWith("/my-jobs/")) {
         const me = await sessionAgent(env, request);
-        if (url.pathname === "/post" && request.method === "GET")
-          return me ? await postFormPage(env, me) : postSignedOutPage(env);
+        if (url.pathname === "/post" && request.method === "GET") {
+          if (!me) {
+            const bot = /bot|crawl|spider|slurp|preview|fetch|http|python|curl|wget|headless/i.test(request.headers.get("user-agent") ?? "");
+            ctx.waitUntil(trackPostFunnel(env.DB, bot ? "view_bot" : "view"));
+            return postSignedOutPage(env);
+          }
+          return await postFormPage(env, me);
+        }
         if (!me) return new Response(null, { status: 302, headers: { location: "/post" } });
         if (url.pathname === "/post" && request.method === "POST") return await handlePost(env, me, request);
         if (url.pathname === "/my-jobs" && request.method === "GET") return await myJobsPage(env, me);
