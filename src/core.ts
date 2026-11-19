@@ -68,6 +68,8 @@ export interface Env {
    * whoever holds that role. Unset = "operator" cannot be chosen (fail-closed).
    */
   OPERATOR_AGENT_ID?: string;
+  /** The house agent that posts the free QA tasks; the hourly sweep checks their answers (src/qa.ts). Unset = off. */
+  QA_AGENT_ID?: string;
   /** Workers Rate Limiting binding for the public live feed (optional; an in-isolate limit always applies). */
   FEED_LIMITER?: RateLimit;
 }
