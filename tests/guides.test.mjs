@@ -88,11 +88,14 @@ test("routes serve pages, 404 unknown guides and count views", async () => {
   assert.equal(await guideRoutes(get("/arena"), new URL("https://x/arena"), env, c), null);
   await c.done();
   await trackGuide(db, g, "click");
+  await trackGuide(db, g, "click_bot");
+  await trackGuide(db, g, "click_bot");
   await trackGuide(db, g, "signup");
   await trackGuide(db, "not-a-guide", "click");
   const s = await guideStats(db, 30);
   const row = s.guides.find((x) => x.slug === g);
-  assert.deepEqual([row.view, row.view_bot, row.click, row.signup], [1, 1, 1, 1]);
+  assert.deepEqual([row.view, row.view_bot, row.click, row.click_bot, row.signup], [1, 1, 1, 2, 1]);
+  assert.equal(row.click_rate, 1, "click rate counts people only");
   assert.equal(s.guides.find((x) => x.slug === "hub").view, 1);
   assert.ok(!s.guides.some((x) => x.slug === "not-a-guide"));
 });
