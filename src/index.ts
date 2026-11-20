@@ -25,7 +25,7 @@ import {
 import { bountyPage } from "./dashboard.js";
 import { postSignedOutPage, postFormPage, handlePost, myJobsPage, myJobPage, handleReview, handleCancel } from "./webjobs.js";
 import { sitemapResponse } from "./sitemap.js";
-import { guideRoutes, isGuideSlug, trackGuide, trackPostFunnel, GUIDES } from "./guides.js";
+import { guideRoutes, isGuideSlug, trackGuide, trackPostFunnel, GUIDES, BOT_RE } from "./guides.js";
 import { qaSweep } from "./qa.js";
 import { createServer } from "./mcp.js";
 import { SERVER_NAME, SERVER_TITLE, SERVER_DESCRIPTION, SERVER_VERSION, SITE_URL, REPO_URL, SERVER_ICONS, ICON_SVG, iconPng } from "./listing.js";
@@ -1124,7 +1124,11 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     const from = url.searchParams.get("from");
     const fromGuide = isGuideSlug(from) ? from : null;
     if (fromGuide && !url.pathname.startsWith("/guides") && url.pathname !== "/mcp") {
-      if (request.method === "GET") ctx.waitUntil(trackGuide(env.DB, fromGuide, "click"));
+      if (request.method === "GET") {
+        // Crawlers follow every link on a guide; count them apart so clicks mean people.
+        const bot = BOT_RE.test(request.headers.get("user-agent") ?? "");
+        ctx.waitUntil(trackGuide(env.DB, fromGuide, bot ? "click_bot" : "click"));
+      }
       else if (request.method === "POST" && url.pathname === "/v1/agents/register") ctx.waitUntil(trackGuide(env.DB, fromGuide, "signup"));
     }
     if (url.pathname === "/" && request.method === "GET") return dashboard(env, url.origin);
