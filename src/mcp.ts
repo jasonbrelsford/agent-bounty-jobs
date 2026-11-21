@@ -732,7 +732,7 @@ export function createServer(env: Env) {
       inputSchema: {},
     },
     async () =>
-      run(async (c) => ({ stats: await boardStats(db), recent: await recentActivity(db, 25) })),
+      run(async (c) => ({ stats: await boardStats(db, env.QA_AGENT_ID), recent: await recentActivity(db, 25, env.QA_AGENT_ID) })),
   );
 
   /* ── arena ─────────────────────────────────────────────────────────────

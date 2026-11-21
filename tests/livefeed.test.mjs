@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { makeD1 } from "./d1shim.mjs";
-import { registerAgent, authByKey, postBounty, submitToBounty, reviewSubmission } from "../.test-build/core.js";
+import { registerAgent, authByKey, postBounty, submitToBounty, reviewSubmission, boardStats, recentActivity } from "../.test-build/core.js";
 import { askQuestion, answerQuestion, sendMessage, adminHide } from "../.test-build/messaging.js";
 import {
   publicEvents, replayPool, feedResponse, WindowLimiter, coloAllow, FEED_LIMIT_PER_MIN, RequestCounter,
@@ -251,4 +251,35 @@ test("rate limit: the location-wide cache counter blocks past the limit and neve
     const r = await feedResponse({ DB: db }, req("198.51.100.7"), new URL("https://x/v1/events"), new WindowLimiter(), t0);
     assert.equal(r.status, 429);
   } finally { delete globalThis.caches; }
+});
+
+test("house QA tasks stay out of public stats, activity and the live feed", async () => {
+  const { db } = await busyBoard();
+  const qa = await agent(db, "lf-house-qa");
+  const solver = await agent(db, "lf-qa-solver");
+  const qb = await postBounty(db, qa.a, ENV, {
+    title: "QA-TASK-ZZ9 count the vowels", description: "House test task: count the vowels in the given word.",
+    category: "research", reward_amount_cents: 100,
+  });
+  await submitToBounty(db, solver.a, qb.bounty_id, "QA answer: the word has 3 vowels.", undefined, "QA answer: the word has three vowels, counted by hand.");
+
+  const all = await boardStats(db);
+  const real = await boardStats(db, qa.agent_id);
+  assert.equal(all.bounties.total_posted, real.bounties.total_posted + 1);
+  assert.equal(real.bounties.total_posted, 1);
+  assert.equal(real.house_qa_tasks.posted, 1);
+  assert.equal(all.house_qa_tasks.posted, 0);
+  assert.equal(real.submissions, all.submissions - 1);
+  assert.ok(real.events_last_24h < all.events_last_24h);
+
+  const act = await recentActivity(db, 200, qa.agent_id);
+  assert.ok(act.length > 0);
+  assert.ok(act.every((e) => e.bounty_id !== qb.bounty_id && e.agent_id !== qa.agent_id));
+  assert.ok((await recentActivity(db, 200)).some((e) => e.bounty_id === qb.bounty_id));
+
+  const feed = await publicEvents(db, null, 100, qa.agent_id);
+  assert.ok(feed.length > 0);
+  assert.ok(feed.every((e) => e.bounty_id !== qb.bounty_id));
+  assert.ok((await publicEvents(db, null, 100)).some((e) => e.bounty_id === qb.bounty_id));
+  assert.ok((await replayPool(db, 30, qa.agent_id)).every((e) => e.bounty_id !== qb.bounty_id));
 });

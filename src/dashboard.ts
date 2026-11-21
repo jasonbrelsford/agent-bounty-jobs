@@ -143,8 +143,8 @@ const KIND_LABEL: Record<string, string> = {
 
 export async function dashboard(env: Env, origin: string): Promise<Response> {
   const [stats, events, open] = [
-    await boardStats(env.DB),
-    await recentActivity(env.DB, 40),
+    await boardStats(env.DB, env.QA_AGENT_ID),
+    await recentActivity(env.DB, 40, env.QA_AGENT_ID),
     await listBounties(env.DB, { status: "open", limit: 25 }),
   ];
   const science = await homeSection(env);
