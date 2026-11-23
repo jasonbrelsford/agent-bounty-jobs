@@ -3181,19 +3181,41 @@ export async function adminRemoveBounty(db: D1Database, bountyId: string, reason
 
 // ── read models for the dashboard ───────────────────────────────────────────
 
-export async function boardStats(db: D1Database) {
+/**
+ * Board totals. The house QA tasks (posted and awarded by QA_AGENT_ID every hour)
+ * are counted apart, so the public numbers describe real posters' work.
+ */
+export async function boardStats(db: D1Database, qaAgentId?: string) {
   await expireOverdue(db);
   const dayAgo = new Date(Date.now() - 86_400_000).toISOString();
-  const [byStatus, agents, submissions, recent] = await db.batch([
-    db.prepare(
-      "SELECT status, COUNT(*) AS n, COALESCE(SUM(reward_amount_cents), 0) AS cents FROM bounties GROUP BY status",
-    ),
+  const qa = qaAgentId ?? null;
+  const [byStatus, agents, submissions, recent, qaRows] = await db.batch([
+    db
+      .prepare(
+        "SELECT status, COUNT(*) AS n, COALESCE(SUM(reward_amount_cents), 0) AS cents FROM bounties WHERE poster_id IS NOT ?1 GROUP BY status",
+      )
+      .bind(qa),
     db.prepare("SELECT COUNT(*) AS n FROM agents"),
-    db.prepare("SELECT COUNT(*) AS n FROM submissions"),
-    db.prepare("SELECT COUNT(*) AS n FROM events WHERE at > ?").bind(dayAgo),
+    db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM submissions s JOIN bounties b ON b.id = s.bounty_id WHERE b.poster_id IS NOT ?1",
+      )
+      .bind(qa),
+    db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM events e LEFT JOIN bounties b ON b.id = e.bounty_id " +
+          "WHERE e.at > ?2 AND (?1 IS NULL OR (e.agent_id IS NOT ?1 AND b.poster_id IS NOT ?1))",
+      )
+      .bind(qa, dayAgo),
+    db
+      .prepare(
+        "SELECT COUNT(*) AS posted, COALESCE(SUM(status = 'awarded'), 0) AS awarded FROM bounties WHERE poster_id IS ?1 AND ?1 IS NOT NULL",
+      )
+      .bind(qa),
   ]);
   const statusRows = (byStatus.results ?? []) as { status: string; n: number; cents: number }[];
   const get = (s: string) => statusRows.find((r) => r.status === s) ?? { n: 0, cents: 0 };
+  const q = (qaRows.results?.[0] as { posted: number; awarded: number } | undefined) ?? { posted: 0, awarded: 0 };
   return {
     bounties: {
       open: get("open").n,
@@ -3207,16 +3229,25 @@ export async function boardStats(db: D1Database) {
       awarded_stated_cents: get("awarded").cents,
       note: "stated by posters; settlement is off-platform during beta",
     },
+    house_qa_tasks: {
+      posted: q.posted ?? 0,
+      awarded: q.awarded ?? 0,
+      note: "free test tasks the board posts and checks itself; left out of the totals above",
+    },
     agents: ((agents.results?.[0] as { n: number } | undefined)?.n ?? 0),
     submissions: ((submissions.results?.[0] as { n: number } | undefined)?.n ?? 0),
     events_last_24h: ((recent.results?.[0] as { n: number } | undefined)?.n ?? 0),
   };
 }
 
-export async function recentActivity(db: D1Database, limit = 50): Promise<EventRow[]> {
+/** Latest events, leaving out the house QA tasks when qaAgentId is given. */
+export async function recentActivity(db: D1Database, limit = 50, qaAgentId?: string): Promise<EventRow[]> {
   const { results } = await db
-    .prepare("SELECT seq, at, kind, bounty_id, agent_id, detail FROM events ORDER BY seq DESC LIMIT ?")
-    .bind(Math.min(Math.max(1, limit), 200))
+    .prepare(
+      "SELECT e.seq, e.at, e.kind, e.bounty_id, e.agent_id, e.detail FROM events e LEFT JOIN bounties b ON b.id = e.bounty_id " +
+        "WHERE ?1 IS NULL OR (e.agent_id IS NOT ?1 AND b.poster_id IS NOT ?1) ORDER BY e.seq DESC LIMIT ?2",
+    )
+    .bind(qaAgentId ?? null, Math.min(Math.max(1, limit), 200))
     .all<EventRow>();
   return results;
 }

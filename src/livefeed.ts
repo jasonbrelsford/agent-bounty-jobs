@@ -82,7 +82,8 @@ const SELECT = `SELECT e.seq, e.at, e.kind, e.bounty_id, e.detail, a.kind AS age
 FROM events e
 LEFT JOIN agents a ON a.id = e.agent_id
 LEFT JOIN bounties b ON b.id = e.bounty_id
-WHERE e.kind IN (${KIND_LIST}) AND (b.status IS NULL OR b.status != 'removed')`;
+WHERE e.kind IN (${KIND_LIST}) AND (b.status IS NULL OR b.status != 'removed')
+  AND (?1 IS NULL OR (e.agent_id IS NOT ?1 AND b.poster_id IS NOT ?1))`;
 
 function view(r: Row): FeedEvent {
   // A human's display name comes from their OAuth profile — keep it off the feed.
@@ -98,21 +99,31 @@ function view(r: Row): FeedEvent {
   return ev;
 }
 
-/** Events after `since` (oldest first), or the latest `limit` when since is null. */
-export async function publicEvents(db: D1Database, since: number | null, limit = 40): Promise<FeedEvent[]> {
+/**
+ * Events after `since` (oldest first), or the latest `limit` when since is null.
+ * The house QA tasks (posted by qaAgentId every hour) are left out, so the feed
+ * shows real posters and agents rather than the board testing itself.
+ */
+export async function publicEvents(
+  db: D1Database, since: number | null, limit = 40, qaAgentId?: string,
+): Promise<FeedEvent[]> {
   const n = Math.min(Math.max(1, Math.floor(limit) || 40), 100);
+  const qa = qaAgentId ?? null;
   if (since == null) {
-    const { results } = await db.prepare(`${SELECT} ORDER BY e.seq DESC LIMIT ?`).bind(n).all<Row>();
+    const { results } = await db.prepare(`${SELECT} ORDER BY e.seq DESC LIMIT ?2`).bind(qa, n).all<Row>();
     return (results ?? []).map(view).reverse();
   }
-  const { results } = await db.prepare(`${SELECT} AND e.seq > ? ORDER BY e.seq ASC LIMIT ?`).bind(since, n).all<Row>();
+  const { results } = await db.prepare(`${SELECT} AND e.seq > ?2 ORDER BY e.seq ASC LIMIT ?3`).bind(qa, since, n).all<Row>();
   return (results ?? []).map(view);
 }
 
 /** The most interesting recent real events, oldest first, for the idle replay. */
-export async function replayPool(db: D1Database, size = 30): Promise<FeedEvent[]> {
+export async function replayPool(db: D1Database, size = 30, qaAgentId?: string): Promise<FeedEvent[]> {
   const from = new Date(Date.now() - 14 * 86_400_000).toISOString();
-  const { results } = await db.prepare(`${SELECT} AND e.at > ? ORDER BY e.seq DESC LIMIT 300`).bind(from).all<Row>();
+  const { results } = await db
+    .prepare(`${SELECT} AND e.at > ?2 ORDER BY e.seq DESC LIMIT 300`)
+    .bind(qaAgentId ?? null, from)
+    .all<Row>();
   const evs = (results ?? []).map(view);
   const score = (e: FeedEvent) => (REPLAY_SCORE[e.kind] ?? 0) + (e.question || e.answer ? 2 : 0);
   return evs
@@ -327,7 +338,7 @@ export async function coloAllow(key: string, now = Date.now(), limit = FEED_LIMI
   return n <= limit;
 }
 
-type FeedEnv = Pick<Env, "DB"> & { FEED_LIMITER?: RateLimit };
+type FeedEnv = Pick<Env, "DB" | "QA_AGENT_ID"> & { FEED_LIMITER?: RateLimit };
 
 const FEED_HEADERS = {
   "content-type": "application/json; charset=utf-8",
@@ -361,7 +372,7 @@ export async function feedResponse(
   const sinceRaw = url.searchParams.get("since");
   const since = sinceRaw != null && /^\d{1,12}$/.test(sinceRaw) ? Number(sinceRaw) : null;
   const reqSince = url.searchParams.get("req_since");
-  const events = await publicEvents(env.DB, since, Number(url.searchParams.get("limit") ?? 40));
+  const events = await publicEvents(env.DB, since, Number(url.searchParams.get("limit") ?? 40), env.QA_AGENT_ID);
   const requests = await requestAggregates(env.DB, reqSince, now);
   const body: Record<string, unknown> = {
     now: new Date(now).toISOString(),
@@ -371,6 +382,6 @@ export async function feedResponse(
     next_req_since: requests.length ? requests[requests.length - 1].minute : reqSince ?? minuteOf(now - SETTLE_MS),
     note: "Public board events and aggregate API request counts only. No submission content, private messages, contact details, keys or IPs.",
   };
-  if (url.searchParams.get("replay") === "1") body.replay = await replayPool(env.DB);
+  if (url.searchParams.get("replay") === "1") body.replay = await replayPool(env.DB, 30, env.QA_AGENT_ID);
   return new Response(JSON.stringify(body), { headers: FEED_HEADERS });
 }

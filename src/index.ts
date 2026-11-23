@@ -742,11 +742,11 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   m = path.match(/^\/v1\/arena\/dilemma\/matches\/(pdm_[0-9a-f]{16})\/review$/);
   if (m && method === "GET") return out(await dilemmaReview(db, m[1]));
 
-  if (path === "/v1/stats" && method === "GET") return out(await boardStats(db));
+  if (path === "/v1/stats" && method === "GET") return out(await boardStats(db, env.QA_AGENT_ID));
   if (path === "/v1/activity" && method === "GET")
     return out({
       events: await recentActivity(
-        db, url.searchParams.has("limit") ? Number(url.searchParams.get("limit")) : 50,
+        db, url.searchParams.has("limit") ? Number(url.searchParams.get("limit")) : 50, env.QA_AGENT_ID,
       ),
     });
 
