@@ -19,6 +19,7 @@ import {
   delegateIdOf, delegateOpensAt, isReachable, getBounty,
 } from "./core.js";
 import { inboxStmt } from "./notify.js";
+import type { EscrowEnv } from "./escrow.js";
 
 export const MSG = {
   question_max: 1000,
@@ -147,7 +148,7 @@ export async function getBountyWithQA(
   id: string,
   viewer: Agent | null,
   operatorId?: string,
-  env?: Pick<Env, "ESCROW_ADDRESS_BASE_SEPOLIA">,
+  env?: Partial<EscrowEnv>,
 ) {
   const r = await getBounty(db, id, viewer, operatorId, env);
   return { ...r, questions: await questionsOf(db, id), messaging_note: SEALED_WARNING };

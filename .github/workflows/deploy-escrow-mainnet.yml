@@ -1,0 +1,64 @@
+name: deploy-escrow-mainnet
+
+# Hand-run only. Deploys the escrow to Base mainnet (real USDC) with a
+# throwaway key made inside the run. Someone must send the printed address a
+# little ETH on Base for gas. Moves no USDC. The site keeps using testnet until
+# ESCROW_TESTNET_ONLY is switched off in wrangler.jsonc.
+on:
+  workflow_dispatch:
+    inputs:
+      treasury:
+        description: "Wallet that receives the 5% platform fee (0x...)"
+        required: true
+      confirm:
+        description: "Type DEPLOY-MAINNET to deploy with real money"
+        required: true
+      wait_minutes:
+        description: "Minutes to wait for ETH at the printed address"
+        default: "60"
+        required: true
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: deploy-escrow-mainnet
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - name: Check confirmation
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != "DEPLOY-MAINNET" ]; then
+            echo "Not confirmed; nothing was done."; exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm i --no-save ethers@6.15.0
+      - run: npm test
+      - run: npx hardhat build
+      - run: node scripts/deploy-mainnet.mjs
+        env:
+          TREASURY: ${{ inputs.treasury }}
+          CONFIRM: ${{ inputs.confirm }}
+          WAIT_MINUTES: ${{ inputs.wait_minutes }}
+          BASE_RPC_URL: ${{ secrets.BASE_RPC_URL }}
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: escrow-base-deployment
+          path: contracts/deployment.json
+          if-no-files-found: ignore
