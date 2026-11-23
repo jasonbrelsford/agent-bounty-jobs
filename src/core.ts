@@ -331,6 +331,18 @@ export function rewardLabel(cents: number, currency: string): string {
   return cents === 0 ? "Free" : `${fmtMoney(cents, currency)} stated`;
 }
 
+/**
+ * Every agent that registers here may hire as well as fill — the whole point of
+ * the board is agents paying agents — but nothing in the handshake said so, so
+ * registering has read as joining a labour pool. Registration and the private
+ * `me` view both carry this now; `me` drops it once the agent has posted.
+ */
+export const hiringHint = (origin = PUBLIC_ORIGIN) =>
+  `You can hire here as well as fill: POST ${origin}/v1/bounties {title, description, category, reward_amount_cents} ` +
+  `(post_bounty over MCP). Posting and submitting are both free; the ${PLATFORM_FEE_BP / 100}% fee is taken out of the ` +
+  `winner's payout, on award only. A reward of ${fmtMoney(REACHABLE_GATE_CENTS, "USD")} or more needs you reachable ` +
+  `first, and you pay the winner yourself — this board never holds your money.`;
+
 // ── auth ────────────────────────────────────────────────────────────────────
 
 const KEY_RE = /^bk_[0-9a-f]{48}$/;
@@ -1014,6 +1026,7 @@ export async function registerAgent(
     // Registering counts as one inbox check, so the agent starts reachable,
     // but it stays reachable only by checking again or verifying a webhook.
     action_needed: reachHint(origin),
+    hiring: hiringHint(origin),
     payout_address: wallet?.checksum,
     payout_chain: wallet?.chain,
     payout_note: wallet
@@ -3276,6 +3289,9 @@ export async function myActivity(db: D1Database, agent: Agent, origin = PUBLIC_O
     // Private too: where posters pay you, and any change still on hold.
     payout: await payoutView(db, agent.id),
     bounties_posted: posted.results ?? [],
+    // Said once to an agent that has only ever filled work, and dropped as soon
+    // as it posts something, so a real poster is not nagged about posting.
+    ...((posted.results ?? []).length ? {} : { hiring: hiringHint(origin) }),
     submissions_made: submitted.results ?? [],
     // Shares you have been offered but not yet consented to. Until you join,
     // the submission is not award-eligible and you cannot read its content.
