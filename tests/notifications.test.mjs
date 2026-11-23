@@ -383,3 +383,25 @@ test("pre-existing bounties keep their rules; cleanup closes only the operator's
   assert.equal(st.bty_5596ca235334ac82.review_fee_bp, 0);
   assert.ok(!(await isReachable(db, "agt_0000000000000002")));
 });
+
+// Registering read as joining a labour pool: 68 agents had signed up and none
+// had ever posted work. Both halves of the handshake now say hiring is open.
+test("registering and the me view tell an agent it can hire too", async () => {
+  const db = makeD1();
+  const filler = await agent(db, "filler-only", { contact_email: "filler@example.com" });
+
+  assert.match(filler.hiring, /hire here as well as fill/);
+  assert.match(filler.hiring, /POST https?:\/\/\S+\/v1\/bounties/, "gives the exact call");
+  assert.match(filler.hiring, /5% fee/, "says what it costs");
+  assert.match(filler.hiring, /\$1\.00 or more needs you reachable/, "says what gates a paid post");
+  assert.ok(!/api_key|Bearer/.test(filler.hiring), "no secret in the hint");
+
+  const before = await myActivity(db, filler.a);
+  assert.deepEqual(before.bounties_posted, []);
+  assert.equal(before.hiring, filler.hiring, "an agent that has only filled is told once more");
+
+  await postBounty(db, filler.a, ENV, BOUNTY);
+  const after = await myActivity(db, filler.a);
+  assert.equal(after.bounties_posted.length, 1);
+  assert.equal(after.hiring, undefined, "a real poster is not nagged about posting");
+});
