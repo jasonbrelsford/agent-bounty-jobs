@@ -15,7 +15,7 @@ import { checkPayoutAddress, toChecksumAddress } from "./wallet.js";
 import { inboxStmt, validateWebhookUrl, newWebhookSecret, WebhookError, eventView, type InboxRow } from "./notify.js";
 import {
   bountyEscrowRef, canPosterReadDeliverable, sweepEscrowReminders, finalizePaidEscrowSubmission,
-  escrowAddressOf, escrowSourcifyUrl, BASE_SEPOLIA_CHAIN_ID, type EscrowState,
+  escrowAddressOf, escrowSourcifyUrl, escrowChainIdOf, escrowNetworkOf, type EscrowEnv, type EscrowState,
 } from "./escrow.js";
 import { enforceAddressScreening, type ScreenFn } from "./sanctions.js";
 
@@ -49,11 +49,18 @@ export interface Env {
    */
   PLATFORM_FEE_ADDRESS?: string;
   BASE_RPC_URL?: string;
-  /** Base Sepolia BountyEscrow deployment (testnet only), USDC token override (tests), and read-only RPC URL. */
+  /** Base Sepolia BountyEscrow deployment, USDC token override (tests), and read-only RPC URL. */
   ESCROW_ADDRESS_BASE_SEPOLIA?: string;
   ESCROW_TOKEN_ADDRESS_BASE_SEPOLIA?: string;
-  ESCROW_TESTNET_ONLY?: string;
   BASE_SEPOLIA_RPC_URL?: string;
+  /**
+   * The real-money switch. Anything but "off" keeps escrow on Base Sepolia. "off"
+   * moves it to Base mainnet, which also needs the deployed contract's address and
+   * deploy block (contracts/deployments/base.json); without both, escrow is paused.
+   */
+  ESCROW_TESTNET_ONLY?: string;
+  ESCROW_ADDRESS_BASE?: string;
+  ESCROW_DEPLOY_BLOCK_BASE?: string;
   /** Read-only Base RPC + Chainalysis Sanctions Oracle address for wallet screening (#51). */
   SANCTIONS_RPC_URL?: string;
   SANCTIONS_ORACLE_ADDRESS?: string;
@@ -1488,7 +1495,7 @@ const PUBLIC_BOUNTY_COLS =
 // This column list is the ONLY way bounty rows reach public responses.
 
 export type PublicEscrowView = {
-  network: "base-sepolia";
+  network: "base" | "base-sepolia";
   chain_id: number;
   contract_address: string;
   sourcify_url: string;
@@ -1510,12 +1517,14 @@ export type PublicBounty = Bounty & {
   poster_unresponsive: number | boolean; poster_reachable: number | boolean;
   escrow_fee_split?: EscrowFeeSplit;
   escrow?: PublicEscrowView;
+  /** Set instead of `escrow` when real-money escrow is switched on but not configured. */
+  escrow_paused?: string;
 };
 
 /** SQLite hands back 0/1; the API speaks booleans. */
 function shapeBounty(
   b: PublicBounty & { has_milestones?: number | boolean },
-  env?: Pick<Env, "ESCROW_ADDRESS_BASE_SEPOLIA">,
+  env?: Partial<EscrowEnv>,
 ): PublicBounty {
   const hasMilestones = !!b.has_milestones;
   delete b.has_milestones;
@@ -1536,15 +1545,25 @@ function shapeBounty(
     const awaitingNewDeposit =
       (b.escrow_state == null || b.escrow_state === "unfunded") ||
       (b.escrow_state === "refunded" && b.accepted_agent_id != null);
-    const contractAddr =
-      !awaitingNewDeposit && b.escrow_contract
-        ? toChecksumAddress(b.escrow_contract)
-        : escrowAddressOf(env);
+    let contractAddr: string;
+    let chainId: number;
+    try {
+      contractAddr =
+        !awaitingNewDeposit && b.escrow_contract
+          ? toChecksumAddress(b.escrow_contract)
+          : escrowAddressOf(env);
+      chainId = escrowChainIdOf(contractAddr, env);
+    } catch (e) {
+      // A half-set real-money switch pauses escrow; listing and viewing jobs must keep working.
+      if (!(e instanceof OpError)) throw e;
+      b.escrow_paused = e.message;
+      return b;
+    }
     b.escrow = {
-      network: "base-sepolia",
-      chain_id: BASE_SEPOLIA_CHAIN_ID,
+      network: chainId === 8453 ? "base" : "base-sepolia",
+      chain_id: chainId,
       contract_address: contractAddr,
-      sourcify_url: escrowSourcifyUrl(contractAddr),
+      sourcify_url: escrowSourcifyUrl(contractAddr, chainId),
       ref: b.escrow_ref ?? bountyEscrowRef(b.id),
       state: ((b.escrow_state ?? "unfunded") as EscrowState),
       refund_reason: b.escrow_refund_reason ?? null,
@@ -1569,7 +1588,7 @@ function shapeBounty(
 export async function listBounties(
   db: D1Database,
   q: { status?: string; category?: string; limit?: number; audience?: string },
-  env?: Pick<Env, "ESCROW_ADDRESS_BASE_SEPOLIA">,
+  env?: Partial<EscrowEnv>,
 ): Promise<PublicBounty[]> {
   await expireOverdue(db);
   const status = q.status ?? "open";
@@ -1685,7 +1704,7 @@ export async function getBounty(
   id: string,
   viewer: Agent | null,
   operatorId?: string,
-  env?: Pick<Env, "ESCROW_ADDRESS_BASE_SEPOLIA">,
+  env?: Partial<EscrowEnv>,
 ): Promise<{
   bounty: PublicBounty;
   submissions?: Omit<Submission, "content">[] | Submission[];
@@ -1737,7 +1756,7 @@ export async function getBounty(
       submissions: await withTeams(db, shown as Submission[]),
       your_role: "poster",
       note: escrowBacked
-        ? `Escrow job #${bounty.escrow_job_id ?? "—"} (${bounty.escrow_state}): you review on previews. The full deliverable is released only after a confirmed Paid event (${MIN_CONFIRMATIONS} confirmations on Base Sepolia).`
+        ? `Escrow job #${bounty.escrow_job_id ?? "—"} (${bounty.escrow_state}): you review on previews. The full deliverable is released only after a confirmed Paid event (${MIN_CONFIRMATIONS} on-chain confirmations).`
         : "You review on previews. Awarding releases the winning submission's full content; it is final and cannot be undone.",
     };
   }
@@ -1819,7 +1838,7 @@ export async function acceptBounty(
   db: D1Database,
   agent: Agent,
   bountyId: string,
-  env?: Pick<Env, "ESCROW_ADDRESS_BASE_SEPOLIA">,
+  env?: Partial<EscrowEnv>,
 ) {
   await expireOverdue(db);
   const b = await db.prepare("SELECT * FROM bounties WHERE id = ?").bind(bountyId).first<Bounty>();
@@ -1888,7 +1907,7 @@ export async function acceptBounty(
       locked_units: ef.locked_units,
       locked_usdc: ef.locked_usdc,
       fund_url: `${PUBLIC_ORIGIN}/bounties/${bountyId}/fund`,
-      message: `Agent "${agent.name}" (${agent.id}) accepted "${b.title}". Lock ${ef.locked_usdc} USDC in BountyEscrow on Base Sepolia so work can begin.`,
+      message: `Agent "${agent.name}" (${agent.id}) accepted "${b.title}". Lock ${ef.locked_usdc} USDC in BountyEscrow so work can begin.`,
     }),
     eventStmt(db, at, "bounty_accepted", bountyId, agent.id, `agent "${agent.name}" accepted "${b.title}" for escrow`),
   ]);
@@ -2629,7 +2648,7 @@ export async function settlementInstruction(
   if (["funded", "submitted", "paid"].includes(b.escrow_state ?? "unfunded"))
     throw new OpError(
       409,
-      "this bounty has an active BountyEscrow job on Base Sepolia; call complete(jobId) or reject(jobId) on the escrow contract rather than paying direct settlement legs",
+      "this bounty has an active BountyEscrow job; call complete(jobId) or reject(jobId) on the escrow contract rather than paying direct settlement legs",
     );
   if (!env.PLATFORM_FEE_ADDRESS)
     throw new OpError(503, "on-chain settlement is not configured on this board");

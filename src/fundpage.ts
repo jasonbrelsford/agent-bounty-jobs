@@ -2,14 +2,15 @@
  * Fund this job page (`/bounties/:id/fund`) and exact-amount transaction builder (#49).
  *
  * Safety invariants:
- *  - Testnet (Base Sepolia, chain ID 84532) only while `ESCROW_TESTNET_ONLY` is on (default "on").
+ *  - Base Sepolia testnet while `ESCROW_TESTNET_ONLY` is on (the default). Base mainnet only when it is
+ *    exactly "off" AND the mainnet contract is configured; otherwise funding is refused (see escrowNetworkOf).
  *  - Never holds a private key and never signs or broadcasts a transaction from the Worker.
  *  - Step 1 (`USDC.approve`) is ALWAYS for the exact reward amount (`BigInt(reward_amount_cents) * 10_000n`),
  *    never larger and never unlimited (`maxUint256`). Verified by decoding calldata before returning
  *    and again on the client before prompting the wallet.
  *  - Step 2 (`BountyEscrow.fund`) always takes `agent` from the accepting agent's `agents.payout_address`
- *    in D1 (never from job descriptions, submissions, or messages) and `escrow` from the single config
- *    value `ESCROW_ADDRESS_BASE_SEPOLIA`.
+ *    in D1 (never from job descriptions, submissions, or messages) and `escrow` from the single
+ *    configured contract for the current network.
  */
 import {
   createPublicClient,
@@ -24,7 +25,7 @@ import {
   type EIP1193Provider,
   type Hex,
 } from "viem";
-import { baseSepolia } from "viem/chains";
+import { base, baseSepolia } from "viem/chains";
 import { sessionAgent } from "./auth.js";
 import {
   type Env,
@@ -39,17 +40,24 @@ import {
   unitsToUsdc,
 } from "./core.js";
 import {
+  BASE_CHAIN_ID,
   BASE_SEPOLIA_CHAIN_ID,
+  BASE_SEPOLIA_CHAIN_HEX,
   ESCROW_MAX_UNITS,
   ESCROW_MIN_UNITS,
-  USDC_BASE_SEPOLIA,
   bountyEscrowRef,
-  escrowAddressOf,
+  escrowNetworkOf,
   escrowSourcifyUrl,
+  isEscrowTestnetOnly,
+  type EscrowEnv,
+  type EscrowNetwork,
 } from "./escrow.js";
 import { screenBountyFundingWallet, type ScreenFn } from "./sanctions.js";
 
-export const BASE_SEPOLIA_CHAIN_HEX = "0x14a34";
+export { BASE_SEPOLIA_CHAIN_HEX, isEscrowTestnetOnly };
+
+/** viem chain object for a network, for the wallet client. */
+const viemChainOf = (chainId: number) => (chainId === BASE_CHAIN_ID ? base : baseSepolia);
 
 /** Plain warnings required verbatim on `/bounties/:id/fund` (#49). */
 export const EXACT_APPROVE_WARNING = "We only ever ask you to approve this exact amount";
@@ -82,6 +90,8 @@ export type FundPageConfig = {
   bounty_id: string;
   chain_id: number;
   chain_id_hex: string;
+  /** "Base" or "Base Sepolia testnet". */
+  network_label: string;
   testnet_only: boolean;
   escrow_address: Address;
   sourcify_url: string;
@@ -100,20 +110,8 @@ export type FundPageConfig = {
   bounty_url: string;
 };
 
-export function escrowTokenAddressOf(
-  env?: Pick<Env, "ESCROW_TOKEN_ADDRESS_BASE_SEPOLIA">,
-): Address {
-  const raw = env?.ESCROW_TOKEN_ADDRESS_BASE_SEPOLIA?.trim() || USDC_BASE_SEPOLIA;
-  if (!/^0x[0-9a-fA-F]{40}$/.test(raw)) {
-    throw new OpError(500, "ESCROW_TOKEN_ADDRESS_BASE_SEPOLIA is not a valid 0x address");
-  }
-  return getAddress(raw);
-}
-
-/** True unless `ESCROW_TESTNET_ONLY` is explicitly set to `"off"`. Defaults to `"on"` (fail-closed to testnet). */
-export function isEscrowTestnetOnly(env?: Pick<Env, "ESCROW_TESTNET_ONLY">): boolean {
-  const raw = (env?.ESCROW_TESTNET_ONLY ?? "on").trim().toLowerCase();
-  return raw !== "off";
+export function escrowTokenAddressOf(env?: Partial<EscrowEnv>): Address {
+  return getAddress(escrowNetworkOf(env).tokenAddress);
 }
 
 export function parseChainIdInput(raw: unknown): number | null {
@@ -133,26 +131,24 @@ export function parseChainIdInput(raw: unknown): number | null {
 }
 
 /**
- * Enforce that funding only happens on Base Sepolia (84532) while the testnet flag is on.
+ * Enforce that funding happens only on the escrow's current chain. `true` (or no
+ * network) means testnet mode: Base Sepolia only. A network means exactly its chain.
  */
-export function assertAllowedFundingChain(chainIdRaw: unknown, testnetOnly = true): number {
+export function assertAllowedFundingChain(chainIdRaw: unknown, net: boolean | EscrowNetwork = true): number {
+  const want = typeof net === "object" ? net : escrowNetworkOf({ ESCROW_TESTNET_ONLY: "on" });
   const chainId = parseChainIdInput(chainIdRaw);
   if (chainId === null) {
-    throw new OpError(400, "chain_id is required (expected Base Sepolia 84532 / 0x14a34)");
+    throw new OpError(400, `chain_id is required (expected ${want.label} ${want.chainId} / ${want.chainHex})`);
   }
-  if (testnetOnly && chainId !== BASE_SEPOLIA_CHAIN_ID) {
+  if (chainId !== want.chainId) {
     throw new OpError(
       409,
-      `Testnet mode is active: only Base Sepolia (chain ID ${BASE_SEPOLIA_CHAIN_ID} / ${BASE_SEPOLIA_CHAIN_HEX}) is accepted, got chain ID ${chainId}. Switch your wallet to Base Sepolia.`,
+      want.mainnet
+        ? `Real-money escrow runs on Base (chain ID ${want.chainId} / ${want.chainHex}); got chain ID ${chainId}. Switch your wallet to Base.`
+        : `Testnet mode is active: only Base Sepolia (chain ID ${BASE_SEPOLIA_CHAIN_ID} / ${BASE_SEPOLIA_CHAIN_HEX}) is accepted, got chain ID ${chainId}. Switch your wallet to Base Sepolia.`,
     );
   }
-  if (chainId !== BASE_SEPOLIA_CHAIN_ID) {
-    throw new OpError(
-      409,
-      `Only Base Sepolia (chain ID ${BASE_SEPOLIA_CHAIN_ID}) has a configured BountyEscrow contract.`,
-    );
-  }
-  return BASE_SEPOLIA_CHAIN_ID;
+  return want.chainId;
 }
 
 /**
@@ -190,7 +186,10 @@ export function buildEscrowFundingTransactions(params: {
   exactAmountUnits: bigint;
   deadlineUnix: number;
   ref: string;
+  /** The escrow's chain; Base Sepolia when omitted. */
+  chainId?: number;
 }): [EscrowPreparedStep, EscrowPreparedStep] {
+  const stepChainId = params.chainId ?? BASE_SEPOLIA_CHAIN_ID;
   const { exactAmountUnits, deadlineUnix } = params;
   if (exactAmountUnits <= 0n || exactAmountUnits >= maxUint256) {
     throw new OpError(400, "exactAmountUnits must be a positive exact USDC amount, never unlimited");
@@ -266,7 +265,7 @@ export function buildEscrowFundingTransactions(params: {
       step: 1,
       action: "approve",
       label: `Approve exact ${exactUsdc} USDC to BountyEscrow`,
-      chainId: BASE_SEPOLIA_CHAIN_ID,
+      chainId: stepChainId,
       to: checksumToken,
       data: approveData,
       value: "0x0",
@@ -275,7 +274,7 @@ export function buildEscrowFundingTransactions(params: {
       step: 2,
       action: "fund",
       label: `Lock ${exactUsdc} USDC in BountyEscrow`,
-      chainId: BASE_SEPOLIA_CHAIN_ID,
+      chainId: stepChainId,
       to: checksumEscrow,
       data: fundData,
       value: "0x0",
@@ -284,7 +283,7 @@ export function buildEscrowFundingTransactions(params: {
 }
 
 /**
- * Screen the poster's wallet (#51), enforce Base Sepolia testnet-only mode, and
+ * Screen the poster's wallet (#51), enforce the escrow's current chain, and
  * return the exact `approve` + `fund` transactions for `/bounties/:id/fund`.
  */
 export async function prepareBountyFunding(
@@ -294,8 +293,9 @@ export async function prepareBountyFunding(
   callerAgentId: string | null = null,
   opts: { screen?: ScreenFn; nowSec?: number } = {},
 ) {
-  const testnetOnly = isEscrowTestnetOnly(env);
-  const chainId = assertAllowedFundingChain(input.chain_id, testnetOnly);
+  const net = escrowNetworkOf(env);
+  const testnetOnly = !net.mainnet;
+  const chainId = assertAllowedFundingChain(input.chain_id, net);
 
   const b = await env.DB
     .prepare("SELECT * FROM bounties WHERE id = ?")
@@ -333,7 +333,7 @@ export async function prepareBountyFunding(
   if (exactAmountUnits < ESCROW_MIN_UNITS || exactAmountUnits > ESCROW_MAX_UNITS) {
     throw new OpError(
       409,
-      `BountyEscrow testnet launch limits require a reward between ${unitsToUsdc(ESCROW_MIN_UNITS)} and ${unitsToUsdc(ESCROW_MAX_UNITS)} USDC`,
+      `BountyEscrow launch limits require a reward between ${unitsToUsdc(ESCROW_MIN_UNITS)} and ${unitsToUsdc(ESCROW_MAX_UNITS)} USDC`,
     );
   }
 
@@ -348,8 +348,8 @@ export async function prepareBountyFunding(
     { screen: opts.screen },
   );
 
-  const escrowAddress = getAddress(escrowAddressOf(env));
-  const tokenAddress = escrowTokenAddressOf(env);
+  const escrowAddress = getAddress(net.escrowAddress);
+  const tokenAddress = getAddress(net.tokenAddress);
   const agentPayoutAddress = getAddress(screened.agent_payout_address);
   const ref = (b.escrow_ref ?? bountyEscrowRef(b.id)).toLowerCase() as Hex;
   const deadlineUnix = computeEscrowDeadlineUnix(b.deadline, opts.nowSec);
@@ -362,15 +362,16 @@ export async function prepareBountyFunding(
     exactAmountUnits,
     deadlineUnix,
     ref,
+    chainId: net.chainId,
   });
 
   return {
     bounty_id: b.id,
     chain_id: chainId,
-    chain_id_hex: BASE_SEPOLIA_CHAIN_HEX,
+    chain_id_hex: net.chainHex,
     testnet_only: testnetOnly,
     escrow_address: escrowAddress,
-    sourcify_url: escrowSourcifyUrl(escrowAddress),
+    sourcify_url: escrowSourcifyUrl(escrowAddress, net.chainId),
     token_address: tokenAddress,
     funding_address: getAddress(screened.funding_address),
     agent_id: b.accepted_agent_id,
@@ -456,7 +457,7 @@ const CLIENT_JS = `(() => {
     }
     const spender = ("0x" + data1.slice(34, 74)).toLowerCase();
     if (spender !== String(cfg.escrow_address).toLowerCase()) {
-      throw new Error("Refused: Step 1 spender does not match ESCROW_ADDRESS_BASE_SEPOLIA.");
+      throw new Error("Refused: Step 1 spender does not match the configured escrow contract.");
     }
     const exact = BigInt(cfg.exact_amount_units);
     const approveAmount = BigInt("0x" + data1.slice(74, 138));
@@ -465,7 +466,7 @@ const CLIENT_JS = `(() => {
     }
 
     if (!step2 || step2.value !== "0x0" || String(step2.to || "").toLowerCase() !== String(cfg.escrow_address).toLowerCase()) {
-      throw new Error("Refused: Step 2 target does not match ESCROW_ADDRESS_BASE_SEPOLIA.");
+      throw new Error("Refused: Step 2 target does not match the configured escrow contract.");
     }
     const data2 = String(step2.data || "");
     if (!/^0x3c1491ff[0-9a-fA-F]{256}$/.test(data2) || data2.slice(10, 34) !== "000000000000000000000000") {
@@ -499,20 +500,20 @@ const CLIENT_JS = `(() => {
       return;
     }
     if (!onRightChain) {
-      setStatus("Connected " + account + " on chain " + currentChainId + " — Base Sepolia (" + cfg.chain_id + ") required.");
+      setStatus("Connected " + account + " on chain " + currentChainId + " — " + cfg.network_label + " (" + cfg.chain_id + ") required.");
       if (cfg.testnet_only) {
-        setErr("Testnet mode is on: switch your wallet to Base Sepolia (chain ID " + cfg.chain_id + ") before funding.");
+        setErr("Switch your wallet to " + cfg.network_label + " (chain ID " + cfg.chain_id + ") before funding.");
       }
       return;
     }
     setErr("");
-    setStatus("Connected " + account + " on Base Sepolia (chain ID " + cfg.chain_id + "). Ready to fund.");
+    setStatus("Connected " + account + " on " + cfg.network_label + " (chain ID " + cfg.chain_id + "). Ready to fund.");
   }
 
   async function refreshWallet(requestAccounts) {
     const eth = window.ethereum;
     if (!eth || typeof eth.request !== "function") {
-      setErr("No injected wallet found. Open this page with Coinbase Wallet, MetaMask, or another Base Sepolia wallet.");
+      setErr("No injected wallet found. Open this page with Coinbase Wallet, MetaMask, or another wallet on " + cfg.network_label + ".");
       return;
     }
     const accounts = await eth.request({ method: requestAccounts ? "eth_requestAccounts" : "eth_accounts" });
@@ -574,7 +575,7 @@ const CLIENT_JS = `(() => {
         const chainNow = parseChain(await eth.request({ method: "eth_chainId" }));
         currentChainId = chainNow;
         if (chainNow !== cfg.chain_id) {
-          throw new Error("Refusing chain " + chainNow + ": Base Sepolia (" + cfg.chain_id + ") is required while testnet is on.");
+          throw new Error("Refusing chain " + chainNow + ": " + cfg.network_label + " (" + cfg.chain_id + ") is required.");
         }
         setStatus("Checking wallet & preparing exact transactions…");
         const prepRes = await fetch(cfg.prepare_url, {
@@ -590,7 +591,7 @@ const CLIENT_JS = `(() => {
         verifyPreparedSteps(step1, step2);
 
         const chainBeforeApprove = parseChain(await eth.request({ method: "eth_chainId" }));
-        if (chainBeforeApprove !== cfg.chain_id) throw new Error("Wallet switched away from Base Sepolia.");
+        if (chainBeforeApprove !== cfg.chain_id) throw new Error("Wallet switched away from " + cfg.network_label + ".");
         setStatus("Step 1/2: Confirm exact " + cfg.exact_amount_usdc + " USDC approve in your wallet…");
         const approveTx = await eth.request({
           method: "eth_sendTransaction",
@@ -600,7 +601,7 @@ const CLIENT_JS = `(() => {
         await waitReceipt(eth, approveTx, 1);
 
         const chainBeforeFund = parseChain(await eth.request({ method: "eth_chainId" }));
-        if (chainBeforeFund !== cfg.chain_id) throw new Error("Wallet switched away from Base Sepolia.");
+        if (chainBeforeFund !== cfg.chain_id) throw new Error("Wallet switched away from " + cfg.network_label + ".");
         setStatus("Step 2/2: Confirm BountyEscrow.fund(" + cfg.exact_amount_usdc + " USDC) in your wallet…");
         const fundTx = await eth.request({
           method: "eth_sendTransaction",
@@ -635,10 +636,10 @@ const CLIENT_JS = `(() => {
           await new Promise((res) => setTimeout(res, 2000));
         }
         if (synced) {
-          setOk("Job funded on Base Sepolia (tx " + fundTx + "). The board now shows this job funded.");
+          setOk("Job funded on " + cfg.network_label + " (tx " + fundTx + "). The board now shows this job funded.");
           setStatus("Funded.");
         } else {
-          setOk("Deposit confirmed on Base Sepolia (tx " + fundTx + "). Board RPC is catching up and will mark this job funded automatically.");
+          setOk("Deposit confirmed on " + cfg.network_label + " (tx " + fundTx + "). Board RPC is catching up and will mark this job funded automatically.");
           setStatus("Funded on-chain — awaiting board RPC sync.");
         }
       } catch (e) {
@@ -657,14 +658,15 @@ const CLIENT_JS = `(() => {
   }
 })();`;
 
-function htmlShell(title: string, inner: string, status = 200): Response {
+function htmlShell(title: string, inner: string, status = 200, net?: EscrowNetwork): Response {
+  const netNote = net?.mainnet ? "Real USDC on Base" : "Base Sepolia testnet only";
   return new Response(
     `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
       `<meta name="viewport" content="width=device-width,initial-scale=1">` +
       `<meta name="robots" content="noindex">` +
       `<title>${esc(title)} — Agent Bounty Jobs</title>` +
       `<style>${CSS}</style></head><body>` +
-      `<p class="mut"><a href="/">Agent Bounty Jobs</a> · <span class="mut">Base Sepolia testnet only</span></p>` +
+      `<p class="mut"><a href="/">Agent Bounty Jobs</a> · <span class="mut">${netNote}</span></p>` +
       `${inner}</body></html>`,
     {
       status,
@@ -676,12 +678,13 @@ function htmlShell(title: string, inner: string, status = 200): Response {
   );
 }
 
-function renderWarnings(escrowAddress: Address, sourcifyUrl: string): string {
+function renderWarnings(escrowAddress: Address, sourcifyUrl: string, net: EscrowNetwork): string {
   return (
     `<div class="warn"><strong>${esc(EXACT_APPROVE_WARNING)}.</strong> Step 1 approves strictly the exact USDC reward — never an unlimited allowance.</div>` +
     `<div class="warn"><strong>${esc(NEVER_PAY_DESCRIPTION_WARNING)}.</strong> Both the escrow contract and the accepting agent's payout wallet come only from verified board records, never from free-form text.</div>` +
     `<div class="card"><dl class="kv">` +
-    `<dt>Network</dt><dd>Base Sepolia testnet (chain ID <code>${BASE_SEPOLIA_CHAIN_ID}</code> / <code>${BASE_SEPOLIA_CHAIN_HEX}</code>)</dd>` +
+    `<dt>Network</dt><dd>${esc(net.label)} (chain ID <code>${net.chainId}</code> / <code>${esc(net.chainHex)}</code>)</dd>` +
+    (net.mainnet ? `<dt>Money</dt><dd><strong>Real USDC.</strong> What you lock is real money, held by the contract until the work is approved or the deadline refunds you.</dd>` : "") +
     `<dt>Escrow contract</dt><dd><code>${esc(escrowAddress)}</code> · <a href="${esc(sourcifyUrl)}">Verified source on Sourcify</a></dd>` +
     `</dl></div>`
   );
@@ -696,12 +699,22 @@ export async function fundBountyPage(
   bountyId: string,
 ): Promise<Response> {
   const me = await sessionAgent(env, request);
+  let net: EscrowNetwork;
+  try {
+    net = escrowNetworkOf(env);
+  } catch (e) {
+    if (e instanceof OpError) {
+      return htmlShell("Escrow paused", `<h1>Escrow is paused</h1><div class="err">${esc(e.message)}</div><p><a href="/bounties/${esc(bountyId)}">Back to the job page</a></p>`, e.status);
+    }
+    throw e;
+  }
+  const shell = (title: string, inner: string, status = 200) => htmlShell(title, inner, status, net);
   let r: Awaited<ReturnType<typeof getBounty>>;
   try {
     r = await getBounty(env.DB, bountyId, me, env.OPERATOR_AGENT_ID, env);
   } catch (e) {
     if (e instanceof OpError && e.status === 404) {
-      return htmlShell(
+      return shell(
         "No such bounty",
         `<h1>No such bounty</h1><p><a href="/">Back to the board</a></p>`,
         404,
@@ -711,12 +724,12 @@ export async function fundBountyPage(
   }
 
   const b = r.bounty;
-  const escrowAddress = getAddress(escrowAddressOf(env));
-  const sourcifyUrl = escrowSourcifyUrl(escrowAddress);
-  const warningsHtml = renderWarnings(escrowAddress, sourcifyUrl);
+  const escrowAddress = getAddress(net.escrowAddress);
+  const sourcifyUrl = escrowSourcifyUrl(escrowAddress, net.chainId);
+  const warningsHtml = renderWarnings(escrowAddress, sourcifyUrl, net);
 
   if (me && me.id !== b.poster_id) {
-    return htmlShell(
+    return shell(
       `Fund ${b.title}`,
       `<h1>Fund this job</h1>` +
         `<div class="err">You are signed in as <strong>${esc(me.name)}</strong>, not this job's poster. Only the poster should lock escrow funds for this job.</div>` +
@@ -732,7 +745,7 @@ export async function fundBountyPage(
     .first<{ x: number }>();
 
   if (b.settlement_mode !== "onchain" || b.reward_amount_cents <= 0 || milestoneHit) {
-    return htmlShell(
+    return shell(
       `Fund ${b.title}`,
       `<h1>${esc(b.title)}</h1>` +
         `<div class="err">This bounty does not use single-job on-chain <code>BountyEscrow</code> funding.</div>` +
@@ -744,17 +757,17 @@ export async function fundBountyPage(
 
   const escrowState = b.escrow?.state ?? b.escrow_state ?? "unfunded";
   if (escrowState === "funded" || escrowState === "submitted" || escrowState === "paid") {
-    return htmlShell(
+    return shell(
       `Funded · ${b.title}`,
       `<h1>${esc(b.title)}</h1>` +
-        `<div class="ok">This job's escrow on Base Sepolia is already <strong>${esc(escrowState)}</strong>${b.escrow_job_id != null ? ` (job #${esc(String(b.escrow_job_id))})` : ""}${b.escrow_funding_tx ? ` · tx <code>${esc(b.escrow_funding_tx)}</code>` : ""}.</div>` +
+        `<div class="ok">This job's escrow on ${esc(net.label)} is already <strong>${esc(escrowState)}</strong>${b.escrow_job_id != null ? ` (job #${esc(String(b.escrow_job_id))})` : ""}${b.escrow_funding_tx ? ` · tx <code>${esc(b.escrow_funding_tx)}</code>` : ""}.</div>` +
         warningsHtml +
         `<p><a class="btn ghost" href="/bounties/${esc(b.id)}">View job on the board</a></p>`,
     );
   }
 
   if (b.status !== "open") {
-    return htmlShell(
+    return shell(
       `Fund ${b.title}`,
       `<h1>${esc(b.title)}</h1>` +
         `<div class="err">This job is <strong>${esc(b.status)}</strong> and can no longer be funded.</div>` +
@@ -765,7 +778,7 @@ export async function fundBountyPage(
   }
 
   if (!b.accepted_agent_id) {
-    return htmlShell(
+    return shell(
       `Waiting for acceptance · ${b.title}`,
       `<h1>Fund: ${esc(b.title)}</h1>` +
         `<div class="card"><strong>Waiting for an agent to accept this job.</strong><p class="mut" style="margin:.4rem 0 0">Once an agent with a Base payout wallet accepts this bounty via <code>accept_bounty</code> or <code>POST /v1/bounties/${esc(b.id)}/accept</code>, return here to lock the exact reward in <code>BountyEscrow</code>.</p></div>` +
@@ -780,7 +793,7 @@ export async function fundBountyPage(
     .bind(b.accepted_agent_id)
     .first<{ id: string; name: string; payout_address: string | null }>();
   if (!filler?.payout_address) {
-    return htmlShell(
+    return shell(
       `Fund ${b.title}`,
       `<h1>Fund: ${esc(b.title)}</h1>` +
         `<div class="err">The accepting agent has not set a valid Base payout address yet.</div>` +
@@ -792,17 +805,17 @@ export async function fundBountyPage(
 
   const exactUnits = BigInt(b.reward_amount_cents) * UNITS_PER_CENT;
   if (exactUnits < ESCROW_MIN_UNITS || exactUnits > ESCROW_MAX_UNITS) {
-    return htmlShell(
+    return shell(
       `Fund ${b.title}`,
       `<h1>Fund: ${esc(b.title)}</h1>` +
-        `<div class="err">Reward (${esc(rewardLabel(b.reward_amount_cents, b.reward_currency))}) is outside the Base Sepolia testnet launch bounds (${unitsToUsdc(ESCROW_MIN_UNITS)}–${unitsToUsdc(ESCROW_MAX_UNITS)} USDC).</div>` +
+        `<div class="err">Reward (${esc(rewardLabel(b.reward_amount_cents, b.reward_currency))}) is outside the BountyEscrow launch bounds (${unitsToUsdc(ESCROW_MIN_UNITS)}–${unitsToUsdc(ESCROW_MAX_UNITS)} USDC).</div>` +
         warningsHtml +
         `<p><a href="/bounties/${esc(b.id)}">Back to the job page</a></p>`,
       409,
     );
   }
 
-  const tokenAddress = escrowTokenAddressOf(env);
+  const tokenAddress = getAddress(net.tokenAddress);
   const agentChecksum = getAddress(filler.payout_address);
   const treasuryChecksum =
     env.PLATFORM_FEE_ADDRESS && /^0x[0-9a-fA-F]{40}$/.test(env.PLATFORM_FEE_ADDRESS)
@@ -813,7 +826,7 @@ export async function fundBountyPage(
     agentChecksum === tokenAddress ||
     (treasuryChecksum && agentChecksum === treasuryChecksum)
   ) {
-    return htmlShell(
+    return shell(
       `Fund ${b.title}`,
       `<h1>Fund: ${esc(b.title)}</h1>` +
         `<div class="err">The accepting agent's payout address conflicts with the escrow, token, or treasury contract and cannot receive funds.</div>` +
@@ -824,12 +837,13 @@ export async function fundBountyPage(
   }
   const feeSplit = escrowFeeSplit(b.reward_amount_cents, b.fee_bp);
   const ref = (b.escrow_ref ?? bountyEscrowRef(b.id)).toLowerCase() as Hex;
-  const testnetOnly = isEscrowTestnetOnly(env);
+  const testnetOnly = !net.mainnet;
 
   const cfg: FundPageConfig = {
     bounty_id: b.id,
-    chain_id: BASE_SEPOLIA_CHAIN_ID,
-    chain_id_hex: BASE_SEPOLIA_CHAIN_HEX,
+    chain_id: net.chainId,
+    chain_id_hex: net.chainHex,
+    network_label: net.label,
     testnet_only: testnetOnly,
     escrow_address: escrowAddress,
     sourcify_url: sourcifyUrl,
@@ -849,7 +863,7 @@ export async function fundBountyPage(
   };
 
   const inner =
-    `<h1>Fund this job (Base Sepolia testnet)</h1>` +
+    `<h1>Fund this job (${esc(net.label)})</h1>` +
     `<p class="mut">Job <code>${esc(b.id)}</code> · <strong>${esc(b.title)}</strong></p>` +
     warningsHtml +
     `<div class="card"><h2>Exact deposit summary</h2><dl class="kv">` +
@@ -862,20 +876,20 @@ export async function fundBountyPage(
     `<div class="card"><h2>Two wallet transactions</h2>` +
     `<div class="step"><strong>Step 1 — Exact USDC approval:</strong> <code>approve(${esc(escrowAddress)}, ${esc(exactUnits.toString())})</code> (${esc(feeSplit.locked_usdc)} USDC, never unlimited)</div>` +
     `<div class="step"><strong>Step 2 — Lock in BountyEscrow:</strong> <code>fund(${esc(agentChecksum)}, ${esc(exactUnits.toString())}, deadline, ${esc(ref)})</code></div>` +
-    `<p id="wallet-status" class="mut">Connect your Base Sepolia wallet (Coinbase Wallet, MetaMask, or compatible EIP-1193 wallet) to begin.</p>` +
+    `<p id="wallet-status" class="mut">Connect your ${esc(net.label)} wallet (Coinbase Wallet, MetaMask, or compatible EIP-1193 wallet) to begin.</p>` +
     `<div id="wallet-error" class="err" hidden></div>` +
     `<div id="wallet-ok" class="ok" hidden></div>` +
     `<p>` +
     `<button type="button" id="btn-connect" class="ghost">Connect wallet</button>` +
-    `<button type="button" id="btn-switch-chain" class="ghost" hidden>Switch to Base Sepolia</button>` +
+    `<button type="button" id="btn-switch-chain" class="ghost" hidden>Switch to ${esc(net.label)}</button>` +
     `<button type="button" id="btn-fund" disabled>Approve &amp; fund ${esc(feeSplit.locked_usdc)} USDC</button>` +
     `</p></div>` +
-    `<p class="mut">This site never holds a private key and never sends transactions itself. After ${MIN_CONFIRMATIONS} Base Sepolia block confirmations, the board records your job as funded.</p>` +
+    `<p class="mut">This site never holds a private key and never sends transactions itself. After ${MIN_CONFIRMATIONS} ${esc(net.label)} block confirmations, the board records your job as funded.</p>` +
     `<p><a href="/bounties/${esc(b.id)}">Back to the job page</a>${me ? ` · <a href="/my-jobs/${esc(b.id)}">My job page</a>` : ""}</p>` +
     `<script id="fund-config" type="application/json">${jsonForScript(cfg)}</script>` +
     `<script type="module">${CLIENT_JS}</script>`;
 
-  return htmlShell(`Fund ${b.title}`, inner);
+  return shell(`Fund ${b.title}`, inner);
 }
 
 /** Extract the embedded `FundPageConfig` JSON from a rendered `/bounties/:id/fund` HTML response. */
@@ -904,7 +918,7 @@ export async function fundJobFromPage(params: {
 
   // Verify the rendered page itself displays the full checksummed escrow address, Sourcify link, and both warnings.
   if (!pageHtml.includes(cfg.escrow_address)) {
-    throw new Error("Rendered fund page is missing full checksummed ESCROW_ADDRESS_BASE_SEPOLIA");
+    throw new Error("Rendered fund page is missing the full checksummed escrow address");
   }
   if (!pageHtml.includes(cfg.sourcify_url)) {
     throw new Error("Rendered fund page is missing Sourcify verified source link");
@@ -914,14 +928,24 @@ export async function fundJobFromPage(params: {
   }
 
   const rawChainHex = await ethereum.request({ method: "eth_chainId" });
-  const connectedChainId = assertAllowedFundingChain(rawChainHex, cfg.testnet_only);
+  // The page's own config names the chain; testnet keeps the original guard and wording.
+  const connectedChainId = cfg.testnet_only
+    ? assertAllowedFundingChain(rawChainHex, true)
+    : parseChainIdInput(rawChainHex);
+  if (connectedChainId !== cfg.chain_id) {
+    throw new OpError(
+      409,
+      `Real-money escrow runs on ${cfg.network_label} (chain ID ${cfg.chain_id} / ${cfg.chain_id_hex}); the wallet is on ${String(rawChainHex)}. Switch your wallet to ${cfg.network_label}.`,
+    );
+  }
+  const chain = viemChainOf(cfg.chain_id);
 
   const walletClient = createWalletClient({
-    chain: baseSepolia,
+    chain,
     transport: custom(ethereum),
   });
   const publicClient = createPublicClient({
-    chain: baseSepolia,
+    chain,
     transport: custom(ethereum),
   });
 
@@ -993,7 +1017,7 @@ export async function fundJobFromPage(params: {
 
   const approveTxHash = await walletClient.sendTransaction({
     account: posterAccount,
-    chain: baseSepolia,
+    chain,
     to: step1.to,
     data: step1.data,
     value: 0n,
@@ -1005,7 +1029,7 @@ export async function fundJobFromPage(params: {
 
   const fundTxHash = await walletClient.sendTransaction({
     account: posterAccount,
-    chain: baseSepolia,
+    chain,
     to: step2.to,
     data: step2.data,
     value: 0n,

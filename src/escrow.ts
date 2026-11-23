@@ -1,5 +1,5 @@
 /**
- * Read-only mirror of BountyEscrow (Base Sepolia testnet) on the board (#50),
+ * Read-only mirror of BountyEscrow (Base Sepolia testnet, or Base once real money is on) on the board (#50),
  * deliverable unsealing rules (#66 / M4), and 48h/68h review-window reminders (#52).
  *
  * READ ONLY — this module never holds a private key, never signs anything, and
@@ -19,8 +19,106 @@ export const DEFAULT_ESCROW_BASE_SEPOLIA = "0xB552A72ffA00BD23e9b2bB7b9579f6a35d
 /** Circle's USDC on Base Sepolia, fixed as immutable `token` in the deployed contract. */
 export const USDC_BASE_SEPOLIA = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
 export const BASE_SEPOLIA_CHAIN_ID = 84532;
+export const BASE_SEPOLIA_CHAIN_HEX = "0x14a34";
 export const DEFAULT_BASE_SEPOLIA_RPC_URL = "https://base-sepolia-rpc.publicnode.com";
 export const ESCROW_DEPLOY_BLOCK_BASE_SEPOLIA = 57_601_750;
+
+/** Circle's native USDC on Base mainnet. Fixed: real money only ever uses this token. */
+export const USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+export const BASE_CHAIN_ID = 8453;
+export const BASE_CHAIN_HEX = "0x2105";
+export const DEFAULT_BASE_RPC_URL = "https://mainnet.base.org";
+
+export type EscrowEnv = Pick<
+  Env,
+  | "ESCROW_TESTNET_ONLY"
+  | "ESCROW_ADDRESS_BASE_SEPOLIA"
+  | "ESCROW_TOKEN_ADDRESS_BASE_SEPOLIA"
+  | "BASE_SEPOLIA_RPC_URL"
+  | "ESCROW_ADDRESS_BASE"
+  | "ESCROW_DEPLOY_BLOCK_BASE"
+  | "BASE_RPC_URL"
+>;
+
+/** The one chain the board's escrow runs on right now, and everything that follows from it. */
+export type EscrowNetwork = {
+  mainnet: boolean;
+  chainId: number;
+  chainHex: string;
+  /** How a person reads it: "Base" or "Base Sepolia testnet". */
+  label: string;
+  escrowAddress: string;
+  tokenAddress: string;
+  rpcUrl: string;
+  deployBlock: number;
+};
+
+/** True unless `ESCROW_TESTNET_ONLY` is explicitly "off". Defaults to "on" (fail-closed to testnet). */
+export function isEscrowTestnetOnly(env?: Pick<Env, "ESCROW_TESTNET_ONLY">): boolean {
+  return (env?.ESCROW_TESTNET_ONLY ?? "on").trim().toLowerCase() !== "off";
+}
+
+/**
+ * Which escrow the board uses. Testnet unless ESCROW_TESTNET_ONLY is exactly "off".
+ * Real money (Base mainnet) also needs the deployed contract's address and deploy
+ * block; without both the board refuses rather than guess, so a half-set switch
+ * can never send anyone's USDC to the wrong place.
+ */
+export function escrowNetworkOf(env?: Partial<EscrowEnv>): EscrowNetwork {
+  if (isEscrowTestnetOnly(env)) {
+    const addr = env?.ESCROW_ADDRESS_BASE_SEPOLIA?.trim() || DEFAULT_ESCROW_BASE_SEPOLIA;
+    if (!isAddress(addr)) throw new OpError(500, "ESCROW_ADDRESS_BASE_SEPOLIA is not a valid 0x address");
+    const token = env?.ESCROW_TOKEN_ADDRESS_BASE_SEPOLIA?.trim() || USDC_BASE_SEPOLIA;
+    if (!isAddress(token)) throw new OpError(500, "ESCROW_TOKEN_ADDRESS_BASE_SEPOLIA is not a valid 0x address");
+    return {
+      mainnet: false,
+      chainId: BASE_SEPOLIA_CHAIN_ID,
+      chainHex: BASE_SEPOLIA_CHAIN_HEX,
+      label: "Base Sepolia testnet",
+      escrowAddress: toChecksumAddress(addr),
+      tokenAddress: toChecksumAddress(token),
+      rpcUrl: env?.BASE_SEPOLIA_RPC_URL?.trim() || DEFAULT_BASE_SEPOLIA_RPC_URL,
+      deployBlock: ESCROW_DEPLOY_BLOCK_BASE_SEPOLIA,
+    };
+  }
+  const addr = env?.ESCROW_ADDRESS_BASE?.trim() ?? "";
+  const block = Number(env?.ESCROW_DEPLOY_BLOCK_BASE?.trim() ?? "");
+  if (!isAddress(addr) || !Number.isSafeInteger(block) || block <= 0) {
+    throw new OpError(
+      503,
+      "real-money escrow is switched on but its Base contract is not configured (ESCROW_ADDRESS_BASE and ESCROW_DEPLOY_BLOCK_BASE); escrow is paused",
+    );
+  }
+  return {
+    mainnet: true,
+    chainId: BASE_CHAIN_ID,
+    chainHex: BASE_CHAIN_HEX,
+    label: "Base",
+    escrowAddress: toChecksumAddress(addr),
+    tokenAddress: toChecksumAddress(USDC_BASE),
+    rpcUrl: env?.BASE_RPC_URL?.trim() || DEFAULT_BASE_RPC_URL,
+    deployBlock: block,
+  };
+}
+
+/** What the API index says about escrow; never throws, so a half-set switch cannot break /v1. */
+export function escrowNetworkView(env?: Partial<EscrowEnv>) {
+  try {
+    const n = escrowNetworkOf(env);
+    return { chain: n.label, chain_id: n.chainId, real_money: n.mainnet, contract: n.escrowAddress, token: n.tokenAddress, paused: false };
+  } catch (e) {
+    return { chain: "Base", chain_id: BASE_CHAIN_ID, real_money: true, paused: true, reason: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** The chain a stored escrow contract lives on: the current network's, or the old testnet one. */
+export function escrowChainIdOf(contract: string | null | undefined, env?: Partial<EscrowEnv>): number {
+  const net = escrowNetworkOf(env);
+  if (!contract || contract.toLowerCase() === net.escrowAddress.toLowerCase()) return net.chainId;
+  if (contract.toLowerCase() === DEFAULT_ESCROW_BASE_SEPOLIA.toLowerCase()) return BASE_SEPOLIA_CHAIN_ID;
+  return net.chainId;
+}
+
 export const ESCROW_MIN_UNITS = 1_000_000n;     // $1.00 launch floor
 export const ESCROW_MAX_UNITS = 100_000_000n;   // $100.00 launch ceiling
 export const ESCROW_REVIEW_WINDOW_S = 3 * 86_400; // 72 hours (BountyEscrow.REVIEW_WINDOW)
@@ -39,18 +137,16 @@ export const ESCROW_TOPICS = {
   Refunded: `0x${keccak256("Refunded(uint256,address,uint256,uint8)")}`,
 } as const;
 
-export function escrowAddressOf(env?: Pick<Env, "ESCROW_ADDRESS_BASE_SEPOLIA">): string {
-  const raw = env?.ESCROW_ADDRESS_BASE_SEPOLIA?.trim() || DEFAULT_ESCROW_BASE_SEPOLIA;
-  if (!isAddress(raw)) throw new OpError(500, "ESCROW_ADDRESS_BASE_SEPOLIA is not a valid 0x address");
-  return toChecksumAddress(raw);
+export function escrowAddressOf(env?: Partial<EscrowEnv>): string {
+  return escrowNetworkOf(env).escrowAddress;
 }
 
-export function escrowRpcUrlOf(env?: Pick<Env, "BASE_SEPOLIA_RPC_URL">): string {
-  return env?.BASE_SEPOLIA_RPC_URL?.trim() || DEFAULT_BASE_SEPOLIA_RPC_URL;
+export function escrowRpcUrlOf(env?: Partial<EscrowEnv>): string {
+  return escrowNetworkOf(env).rpcUrl;
 }
 
-export function escrowSourcifyUrl(address: string): string {
-  return `https://repo.sourcify.dev/${BASE_SEPOLIA_CHAIN_ID}/${toChecksumAddress(address)}`;
+export function escrowSourcifyUrl(address: string, chainId: number = BASE_SEPOLIA_CHAIN_ID): string {
+  return `https://repo.sourcify.dev/${chainId}/${toChecksumAddress(address)}`;
 }
 
 /** Canonical bytes32 `ref` passed to `BountyEscrow.fund(..., ref)` for a board bounty id. */
@@ -557,7 +653,7 @@ export async function applyEscrowEvents(
             settlement_tx: ev.txHash,
             to_agent_usdc: unitsToUsdc(ev.toAgentUnits),
             fee_usdc: unitsToUsdc(ev.feeUnits),
-            next: "Escrow payment confirmed on Base Sepolia. The full deliverable is now unsealed: GET the bounty with your API key.",
+            next: "Escrow payment confirmed on-chain. The full deliverable is now unsealed: GET the bounty with your API key.",
           }),
           eventStmt(
             db, at, "bounty_awarded", b.id, b.escrow_agent_id,
@@ -717,7 +813,7 @@ export async function finalizePaidEscrowSubmission(
       settlement_tx: b.escrow_settlement_tx,
       to_agent_usdc: unitsToUsdc(toAgentUnits),
       fee_usdc: unitsToUsdc(feeUnits),
-      next: "Escrow payment confirmed on Base Sepolia. The full deliverable is now unsealed: GET the bounty with your API key.",
+      next: "Escrow payment confirmed on-chain. The full deliverable is now unsealed: GET the bounty with your API key.",
     }),
     eventStmt(
       db, at, "bounty_awarded", b.id, b.escrow_agent_id,
@@ -727,7 +823,7 @@ export async function finalizePaidEscrowSubmission(
   return true;
 }
 
-// ── Read-only JSON-RPC client (Base Sepolia) ────────────────────────────────
+// ── Read-only JSON-RPC client ──────────────────────────────────────────────
 
 export type EscrowRpc = {
   blockNumber: () => Promise<bigint>;
@@ -832,7 +928,7 @@ async function fetchLogsChunked(
  * on-chain bounties.
  */
 export async function syncEscrowChain(
-  env: Pick<Env, "DB" | "ESCROW_ADDRESS_BASE_SEPOLIA" | "BASE_SEPOLIA_RPC_URL">,
+  env: Pick<Env, "DB"> & Partial<EscrowEnv>,
   opts: { rpc?: EscrowRpc; minConfirmations?: number; startBlock?: number } = {},
 ): Promise<EscrowSyncSummary & { synced_to_block: number | null }> {
   const active = await env.DB
@@ -842,10 +938,11 @@ export async function syncEscrowChain(
     .first<{ x: number }>();
   if (!active) return { funded: 0, submitted: 0, paid: 0, refunded: 0, synced_to_block: null };
 
-  const escrowAddr = escrowAddressOf(env);
+  const net = escrowNetworkOf(env);
+  const escrowAddr = net.escrowAddress;
   const contractLower = escrowAddr.toLowerCase();
   const minConf = opts.minConfirmations ?? MIN_CONFIRMATIONS;
-  const rpc = opts.rpc ?? makeHttpEscrowRpc(escrowRpcUrlOf(env));
+  const rpc = opts.rpc ?? makeHttpEscrowRpc(net.rpcUrl);
 
   const head = await rpc.blockNumber();
   const safeHead = head - BigInt(minConf - 1);
@@ -855,7 +952,7 @@ export async function syncEscrowChain(
     .prepare("SELECT last_synced_block FROM escrow_sync_cursor WHERE escrow_contract = ?")
     .bind(contractLower)
     .first<{ last_synced_block: number }>();
-  const defaultStart = opts.startBlock ?? ESCROW_DEPLOY_BLOCK_BASE_SEPOLIA;
+  const defaultStart = opts.startBlock ?? net.deployBlock;
   const fromBlock = BigInt(curRow ? curRow.last_synced_block + 1 : defaultStart);
   if (fromBlock > safeHead) {
     return { funded: 0, submitted: 0, paid: 0, refunded: 0, synced_to_block: Number(safeHead) };
@@ -889,24 +986,25 @@ export async function syncEscrowChain(
 }
 
 /**
- * Sync one specific Base Sepolia transaction receipt against BountyEscrow.
+ * Sync one specific transaction receipt (on the escrow's current chain) against BountyEscrow.
  * Used when a poster or agent wants immediate feedback once their tx reaches
  * MIN_CONFIRMATIONS without waiting for the next cron tick.
  */
 export async function syncEscrowReceipt(
-  env: Pick<Env, "DB" | "ESCROW_ADDRESS_BASE_SEPOLIA" | "BASE_SEPOLIA_RPC_URL">,
+  env: Pick<Env, "DB"> & Partial<EscrowEnv>,
   txHashRaw: unknown,
   opts: { rpc?: EscrowRpc; minConfirmations?: number; startBlock?: number } = {},
 ): Promise<EscrowSyncSummary & { confirmations: number }> {
   if (!isTxHash(txHashRaw)) throw new OpError(400, "tx_hash must be a 0x-prefixed 64-hex-character transaction hash");
   const txHash = txHashRaw.toLowerCase();
-  const escrowAddr = escrowAddressOf(env);
+  const net = escrowNetworkOf(env);
+  const escrowAddr = net.escrowAddress;
   const contractLower = escrowAddr.toLowerCase();
   const minConf = opts.minConfirmations ?? MIN_CONFIRMATIONS;
-  const rpc = opts.rpc ?? makeHttpEscrowRpc(escrowRpcUrlOf(env));
+  const rpc = opts.rpc ?? makeHttpEscrowRpc(net.rpcUrl);
 
   const receipt = await rpc.getReceipt(txHash);
-  if (!receipt) throw new OpError(404, "transaction not found on Base Sepolia — is it mined, and is the hash right?");
+  if (!receipt) throw new OpError(404, `transaction not found on ${net.label} — is it mined, and is the hash right?`);
   if (receipt.status !== "0x1") throw new OpError(400, "that transaction reverted on-chain");
 
   const head = await rpc.blockNumber();
