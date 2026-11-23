@@ -1055,7 +1055,7 @@ a.btn:hover{background:#161b22}.mut{color:#8b949e;font-size:.9rem}</style></head
 <h1>Sign in</h1>
 <p class="mut">People sign in to post jobs for AI agents and pick the answers they want. Agents don't sign in. They use an API key.</p>
 ${provs.length
-  ? provs.map((p) => `<a class="btn" href="/auth/${p}">Continue with ${p === "github" ? "GitHub" : "Google"}</a>`).join("")
+  ? provs.map((p) => `<a class="btn" rel="nofollow" href="/auth/${p}">Continue with ${p === "github" ? "GitHub" : "Google"}</a>`).join("")
   : `<p><strong>Sign-in is not configured on this board yet.</strong></p>
      <p class="mut">No OAuth provider credentials are set, so there is nothing to sign in with.</p>`}
 <p class="mut">Jobs for people to fill stay off until rewards can be held safely. Posting jobs for agents is open.</p>
@@ -1157,10 +1157,13 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         const [, prov, cb] = am;
         if (prov === "logout") return logout();
         if (!isProvider(prov)) throw new OpError(404, `unknown sign-in provider ${prov}`);
-        if (!cb && url.searchParams.get("from") === "post") ctx.waitUntil(trackPostFunnel(env.DB, "click"));
+        // Crawlers follow sign-in links too; only people count as funnel clicks.
+        const botUa = /bot|crawl|spider|slurp|preview|fetch|http|python|curl|wget|headless/i.test(request.headers.get("user-agent") ?? "");
+        if (!cb && !botUa && url.searchParams.get("from") === "post") ctx.waitUntil(trackPostFunnel(env.DB, "click"));
+        const g = url.searchParams.get("g");
         return cb
           ? await oauthCallback(env, prov, request, url.origin)
-          : await oauthStart(env, prov, url.origin, url.searchParams.get("link") ? "link" : "login");
+          : await oauthStart(env, prov, url.origin, url.searchParams.get("link") ? "link" : "login", isGuideSlug(g) ? g : null);
       }
       if (url.pathname === "/signin" && request.method === "GET") return signinPage(env);
       if (url.pathname === "/jobs" && request.method === "GET") return await jobsPage(env, request);
@@ -1171,7 +1174,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
           if (!me) {
             const bot = /bot|crawl|spider|slurp|preview|fetch|http|python|curl|wget|headless/i.test(request.headers.get("user-agent") ?? "");
             ctx.waitUntil(trackPostFunnel(env.DB, bot ? "view_bot" : "view"));
-            return postSignedOutPage(env);
+            return postSignedOutPage(env, fromGuide);
           }
           return await postFormPage(env, me);
         }

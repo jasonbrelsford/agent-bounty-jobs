@@ -13,6 +13,7 @@
  * offered, and a missing SESSION_SECRET disables human sign-in entirely.
  */
 import { type Env, type Agent, OpError, LIMITS } from "./core.js";
+import { isGuideSlug, trackGuide } from "./guides.js";
 
 const SESSION_TTL_S = 7 * 24 * 3600;
 const STATE_TTL_S = 600; // an OAuth round-trip that takes >10 min has failed
@@ -117,7 +118,7 @@ export async function sessionAgent(env: Env, request: Request): Promise<Agent | 
 // ── flow ────────────────────────────────────────────────────────────────────
 
 export async function oauthStart(
-  env: Env, p: Provider, origin: string, intent: "login" | "link" = "login",
+  env: Env, p: Provider, origin: string, intent: "login" | "link" = "login", guide?: string | null,
 ): Promise<Response> {
   const c = creds(env, p);
   if (!c || !env.SESSION_SECRET) throw new OpError(503, `${p} sign-in is not configured on this board`);
@@ -125,7 +126,9 @@ export async function oauthStart(
   // callback that did not originate here has no matching cookie to compare to.
   // Intent rides INSIDE the signature, so it cannot be flipped from login to
   // link (or back) by editing the query string.
-  const nonce = `${crypto.randomUUID()}~${intent}`;
+  // The guide a visitor came from rides in the signed state too, so a sign-up
+  // that started on a guide is credited to it once the account exists.
+  const nonce = `${crypto.randomUUID()}~${intent}~${isGuideSlug(guide ?? null) ? guide : ""}`;
   const state = await seal(env.SESSION_SECRET, nonce, STATE_TTL_S);
   const u = new URL(PROVIDERS[p].authorize);
   u.searchParams.set("client_id", c.id);
@@ -170,7 +173,9 @@ export async function oauthCallback(env: Env, p: Provider, request: Request, ori
   const rawName = String(prof.name ?? prof.login ?? "").trim() || `${p} user`;
   const name = rawName.slice(0, LIMITS.name.max).padEnd(LIMITS.name.min, ".");
 
-  const intent = (await unseal(env.SESSION_SECRET, state))?.split("~")[1] === "link" ? "link" : "login";
+  const parts = (await unseal(env.SESSION_SECRET, state))?.split("~") ?? [];
+  const intent = parts[1] === "link" ? "link" : "login";
+  const guide = parts[2] ?? "";
   const existing = await env.DB.prepare("SELECT agent_id FROM agent_identities WHERE subject = ?")
     .bind(subject)
     .first<{ agent_id: string }>();
@@ -235,6 +240,7 @@ export async function oauthCallback(env: Env, p: Provider, request: Request, ori
   }
 
   const agentId = existing ? existing.agent_id : await createHuman(env, subject, name, p);
+  if (!existing && isGuideSlug(guide)) await trackGuide(env.DB, guide, "signup");
   return redirectWithSession(env, agentId, "/my-jobs");
 }
 

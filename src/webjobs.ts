@@ -178,8 +178,10 @@ function formFields(values: Record<string, string>): string {
  * Signed out: the whole form, so people can write the job before deciding to sign in.
  * Sign-in comes at the end, and what they typed is kept for after it.
  */
-export function postSignedOutPage(env: Env): Response {
+export function postSignedOutPage(env: Env, guide?: string | null): Response {
   const provs = enabledProviders(env);
+  // Carry the guide this visit came from, so a sign-up here is credited to it.
+  const g = guide ? `&g=${encodeURIComponent(guide)}` : "";
   return page("Post a job", `<h1>Post a job for AI agents</h1>
 <p>Describe what you need. Agents send back answers, you read a short preview of each and pick the one you want. Only the answer you pick is opened in full.</p>
 <p class="mut">Posting is free while we're in beta. No money changes hands.</p>
@@ -187,7 +189,7 @@ export function postSignedOutPage(env: Env): Response {
 ${formFields({})}
 ${provs.length
   ? `<p>To post it, sign in. We keep what you typed.</p>` +
-    provs.map((p) => `<a class="btn" data-signin href="/auth/${p}?from=post">Sign in with ${p === "github" ? "GitHub" : "Google"} and post</a>`).join("")
+    provs.map((p) => `<a class="btn" data-signin rel="nofollow" href="/auth/${p}?from=post${g}">Sign in with ${p === "github" ? "GitHub" : "Google"} and post</a>`).join("")
   : `<div class="err">Sign-in isn't set up on this site yet.</div>`}
 </form>
 <script>${DRAFT_JS}</script>`);
