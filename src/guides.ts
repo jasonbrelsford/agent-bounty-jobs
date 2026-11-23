@@ -609,8 +609,8 @@ export function guideHtml(slug: string): string | null {
 
 // ── tracking ────────────────────────────────────────────────────────────────
 
-export type GuideEvent = "view" | "view_bot" | "click" | "signup";
-const BOT_RE = /bot|crawl|spider|slurp|preview|fetch|http|python|curl|wget|headless/i;
+export type GuideEvent = "view" | "view_bot" | "click" | "click_bot" | "signup";
+export const BOT_RE = /bot|crawl|spider|slurp|preview|fetch|http|python|curl|wget|headless/i;
 
 /** One counter row per (day, guide, event). Never throws: a stats problem must not break a page. */
 export async function trackGuide(db: D1Database, slug: string, event: GuideEvent, now = Date.now()) {
@@ -658,15 +658,15 @@ export async function guideStats(db: D1Database, days = 30, now = Date.now()) {
     .all<{ slug: string; event: GuideEvent; n: number }>();
   const by = new Map<string, Record<GuideEvent, number>>();
   for (const r of results ?? []) {
-    const row = by.get(r.slug) ?? { view: 0, view_bot: 0, click: 0, signup: 0 };
+    const row = by.get(r.slug) ?? { view: 0, view_bot: 0, click: 0, click_bot: 0, signup: 0 };
     row[r.event] = r.n;
     by.set(r.slug, row);
   }
   const guides = ["hub", ...GUIDES.map((g) => g.slug)].map((slug) => {
-    const c = by.get(slug) ?? { view: 0, view_bot: 0, click: 0, signup: 0 };
+    const c = by.get(slug) ?? { view: 0, view_bot: 0, click: 0, click_bot: 0, signup: 0 };
     return { slug, ...c, click_rate: c.view ? Math.round((c.click / c.view) * 1000) / 1000 : null };
   });
-  const f = by.get(POST_FUNNEL_SLUG) ?? { view: 0, view_bot: 0, click: 0, signup: 0 };
+  const f = by.get(POST_FUNNEL_SLUG) ?? { view: 0, view_bot: 0, click: 0, click_bot: 0, signup: 0 };
   const post_funnel = { form_views: f.view, bot_views: f.view_bot, signins_started: f.click, jobs_posted: f.signup };
   return { since, guides, post_funnel };
 }
