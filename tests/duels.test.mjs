@@ -157,3 +157,12 @@ test("profiles in plain words", () => {
   assert.equal(opp.style, "Opportunist");
   assert.match(opp.summary, /defected on a cooperating opponent 30%/);
 });
+
+test("Qwen and DeepSeek are asked for low reasoning effort; others get their defaults", async () => {
+  const seen = [];
+  const env = { DB: makeD1(), AI: { run: async (model, input) => { seen.push([model, input.reasoning_effort]); return { response: '{"move":"C","reason":"ok"}' }; } } };
+  const { liveAsk } = await import("../.test-build/duels.js");
+  const ask = liveAsk(env);
+  for (const k of ["qwen3.8-27b", "deepseek-v4.1-flash", "llama-3.3-70b", "gemma-4-26b", "gpt-oss-120b"]) await ask(ROSTER[k], "Round 1. Your move?");
+  assert.deepEqual(seen.map((x) => x[1]), ["low", "low", undefined, undefined, undefined]);
+});

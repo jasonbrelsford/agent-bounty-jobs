@@ -24,6 +24,8 @@ export type Player = {
   provider: "anthropic" | "workers-ai";
   /** Workers AI model id, or for Anthropic the family word the newest model id contains. */
   model: string;
+  /** Reasoning effort, for models that think before answering and take a reasoning_effort setting. */
+  effort?: "low";
 };
 
 export const ROSTER: Record<string, Player> = {
@@ -31,10 +33,10 @@ export const ROSTER: Record<string, Player> = {
   "claude-sonnet": { name: "Claude Sonnet", maker: "Anthropic", family: "claude", provider: "anthropic", model: "sonnet" },
   "claude-haiku": { name: "Claude Haiku", maker: "Anthropic", family: "claude", provider: "anthropic", model: "haiku" },
   "llama-3.3-70b": { name: "Llama 3.3 70B", maker: "Meta", family: "llama", provider: "workers-ai", model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast" },
-  "qwen3.8-27b": { name: "Qwen3.8 27B", maker: "Alibaba", family: "qwen", provider: "workers-ai", model: "@cf/qwen/qwen3.8-27b" },
+  "qwen3.8-27b": { name: "Qwen3.8 27B", maker: "Alibaba", family: "qwen", provider: "workers-ai", model: "@cf/qwen/qwen3.8-27b", effort: "low" },
   "gemma-4-26b": { name: "Gemma 4 26B", maker: "Google", family: "gemma", provider: "workers-ai", model: "@cf/google/gemma-4-26b-a4b-it" },
   "gpt-oss-120b": { name: "gpt-oss 120B", maker: "OpenAI (open weights)", family: "gpt-oss", provider: "workers-ai", model: "@cf/openai/gpt-oss-120b" },
-  "deepseek-v4.1-flash": { name: "DeepSeek V4.1 Flash", maker: "DeepSeek", family: "deepseek", provider: "workers-ai", model: "@cf/deepseek-ai/deepseek-v4.1-flash-1017" },
+  "deepseek-v4.1-flash": { name: "DeepSeek V4.1 Flash", maker: "DeepSeek", family: "deepseek", provider: "workers-ai", model: "@cf/deepseek-ai/deepseek-v4.1-flash-1017", effort: "low" },
 };
 
 export const TOURNAMENT = {
@@ -184,6 +186,8 @@ export function liveAsk(env: Env): Ask {
       messages: [{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content: prompt }],
       // Reasoning models think before they answer; too small a limit leaves the answer empty.
       max_tokens: 4096,
+      // Qwen and DeepSeek default to long reasoning that can run out of room; low effort, like Claude.
+      ...(p.effort ? { reasoning_effort: p.effort } : {}),
     } as any);
     const text = workersAiText(res);
     const a = readAnswer(text);
@@ -443,7 +447,7 @@ export async function duelResults(db: D1Database, t = TOURNAMENT) {
     how: {
       format: `Every pair of models plays ${t.matches_per_pair} matches, and each model plays a copy of itself. Matches last ${PD.min_rounds} to ${PD.max_rounds} rounds; neither side knows when it ends or who it plays.`,
       prompt: SYSTEM_PROMPT,
-      settings: "Claude models answer at low effort with a fixed JSON answer format. Open models run with their default settings on Cloudflare Workers AI. Every model gets the same prompt.",
+      settings: "Claude, Qwen and DeepSeek reason at low effort; Claude also uses a fixed JSON answer format. The other open models run with their default settings on Cloudflare Workers AI. Every model gets the same prompt.",
       ranking: "Points per round across all matches against other models (3.0 is mutual cooperation every round). Self-play is shown apart.",
     },
     page: "/arena/dilemma/models",
