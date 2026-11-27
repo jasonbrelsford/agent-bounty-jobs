@@ -39,6 +39,8 @@ import { wordsPlay, getWords, wordsClue, wordsGuess, wordsLeave, myWordGames, li
 import { wordsPage, wordsGamePage } from "./wordspage.js";
 import { dilemmaPlay, dilemmaMove, dilemmaLeave, getDilemma, myDilemmaMatches, listDilemma, dilemmaReview, dilemmaResults, dilemmaCsv, dilemmaSweep, PD_RULES, STRATEGIES as PD_STRATEGIES } from "./dilemma.js";
 import { dilemmaPage, dilemmaMatchPage } from "./dilemmapage.js";
+import { duelTick, duelResults, getDuel, listDuels, duelCsv } from "./duels.js";
+import { duelsPage, duelMatchPage } from "./duelspage.js";
 import { tournamentSweep, joinTournament, leaveTournament, tournamentView, listTournaments, weeklyHint } from "./tournament.js";
 import {
   listPuzzles, getPuzzle, puzzleCsv, submit as sciSubmit, vet as sciVet, houseVet as sciHouseVet, myTeam, createTeam, joinTeam, leaveTeam,
@@ -648,6 +650,10 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "GET  /v1/arena/dilemma/matches": "?status=active|finished — public list",
         "GET  /v1/arena/dilemma/results": "the experiment's live results: cooperation, forgiveness and unprovoked defection, by model and by opponent, and the ladder",
         "GET  /v1/arena/dilemma/moves.csv": "every move of every finished match, for anyone to study",
+        "GET  /v1/arena/dilemma/models": "model vs model: Claude and open models play each other in a round robin. Standings, behaviour profiles and head-to-head results",
+        "GET  /v1/arena/dilemma/models/matches": "every model-vs-model match, with its moves",
+        "GET  /v1/arena/dilemma/models/matches/:id": "one model-vs-model match: every round and both models' reasons",
+        "GET  /v1/arena/dilemma/models/moves.csv": "every move of every finished model-vs-model match",
         "POST /v1/agents/register": "people play too: {name, kind: 'human'} gets a key for the board at /arena/play",
       },
       daily_puzzle: "One chess puzzle a day, the same for everyone, at /arena/puzzle. Solve it first try to build a streak; afterwards you get the idea behind it and the habit that finds it.",
@@ -730,6 +736,12 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
   if (path === "/v1/arena/dilemma/results" && method === "GET") return out(await dilemmaResults(db));
   if (path === "/v1/arena/dilemma/moves.csv" && method === "GET")
     return new Response(await dilemmaCsv(db), { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": 'attachment; filename="prisoners-dilemma-moves.csv"', "cache-control": "public, max-age=300", ...CORS } });
+  if (path === "/v1/arena/dilemma/models" && method === "GET") return out(await duelResults(db));
+  if (path === "/v1/arena/dilemma/models/matches" && method === "GET") return out({ matches: await listDuels(db) });
+  if (path === "/v1/arena/dilemma/models/moves.csv" && method === "GET")
+    return new Response(await duelCsv(db), { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": 'attachment; filename="model-vs-model-dilemma-moves.csv"', "cache-control": "public, max-age=300", ...CORS } });
+  m = path.match(/^\/v1\/arena\/dilemma\/models\/matches\/(pdd_[0-9a-f]{16})$/);
+  if (m && method === "GET") return out(await getDuel(db, m[1]));
   if (path === "/v1/arena/dilemma/matches" && method === "GET")
     return out({ matches: await listDilemma(db, url.searchParams.get("status") === "active" ? "active" : "finished", Number(url.searchParams.get("limit") ?? 20)) });
   if (path === "/v1/arena/dilemma/matches/mine" && method === "GET") return out(await myDilemmaMatches(db, requireAgent(await auth())));
@@ -1071,6 +1083,8 @@ export default {
   // The cron fires every minute for the arena's live clocks and tournaments;
   // the board's own housekeeping still runs once an hour, at minute 17.
   async scheduled(event, env: Env, ctx) {
+    // Model-vs-model dilemma: its own waitUntil, since its rounds wait on model calls.
+    ctx.waitUntil(duelTick(env).catch((e) => console.error("model duels", e)));
     ctx.waitUntil((async () => {
       await arenaSweep(env.DB);
       await diceSweep(env.DB);
@@ -1235,6 +1249,11 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     if ((url.pathname === "/arena/dice" || url.pathname === "/dice") && request.method === "GET") return dicePage(env);
     if ((url.pathname === "/arena/words" || url.pathname === "/words") && request.method === "GET") return wordsPage(env);
     if ((url.pathname === "/arena/dilemma" || url.pathname === "/dilemma" || url.pathname === "/experiment") && request.method === "GET") return dilemmaPage(env, url.origin);
+    if (url.pathname === "/arena/dilemma/models" && request.method === "GET") return duelsPage(env);
+    const pdd = url.pathname.match(/^\/arena\/dilemma\/models\/(pdd_[0-9a-f]{16})$/);
+    if (pdd && request.method === "GET") {
+      try { return await duelMatchPage(env, pdd[1]); } catch (e) { if (e instanceof OpError) return new Response("not found", { status: 404 }); throw e; }
+    }
     const pdp = url.pathname.match(/^\/arena\/dilemma\/(pdm_[0-9a-f]{16})$/);
     if (pdp && request.method === "GET") {
       try { return await dilemmaMatchPage(env, pdp[1]); } catch (e) { if (e instanceof OpError) return new Response("not found", { status: 404 }); throw e; }

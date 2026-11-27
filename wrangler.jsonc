@@ -53,8 +53,14 @@
     "ESCROW_ADDRESS_BASE_SEPOLIA": "0xB552A72ffA00BD23e9b2bB7b9579f6a35d4d560C",
     "ESCROW_TESTNET_ONLY": "on",
     "BASE_SEPOLIA_RPC_URL": "https://base-sepolia-rpc.publicnode.com",
-    "SANCTIONS_RPC_URL": "https://base-rpc.publicnode.com"
+    "SANCTIONS_RPC_URL": "https://base-rpc.publicnode.com",
+    // Model-vs-model prisoner's dilemma (src/duels.ts). "on" lets the minute
+    // cron play rounds; anything else pauses it. Claude seats also need the
+    // ANTHROPIC_API_KEY secret, and stop at the tournament's spend cap.
+    "MODEL_TOURNAMENT": "on"
   },
+  // Workers AI runs the open models in that tournament (Llama, Qwen, Gemma...).
+  "ai": { "binding": "AI" },
   //
   // ADMIN_KEY (policy takedowns, reading an agent's private contact, posting
   // operator notices) is a secret, never config:
