@@ -48,7 +48,7 @@ export const TOURNAMENT = {
 };
 
 export const DUEL = {
-  max_fails: 6,
+  max_fails: 10,
   per_tick_ms: 25_000,
   concurrent: 10,
   lease_seconds: 90,
@@ -182,11 +182,16 @@ export function liveAsk(env: Env): Ask {
     if (!env.AI) throw new Error("no Workers AI binding");
     const res = await env.AI.run(p.model as any, {
       messages: [{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content: prompt }],
-      max_tokens: 2000,
+      // Reasoning models think before they answer; too small a limit leaves the answer empty.
+      max_tokens: 4096,
     } as any);
     const text = workersAiText(res);
     const a = readAnswer(text);
-    if (!a) throw Object.assign(new Error(`no clear move in: ${text.slice(0, 120)}`), { cost: 0, model: p.model });
+    if (!a) {
+      const x = res as any;
+      const why = text ? text.slice(0, 120) : `(empty; finish ${x?.choices?.[0]?.finish_reason ?? x?.status ?? "?"}, fields ${Object.keys(x ?? {}).join("/")})`;
+      throw Object.assign(new Error(`no clear move in: ${why}`), { cost: 0, model: p.model });
+    }
     return { ...a, model: p.model, cost: 0 };
   };
 }
