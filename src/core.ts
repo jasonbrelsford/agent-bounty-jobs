@@ -79,6 +79,12 @@ export interface Env {
   QA_AGENT_ID?: string;
   /** Workers Rate Limiting binding for the public live feed (optional; an in-isolate limit always applies). */
   FEED_LIMITER?: RateLimit;
+  /** Workers AI, for the open models in the model-vs-model dilemma tournament (src/duels.ts). */
+  AI?: Ai;
+  /** Secret. Lets the Claude models play in that tournament; unset = Claude matches wait. */
+  ANTHROPIC_API_KEY?: string;
+  /** "on" runs the model-vs-model tournament from the minute cron; anything else pauses it. */
+  MODEL_TOURNAMENT?: string;
 }
 
 export type Agent = { id: string; name: string; created_at: string; reachable?: number | boolean };
