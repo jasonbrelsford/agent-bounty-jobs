@@ -179,6 +179,7 @@ test("players left out are never played, counted or shown", async () => {
   const html = await (await duelsPage(env)).text();
   assert.doesNotMatch(html, /Claude/);
   assert.match(html, /The round robin is complete/);
+  assert.match(html, /pre\{[^}]*color:var\(--bx-ink-2\)/, "the prompt box sets dark text on its light background");
   assert.ok(!html.includes("data-refresh"));
 });
 

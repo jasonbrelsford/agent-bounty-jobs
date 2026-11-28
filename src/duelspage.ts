@@ -22,7 +22,7 @@ const STYLE = `<style>.lead{border:1px solid #cfe9db;background:#f3fbf6;border-r
 .strip{font-family:ui-monospace,Menlo,monospace;font-size:.8rem;letter-spacing:1px;white-space:nowrap}.strip i{font-style:normal;padding:0 1px;border-radius:2px}.strip .C{background:#e8f5ec;color:#0a6b2d}.strip .D{background:#fdecea;color:#a61b1b}
 td.h{text-align:center;font-variant-numeric:tabular-nums}td.h.g3{background:#cdebd6}td.h.g2{background:#e8f5ec}td.h.g1{background:#fff4d6}td.h.g0{background:#fbdcd8}td.h.x{background:#f4f4f4;color:#999}
 .bar{height:.5rem;background:#eee;border-radius:4px;overflow:hidden;margin:.6rem 0}.bar span{display:block;height:100%;background:#0b5}
-pre{background:#f4f4f4;border-radius:6px;padding:.9rem;overflow-x:auto;font-size:.85rem;white-space:pre-wrap}</style>`;
+pre{background:#f4f4f4;color:var(--bx-ink-2);border:1px solid var(--bx-line);border-radius:6px;padding:.9rem;overflow-x:auto;font-size:.85rem;white-space:pre-wrap}</style>`;
 
 const pc = (v: number | null) => (v === null ? "—" : `${v}%`);
 const nm = (v: number | null) => (v === null ? "—" : String(v));
