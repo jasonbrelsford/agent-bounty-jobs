@@ -1,6 +1,6 @@
 import type { Env } from "./core.js";
 import { esc, page as basePage } from "./arenapage.js";
-import { duelResults, listDuels, getDuel, ROSTER, TOURNAMENT, DUEL } from "./duels.js";
+import { duelResults, listDuels, getDuel, ROSTER, DUEL, playing } from "./duels.js";
 
 /**
  * Pages for the model-vs-model prisoner's dilemma round robin. Server-rendered, no client script.
@@ -8,7 +8,7 @@ import { duelResults, listDuels, getDuel, ROSTER, TOURNAMENT, DUEL } from "./due
  * value that is not a number goes through esc().
  */
 
-const DESC = "Which AI models cooperate? Claude, Llama, Qwen, Gemma, gpt-oss and DeepSeek play the repeated prisoner's dilemma against each other. Standings, head-to-head results, and how each model behaves.";
+const DESC = "Which AI models cooperate? Llama, Qwen, Gemma, gpt-oss and DeepSeek play the repeated prisoner's dilemma against each other. Standings, head-to-head results, and how each model behaves.";
 const page = (title: string, body: string, refreshSeconds = 0) => basePage(title, body, refreshSeconds, DESC);
 
 const STYLE = `<style>.lead{border:1px solid #cfe9db;background:#f3fbf6;border-radius:10px;padding:1rem 1.15rem;margin:1rem 0}
@@ -64,7 +64,6 @@ export async function duelsPage(env: Env): Promise<Response> {
   const st = r.status;
   const done = st.finished + st.failed;
   const running = st.total === 0 || done < st.total;
-  const claudeWaiting = !env.ANTHROPIC_API_KEY && matches.some((m) => m.status === "queued" && (ROSTER[m.a]?.provider === "anthropic" || ROSTER[m.b]?.provider === "anthropic"));
   const ranked = r.standings.filter((x) => x.matches > 0);
   const waiting = r.standings.filter((x) => x.matches === 0);
 
@@ -79,7 +78,7 @@ export async function duelsPage(env: Env): Promise<Response> {
 ${x.against_itself ? `<p><b>Against a copy of itself:</b> both cooperated in ${pc(x.against_itself.mutual_cooperation_pct)} of rounds.</p>` : ""}
 ${quotes(x.quotes as Record<string, string>)}</div>`).join("");
 
-  const keys = TOURNAMENT.players.filter((k) => ranked.some((x) => x.key === k));
+  const keys = playing().filter((k) => ranked.some((x) => x.key === k));
   const grid = keys.length >= 2
     ? `<div class="scroll-x"><table><tr><th>Row scored against column</th>${keys.map((k) => `<th>${esc(ROSTER[k].name)}</th>`).join("")}</tr>${
       r.head_to_head.filter((h) => keys.includes(h.model)).map((h) => `<tr><th>${esc(h.name)}</th>${keys.map((o) => {
@@ -104,7 +103,6 @@ ${quotes(x.quotes as Record<string, string>)}</div>`).join("");
 <p>${esc(r.how.format)} This is the same game as the <a href="/arena/dilemma">agent experiment</a>, but here the models play each other directly.</p></div>
 <p><strong>${st.finished} of ${st.total || "—"} matches finished</strong>${st.active ? `, ${st.active} being played now` : ""}${st.failed ? `, ${st.failed} stopped after repeated errors` : ""}.${running ? " This page refreshes every minute." : " The round robin is complete."}</p>
 <div class="bar"><span style="width:${pctDone}%"></span></div>
-${claudeWaiting ? `<p class="mut">The Claude models' matches are queued and start as soon as they are switched on.</p>` : ""}
 ${heads.length ? `<div class="tiles">${heads.map((h) => `<div class="tile">${h}</div>`).join("")}</div>` : ""}
 <h2>Standings</h2>
 <div class="scroll-x"><table><tr><th>#</th><th>Model</th><th>Style</th><th>Points / round</th><th>W-D-L</th><th>Cooperate</th><th>Never struck first</th><th>Forgive</th><th>Unprovoked D</th></tr>${standings}</table></div>

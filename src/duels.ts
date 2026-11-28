@@ -43,6 +43,12 @@ export const TOURNAMENT = {
   key: "models-2026-11",
   title: "AI model round robin",
   players: Object.keys(ROSTER),
+  /**
+   * Players dropped from this round robin. Their matches stay in the table as never played
+   * and are ignored everywhere: not played, not counted, not shown. Jason chose to run this
+   * round robin without Claude (no Anthropic API key), so the results cover the open models.
+   */
+  left_out: ["claude-opus", "claude-sonnet", "claude-haiku"] as string[],
   matches_per_pair: 2,
   self_play: true,
   /** Estimated Anthropic spend at which Claude stops being called. */
@@ -202,6 +208,11 @@ export function liveAsk(env: Env): Ask {
 
 // ── the tournament ──────────────────────────────────────────────────────────
 
+export type Tournament = typeof TOURNAMENT;
+/** The players whose matches count: everyone on the schedule except those left out. */
+export const playing = (t: Tournament = TOURNAMENT) => t.players.filter((k) => !t.left_out.includes(k));
+const inPlay = (t: Tournament, r: { a: string; b: string }) => !t.left_out.includes(r.a) && !t.left_out.includes(r.b);
+
 /** Every match of the round robin, in play order: pairs first round by round, self-play last. */
 export function schedule(t = TOURNAMENT): [string, string][] {
   const ps = t.players, out: [string, string][] = [];
@@ -261,9 +272,9 @@ export async function playRound(db: D1Database, row: DuelRow, ask: Ask): Promise
  * One cron tick: play rounds of up to DUEL.concurrent matches until the time budget is spent.
  * Matches that need Claude wait while there is no key or the spend cap is reached.
  */
-export async function duelTick(env: Env, opts: { ask?: Ask; budgetMs?: number; now?: () => number } = {}) {
+export async function duelTick(env: Env, opts: { ask?: Ask; budgetMs?: number; now?: () => number; t?: Tournament } = {}) {
   if (env.MODEL_TOURNAMENT !== "on") return { played: 0, reason: "off" };
-  const db = env.DB, t = TOURNAMENT, now = opts.now ?? Date.now;
+  const db = env.DB, t = opts.t ?? TOURNAMENT, now = opts.now ?? Date.now;
   await ensureTournament(db, t);
   const claudeOk = !!env.ANTHROPIC_API_KEY && (await claudeSpent(db, t.key)) < t.claude_budget_usd;
   const openOk = !!env.AI || !!opts.ask;
@@ -275,7 +286,7 @@ export async function duelTick(env: Env, opts: { ask?: Ask; budgetMs?: number; n
   const picked: DuelRow[] = [];
   for (const row of cands) {
     if (picked.length >= DUEL.concurrent) break;
-    if (!runnable(row.a) || !runnable(row.b)) continue;
+    if (!inPlay(t, row) || !runnable(row.a) || !runnable(row.b)) continue;
     const until = new Date(now() + DUEL.lease_seconds * 1000).toISOString();
     const l = await db.prepare("UPDATE pd_duels SET lease_until = ?, version = version + 1 WHERE id = ? AND version = ? AND (lease_until IS NULL OR lease_until < ?)")
       .bind(until, row.id, row.version, at).run();
@@ -379,16 +390,17 @@ const STYLE_ABOUT: Record<string, string> = {
   "No matches yet": "",
 };
 
-export async function duelResults(db: D1Database, t = TOURNAMENT) {
-  const rows = (await db.prepare("SELECT * FROM pd_duels WHERE tournament = ? ORDER BY seq").bind(t.key).all<DuelRow>()).results ?? [];
-  const per = new Map<string, Stat>(t.players.map((k) => [k, stat()]));
+export async function duelResults(db: D1Database, t: Tournament = TOURNAMENT) {
+  const rows = ((await db.prepare("SELECT * FROM pd_duels WHERE tournament = ? ORDER BY seq").bind(t.key).all<DuelRow>()).results ?? []).filter((r) => inPlay(t, r));
+  const players = playing(t);
+  const per = new Map<string, Stat>(players.map((k) => [k, stat()]));
   const self = new Map<string, { rounds: number; both: number; points: number; matches: number }>();
   const grid = new Map<string, { rounds: number; points: number; matches: number }>();
   const models = new Map<string, Set<string>>();
-  const counts = { total: rows.length, finished: 0, active: 0, queued: 0, failed: 0 };
+  const tally = { total: rows.length, finished: 0, active: 0, queued: 0, failed: 0 };
   let cost = 0;
   for (const r of rows) {
-    counts[r.status as keyof typeof counts]++;
+    tally[r.status as keyof typeof tally]++;
     cost += r.cost_usd;
     for (const [k, m] of [[r.a, r.a_model], [r.b, r.b_model]] as const) if (m) (models.get(k) ?? models.set(k, new Set()).get(k)!).add(m);
     if (r.status !== "finished") continue;
@@ -410,7 +422,7 @@ export async function duelResults(db: D1Database, t = TOURNAMENT) {
       grid.set(`${me}|${them}`, g);
     }
   }
-  const standings = t.players.map((k) => {
+  const standings = players.map((k) => {
     const s = per.get(k)!, p = ROSTER[k], pr = profile(s), sp = self.get(k);
     return {
       key: k, name: p.name, maker: p.maker, family: p.family, runs_on: p.provider === "anthropic" ? "Anthropic API" : "Cloudflare Workers AI",
@@ -430,9 +442,9 @@ export async function duelResults(db: D1Database, t = TOURNAMENT) {
     };
   }).sort((x, y) => (y.points_per_round ?? -1) - (x.points_per_round ?? -1) || y.wins - x.wins)
     .map((x, i) => ({ rank: x.matches ? i + 1 : null, ...x }));
-  const head_to_head = t.players.map((me) => ({
+  const head_to_head = players.map((me) => ({
     model: me, name: ROSTER[me].name,
-    against: Object.fromEntries(t.players.filter((o) => o !== me).map((o) => {
+    against: Object.fromEntries(players.filter((o) => o !== me).map((o) => {
       const g = grid.get(`${me}|${o}`);
       return [o, g ? { matches: g.matches, points_per_round: +(g.points / g.rounds).toFixed(2) } : null];
     })),
@@ -440,14 +452,17 @@ export async function duelResults(db: D1Database, t = TOURNAMENT) {
   return {
     tournament: t.key,
     title: "Which AI models cooperate? A round robin of the prisoner's dilemma",
-    status: counts,
+    status: tally,
+    left_out: t.left_out.map((k) => ROSTER[k]?.name ?? k),
     claude_cost_usd_estimate: +cost.toFixed(2),
     standings,
     head_to_head,
     how: {
-      format: `Every pair of models plays ${t.matches_per_pair} matches, and each model plays a copy of itself. Matches last ${PD.min_rounds} to ${PD.max_rounds} rounds; neither side knows when it ends or who it plays.`,
+      format: `Every pair of ${players.length} models plays ${t.matches_per_pair} matches, and each model plays a copy of itself. Matches last ${PD.min_rounds} to ${PD.max_rounds} rounds; neither side knows when it ends or who it plays.`,
       prompt: SYSTEM_PROMPT,
-      settings: "Claude, Qwen and DeepSeek reason at low effort; Claude also uses a fixed JSON answer format. The other open models run with their default settings on Cloudflare Workers AI. Every model gets the same prompt.",
+      settings: players.some((k) => ROSTER[k].provider === "anthropic")
+        ? "Claude, Qwen and DeepSeek reason at low effort; Claude also uses a fixed JSON answer format. The other open models run with their default settings on Cloudflare Workers AI. Every model gets the same prompt."
+        : "Every model runs on Cloudflare Workers AI with the same prompt. Qwen and DeepSeek reason at low effort, so they answer within the length limit; the others run with their default settings.",
       ranking: "Points per round across all matches against other models (3.0 is mutual cooperation every round). Self-play is shown apart.",
     },
     page: "/arena/dilemma/models",
@@ -457,7 +472,7 @@ export async function duelResults(db: D1Database, t = TOURNAMENT) {
 
 export async function getDuel(db: D1Database, id: string) {
   const r = await db.prepare("SELECT * FROM pd_duels WHERE id = ?").bind(id).first<DuelRow>();
-  if (!r) throw new OpError(404, "no such match");
+  if (!r || (r.tournament === TOURNAMENT.key && !inPlay(TOURNAMENT, r))) throw new OpError(404, "no such match");
   const rounds = parse(r);
   return {
     id: r.id, status: r.status, a: { key: r.a, name: ROSTER[r.a]?.name ?? r.a, model: r.a_model }, b: { key: r.b, name: ROSTER[r.b]?.name ?? r.b, model: r.b_model },
@@ -470,8 +485,8 @@ export async function getDuel(db: D1Database, id: string) {
   };
 }
 
-export async function listDuels(db: D1Database, t = TOURNAMENT) {
-  const rows = (await db.prepare("SELECT * FROM pd_duels WHERE tournament = ? ORDER BY updated_at DESC").bind(t.key).all<DuelRow>()).results ?? [];
+export async function listDuels(db: D1Database, t: Tournament = TOURNAMENT) {
+  const rows = ((await db.prepare("SELECT * FROM pd_duels WHERE tournament = ? ORDER BY updated_at DESC").bind(t.key).all<DuelRow>()).results ?? []).filter((r) => inPlay(t, r));
   return rows.map((r) => {
     const rounds = parse(r);
     return {
@@ -487,8 +502,8 @@ const csvCell = (v: unknown) => {
   return /[",\n\r]/.test(s) || /^[=+\-@]/.test(s) ? `"${s.replace(/^([=+\-@])/, "'$1").replace(/"/g, '""')}"` : s;
 };
 
-export async function duelCsv(db: D1Database, t = TOURNAMENT): Promise<string> {
-  const rows = (await db.prepare("SELECT * FROM pd_duels WHERE tournament = ? AND status = 'finished' ORDER BY seq").bind(t.key).all<DuelRow>()).results ?? [];
+export async function duelCsv(db: D1Database, t: Tournament = TOURNAMENT): Promise<string> {
+  const rows = ((await db.prepare("SELECT * FROM pd_duels WHERE tournament = ? AND status = 'finished' ORDER BY seq").bind(t.key).all<DuelRow>()).results ?? []).filter((r) => inPlay(t, r));
   const lines = ["match_id,round,model_a,model_a_id,model_b,model_b_id,move_a,move_b,points_a,points_b,reason_a,reason_b,at"];
   for (const r of rows)
     parse(r).forEach((x, i) => {
