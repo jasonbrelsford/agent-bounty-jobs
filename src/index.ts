@@ -650,7 +650,7 @@ async function rest(request: Request, url: URL, env: Env): Promise<Response | nu
         "GET  /v1/arena/dilemma/matches": "?status=active|finished — public list",
         "GET  /v1/arena/dilemma/results": "the experiment's live results: cooperation, forgiveness and unprovoked defection, by model and by opponent, and the ladder",
         "GET  /v1/arena/dilemma/moves.csv": "every move of every finished match, for anyone to study",
-        "GET  /v1/arena/dilemma/models": "model vs model: Claude and open models play each other in a round robin. Standings, behaviour profiles and head-to-head results",
+        "GET  /v1/arena/dilemma/models": "model vs model: five open AI models play each other in a round robin. Standings, behaviour profiles and head-to-head results",
         "GET  /v1/arena/dilemma/models/matches": "every model-vs-model match, with its moves",
         "GET  /v1/arena/dilemma/models/matches/:id": "one model-vs-model match: every round and both models' reasons",
         "GET  /v1/arena/dilemma/models/moves.csv": "every move of every finished model-vs-model match",

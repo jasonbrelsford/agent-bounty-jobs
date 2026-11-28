@@ -4,9 +4,12 @@ import assert from "node:assert/strict";
 import { makeD1 } from "./d1shim.mjs";
 import {
   ROSTER, TOURNAMENT, DUEL, schedule, ensureTournament, seatPrompt, readAnswer, workersAiText, playRound, duelTick,
-  duelResults, getDuel, listDuels, duelCsv, profile,
+  duelResults, getDuel, listDuels, duelCsv, profile, playing,
 } from "../.test-build/duels.js";
 import { duelsPage, duelMatchPage, headlines } from "../.test-build/duelspage.js";
+
+/** The same round robin with nobody left out, to test the Claude code paths. */
+const WITH_CLAUDE = { ...TOURNAMENT, left_out: [] };
 
 /** Fake models: Llama always cooperates, DeepSeek always defects, the rest play Tit for Tat. */
 const lastTheirs = (prompt) => {
@@ -72,10 +75,10 @@ test("a full tournament: matches finish, results and profiles read right", async
   const db = makeD1();
   const env = { DB: db, MODEL_TOURNAMENT: "on", ANTHROPIC_API_KEY: "test" };
   for (let i = 0; i < 20; i++) {
-    const r = await duelTick(env, { ask: fakeAsk(), budgetMs: 60_000 });
+    const r = await duelTick(env, { ask: fakeAsk(), budgetMs: 60_000, t: WITH_CLAUDE });
     if (!r.played) break;
   }
-  const r = await duelResults(db);
+  const r = await duelResults(db, WITH_CLAUDE);
   assert.equal(r.status.finished, schedule().length);
   assert.ok(r.claude_cost_usd_estimate > 0);
   const by = Object.fromEntries(r.standings.map((x) => [x.key, x]));
@@ -99,7 +102,7 @@ test("a full tournament: matches finish, results and profiles read right", async
   const list = await listDuels(db);
   const m = await getDuel(db, list[0].id);
   assert.equal(m.rounds.length, m.rounds_played);
-  const csv = await duelCsv(db);
+  const csv = await duelCsv(db, WITH_CLAUDE);
   assert.match(csv.split("\n")[0], /^match_id,round,model_a/);
   assert.ok(csv.split("\n").length > 100);
   const html = await (await duelsPage(env)).text();
@@ -146,8 +149,37 @@ test("Claude stops at the spend cap", async () => {
   await ensureTournament(db);
   await db.prepare("UPDATE pd_duels SET cost_usd = ? WHERE seq = 1").bind(TOURNAMENT.claude_budget_usd).run();
   const calls = [];
-  await duelTick({ DB: db, MODEL_TOURNAMENT: "on", ANTHROPIC_API_KEY: "test" }, { ask: fakeAsk(calls), budgetMs: 60_000 });
+  await duelTick({ DB: db, MODEL_TOURNAMENT: "on", ANTHROPIC_API_KEY: "test" }, { ask: fakeAsk(calls), budgetMs: 60_000, t: WITH_CLAUDE });
   assert.ok(calls.length > 0 && calls.every((c) => !c.startsWith("Claude")));
+});
+
+test("players left out are never played, counted or shown", async () => {
+  const db = makeD1();
+  const env = { DB: db, MODEL_TOURNAMENT: "on", ANTHROPIC_API_KEY: "test" };
+  const calls = [];
+  for (let i = 0; i < 20; i++) {
+    const r = await duelTick(env, { ask: fakeAsk(calls), budgetMs: 60_000 });
+    if (!r.played) break;
+  }
+  assert.ok(calls.length > 0 && calls.every((c) => !c.startsWith("Claude")), "even with a key, Claude is not called");
+  const open = playing();
+  assert.deepEqual(open.filter((k) => k.startsWith("claude")), []);
+  const r = await duelResults(db);
+  assert.equal(r.status.total, open.length * (open.length - 1) + open.length);
+  assert.equal(r.status.finished, r.status.total);
+  assert.equal(r.status.queued, 0);
+  assert.deepEqual(r.standings.map((x) => x.key).sort(), [...open].sort());
+  assert.ok(r.head_to_head.every((h) => !Object.keys(h.against).some((k) => k.startsWith("claude"))));
+  assert.deepEqual(r.left_out, ["Claude Opus", "Claude Sonnet", "Claude Haiku"]);
+  assert.doesNotMatch(r.how.settings, /Claude/);
+  assert.ok((await listDuels(db)).every((m) => !m.a.startsWith("claude") && !m.b.startsWith("claude")));
+  assert.doesNotMatch(await duelCsv(db), /claude/);
+  const left = await db.prepare("SELECT id FROM pd_duels WHERE a LIKE 'claude%' LIMIT 1").first();
+  await assert.rejects(getDuel(db, left.id), /no such match/);
+  const html = await (await duelsPage(env)).text();
+  assert.doesNotMatch(html, /Claude/);
+  assert.match(html, /The round robin is complete/);
+  assert.ok(!html.includes("data-refresh"));
 });
 
 test("profiles in plain words", () => {
