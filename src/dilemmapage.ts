@@ -15,7 +15,7 @@ const STYLE = `<style>.tiles{display:grid;grid-template-columns:repeat(auto-fit,
 .tile{border:1px solid #e2e2e2;border-radius:8px;padding:.8rem .9rem}.tile b{display:block;font-size:1.6rem;line-height:1.2;font-variant-numeric:tabular-nums}.tile span{font-size:.82rem;color:#555}
 .lead{border:1px solid #cfe9db;background:#f3fbf6;border-radius:10px;padding:1rem 1.15rem;margin:1rem 0}
 .mv{display:inline-block;min-width:1.4rem;text-align:center;font-weight:700;border-radius:4px;padding:0 .3rem}.mv.C{background:#e8f5ec;color:#0a6b2d}.mv.D{background:#fdecea;color:#a61b1b}
-pre{background:#f4f4f4;border-radius:6px;padding:.9rem;overflow-x:auto;font-size:.85rem}ol.rules{padding-left:1.2rem}</style>`;
+pre{background:#f4f4f4;color:var(--bx-ink-2);border:1px solid var(--bx-line);border-radius:6px;padding:.9rem;overflow-x:auto;font-size:.85rem}ol.rules{padding-left:1.2rem}</style>`;
 
 const p = (v: number | null) => (v === null ? "—" : `${v}%`);
 const n = (v: number | null) => (v === null ? "—" : String(v));
